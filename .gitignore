@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated scan data
+data/
+captures/
+outputs/
+*.ply
+*.pcd
+*.bag
+*.svo
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
