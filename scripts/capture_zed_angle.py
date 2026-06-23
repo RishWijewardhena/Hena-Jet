@@ -14,7 +14,8 @@ import pyzed.sl as sl
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for one ZED point-cloud capture.
 
-    --angle-deg: Required camera angle around the scanner center, in degrees.
+    --angle-deg: Optional camera angle around the scanner center, in degrees.
+        If omitted, the script stays open and prompts for angles until you type q.
         This tells the merge step where this capture sits on the circular path.
     --radius-m: Required distance from the scanner center to the camera, in meters.
         This is used to place the camera around the object during merging.
@@ -28,21 +29,48 @@ def parse_args() -> argparse.Namespace:
         The ZED SDK may clamp this upward if the requested value is too close.
     --warmup: Optional number of camera frames to skip before saving.
         This helps the camera stabilize exposure and depth.
+    --angle-warmup: Optional number of extra frames to grab between interactive
+        captures. This flushes stale buffered frames before each new angle.
     --resolution: Optional ZED camera resolution. Allowed values are HD2K,
         HD1080, HD720, and VGA. The default is HD720.
+    --coordinate-system: ZED point-cloud coordinate system. IMAGE is the ZED
+        image/depth convention: +X right, +Y down, +Z forward.
     """
     parser = argparse.ArgumentParser(
         description="Capture one RGB/depth point cloud from a ZED camera."
     )
-    parser.add_argument("--angle-deg", type=float, required=True)
+    parser.add_argument("--angle-deg", type=float, default=None)
     parser.add_argument("--radius-m", type=float, required=True)
     parser.add_argument("--height-m", type=float, default=0.0)
     parser.add_argument("--out-dir", type=Path, default=Path("captures/zed_m_first_scan"))
     parser.add_argument("--max-depth-m", type=float, default=1.0)
     parser.add_argument("--min-depth-m", type=float, default=0.05)
     parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--angle-warmup", type=int, default=3)
     parser.add_argument("--resolution", choices=["HD2K", "HD1080", "HD720", "VGA"], default="HD720")
+    parser.add_argument(
+        "--coordinate-system",
+        choices=["IMAGE", "RIGHT_HANDED_Z_UP_X_FWD"],
+        default="IMAGE",
+    )
     return parser.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """Validate parsed arguments and raise early with a clear message on errors.
+
+    FIX: Added validation for radius_m. A zero or negative radius would silently
+    produce garbage camera transforms in the merge step.
+    """
+    if args.radius_m <= 0:
+        raise ValueError(f"--radius-m must be positive, got {args.radius_m}")
+    if args.min_depth_m <= 0:
+        raise ValueError(f"--min-depth-m must be positive, got {args.min_depth_m}")
+    if args.max_depth_m <= args.min_depth_m:
+        raise ValueError(
+            f"--max-depth-m ({args.max_depth_m}) must be greater than "
+            f"--min-depth-m ({args.min_depth_m})"
+        )
 
 
 def resolution_from_name(name: str) -> sl.RESOLUTION:
@@ -60,12 +88,38 @@ def resolution_from_name(name: str) -> sl.RESOLUTION:
     }[name]
 
 
+def coordinate_system_from_name(name: str) -> sl.COORDINATE_SYSTEM:
+    """Convert the user-facing coordinate-system name into a ZED SDK enum."""
+    return {
+        "IMAGE": sl.COORDINATE_SYSTEM.IMAGE,
+        "RIGHT_HANDED_Z_UP_X_FWD": sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD,
+    }[name]
+
+
+def forward_depth_from_points(points: np.ndarray, coordinate_system: str) -> np.ndarray:
+    """Return camera-forward depth from XYZ points for the selected ZED axes."""
+    if coordinate_system == "IMAGE":
+        return points[:, 2]
+    if coordinate_system == "RIGHT_HANDED_Z_UP_X_FWD":
+        return points[:, 0]
+    raise ValueError(f"Unsupported coordinate system: {coordinate_system}")
+
+
 def rgba_float_to_rgb(rgba_values: np.ndarray) -> np.ndarray:
-    """Decode ZED XYZRGBA color values stored in the fourth float channel."""
+    """Decode ZED XYZRGBA color values stored in the fourth float channel.
+
+    FIX: The ZED SDK packs color as BGRA, not RGBA. The original code labelled
+    the extracted bytes as R, G, B but was actually reading B, G, R order,
+    producing swapped red and blue channels in all saved point clouds.
+    Corrected byte extraction:
+        byte 0 (& 0xFF)        → Blue
+        byte 1 (>> 8  & 0xFF)  → Green
+        byte 2 (>> 16 & 0xFF)  → Red
+    """
     rgba_uint32 = rgba_values.view(np.uint32)
-    r = rgba_uint32 & 0xFF
+    b = rgba_uint32 & 0xFF
     g = (rgba_uint32 >> 8) & 0xFF
-    b = (rgba_uint32 >> 16) & 0xFF
+    r = (rgba_uint32 >> 16) & 0xFF
     return np.stack([r, g, b], axis=1).astype(np.uint8)
 
 
@@ -94,14 +148,16 @@ def camera_intrinsics_from_zed(zed: sl.Camera, image_shape: tuple[int, int]) -> 
 def color_image_to_rgb(image: np.ndarray) -> np.ndarray:
     """Convert a ZED left camera image array into an RGB uint8 image.
 
-    The ZED SDK usually returns a 4-channel color image. TSDF fusion only needs
-    three 8-bit color channels, so this function drops alpha if present and
-    keeps the image-shaped layout instead of flattening it.
+    FIX: The ZED SDK returns images in BGRA channel order. The original code
+    took the first three channels directly, which produced a BGR image instead
+    of RGB. The channel order is now reversed (::-1) to give correct RGB output
+    for Open3D TSDF fusion and any downstream viewer.
     """
     if image.ndim == 2:
         return np.repeat(image[:, :, None], 3, axis=2).astype(np.uint8)
     if image.shape[2] >= 3:
-        return image[:, :, :3].astype(np.uint8)
+        # ZED returns BGRA — take first 3 channels then reverse to get RGB
+        return image[:, :, :3][:, :, ::-1].astype(np.uint8)
     raise ValueError(f"Unsupported color image shape: {image.shape}")
 
 
@@ -150,6 +206,131 @@ def write_ascii_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
             )
 
 
+def flush_frames(zed: sl.Camera, runtime: sl.RuntimeParameters, count: int) -> None:
+    """Grab and discard a number of frames to flush the ZED buffer.
+
+    FIX: In interactive capture mode the camera runs continuously between angle
+    inputs. Without flushing, the grabbed frame may be stale (captured before
+    the user finished positioning the scanner). Discarding a small number of
+    frames gives the sensor time to settle at each new angle.
+    """
+    for i in range(count):
+        status = zed.grab(runtime)
+        if status != sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"Frame flush {i + 1}/{count} failed: {status}")
+
+
+def capture_angle(
+    zed: sl.Camera,
+    runtime: sl.RuntimeParameters,
+    point_cloud: sl.Mat,
+    depth_mat: sl.Mat,
+    color_mat: sl.Mat,
+    args: argparse.Namespace,
+    angle_deg: float,
+    *,
+    flush: bool = False,
+) -> None:
+    """Capture and save one RGB-D point cloud at the requested scanner angle.
+
+    Parameters
+    ----------
+    flush:
+        When True, grab and discard ``args.angle_warmup`` frames before the
+        real capture. Set this in interactive mode so stale buffered frames
+        accumulated while the user was repositioning the scanner are discarded.
+    """
+    if flush:
+        flush_frames(zed, runtime, args.angle_warmup)
+
+    status = zed.grab(runtime)
+    if status != sl.ERROR_CODE.SUCCESS:
+        raise RuntimeError(f"Could not grab frame at angle {angle_deg}: {status}")
+
+    zed.retrieve_measure(point_cloud, sl.MEASURE.XYZRGBA)
+    zed.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
+    zed.retrieve_image(color_mat, sl.VIEW.LEFT)
+
+    cloud = point_cloud.get_data()
+    depth_image = clean_depth_image(
+        depth_mat.get_data(),
+        min_depth_m=args.min_depth_m,
+        max_depth_m=args.max_depth_m,
+    )
+    color_image = color_image_to_rgb(color_mat.get_data())
+    intrinsics = camera_intrinsics_from_zed(zed, depth_image.shape)
+
+    xyz = cloud[:, :, :3].reshape(-1, 3)
+    rgba = cloud[:, :, 3].reshape(-1)
+
+    finite = np.isfinite(xyz).all(axis=1)
+    depth = forward_depth_from_points(xyz, args.coordinate_system)
+    in_range = (depth >= args.min_depth_m) & (depth <= args.max_depth_m)
+    valid = finite & in_range
+
+    points = xyz[valid].astype(np.float32)
+    colors = rgba_float_to_rgb(rgba[valid])
+
+    stem = f"angle_{angle_deg:07.2f}".replace(".", "p")
+    npz_path = args.out_dir / f"{stem}.npz"
+    meta_path = args.out_dir / f"{stem}.json"
+    ply_path = args.out_dir / f"{stem}.ply"
+    if npz_path.exists() or meta_path.exists() or ply_path.exists():
+        print(f"Warning: overwriting existing files for angle {angle_deg:g}")
+
+    np.savez_compressed(
+        npz_path,
+        points=points,
+        colors=colors,
+        depth_image_m=depth_image,
+        color_image=color_image,
+    )
+    write_ascii_ply(ply_path, points, colors)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "angle_deg": angle_deg,
+                "radius_m": args.radius_m,
+                "height_m": args.height_m,
+                "min_depth_m": args.min_depth_m,
+                "max_depth_m": args.max_depth_m,
+                "resolution": args.resolution,
+                "coordinate_system": args.coordinate_system,
+                "camera_intrinsics": intrinsics,
+                "point_count": int(points.shape[0]),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    print(f"Saved angle {angle_deg:g} with {points.shape[0]} points")
+    print(npz_path)
+    print(meta_path)
+    print(ply_path)
+
+
+def prompt_for_angle() -> float | None:
+    """Read one angle from stdin; q exits the interactive loop.
+
+    FIX: The original implementation called itself recursively on empty input,
+    which would eventually hit Python's recursion limit if the user kept pressing
+    Enter. Replaced with an explicit while loop that retries until valid input or
+    a quit command is received.
+    """
+    while True:
+        raw_value = input("Angle degrees to capture, or q to quit: ").strip()
+        if raw_value.lower() in {"q", "quit", "exit"}:
+            return None
+        if not raw_value:
+            continue
+        try:
+            return float(raw_value)
+        except ValueError:
+            print(f"Invalid input '{raw_value}'. Please enter a number or q.")
+
+
 def main() -> None:
     """Capture one filtered XYZRGBA point cloud and save RGB-D data plus metadata.
 
@@ -160,13 +341,14 @@ def main() -> None:
     MeshLab inspection.
     """
     args = parse_args()
+    validate_args(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     init = sl.InitParameters()
     init.camera_resolution = resolution_from_name(args.resolution)
     init.depth_mode = sl.DEPTH_MODE.NEURAL
     init.coordinate_units = sl.UNIT.METER
-    init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
+    init.coordinate_system = coordinate_system_from_name(args.coordinate_system)
     init.depth_minimum_distance = args.min_depth_m
     init.depth_maximum_distance = args.max_depth_m
 
@@ -181,72 +363,43 @@ def main() -> None:
     color_mat = sl.Mat()
 
     try:
-        for _ in range(args.warmup):
-            zed.grab(runtime)
+        for index in range(args.warmup):
+            status = zed.grab(runtime)
+            if status != sl.ERROR_CODE.SUCCESS:
+                raise RuntimeError(f"Warmup frame {index + 1} failed: {status}")
 
-        status = zed.grab(runtime)
-        if status != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(f"Could not grab frame: {status}")
-
-        zed.retrieve_measure(point_cloud, sl.MEASURE.XYZRGBA)
-        zed.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
-        zed.retrieve_image(color_mat, sl.VIEW.LEFT)
-        cloud = point_cloud.get_data()
-        depth_image = clean_depth_image(
-            depth_mat.get_data(),
-            min_depth_m=args.min_depth_m,
-            max_depth_m=args.max_depth_m,
-        )
-        color_image = color_image_to_rgb(color_mat.get_data())
-        intrinsics = camera_intrinsics_from_zed(zed, depth_image.shape)
-
-        xyz = cloud[:, :, :3].reshape(-1, 3)
-        rgba = cloud[:, :, 3].reshape(-1)
-
-        finite = np.isfinite(xyz).all(axis=1)
-        depth = xyz[:, 0]
-        in_range = (depth >= args.min_depth_m) & (depth <= args.max_depth_m)
-        valid = finite & in_range
-
-        points = xyz[valid].astype(np.float32)
-        colors = rgba_float_to_rgb(rgba[valid])
-
-        stem = f"angle_{args.angle_deg:07.2f}".replace(".", "p")
-        npz_path = args.out_dir / f"{stem}.npz"
-        meta_path = args.out_dir / f"{stem}.json"
-        ply_path = args.out_dir / f"{stem}.ply"
-
-        np.savez_compressed(
-            npz_path,
-            points=points,
-            colors=colors,
-            depth_image_m=depth_image,
-            color_image=color_image,
-        )
-        write_ascii_ply(ply_path, points, colors)
-        meta_path.write_text(
-            json.dumps(
-                {
-                    "angle_deg": args.angle_deg,
-                    "radius_m": args.radius_m,
-                    "height_m": args.height_m,
-                    "min_depth_m": args.min_depth_m,
-                    "max_depth_m": args.max_depth_m,
-                    "resolution": args.resolution,
-                    "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
-                    "camera_intrinsics": intrinsics,
-                    "point_count": int(points.shape[0]),
-                },
-                indent=2,
+        if args.angle_deg is not None:
+            # Single-angle mode: warmup already done above, no extra flush needed
+            capture_angle(
+                zed,
+                runtime,
+                point_cloud,
+                depth_mat,
+                color_mat,
+                args,
+                args.angle_deg,
+                flush=False,
             )
-            + "\n",
-            encoding="utf-8",
-        )
+            return
 
-        print(f"Saved {points.shape[0]} points")
-        print(npz_path)
-        print(meta_path)
-        print(ply_path)
+        print("Interactive capture mode. Type an angle and press Enter.")
+        print("Type q to quit.")
+        while True:
+            angle_deg = prompt_for_angle()
+            if angle_deg is None:
+                print("Capture session finished.")
+                break
+            # FIX: flush stale frames accumulated while the user was positioning
+            capture_angle(
+                zed,
+                runtime,
+                point_cloud,
+                depth_mat,
+                color_mat,
+                args,
+                angle_deg,
+                flush=True,
+            )
     finally:
         zed.close()
 
