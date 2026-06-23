@@ -8,10 +8,16 @@ venv/
 data/
 captures/
 outputs/
+results/
 *.ply
 *.pcd
 *.bag
 *.svo
+
+# Local runtime/viewer files
+.cache/
+.polyscope.ini
+imgui.ini
 
 # OS/editor
 .DS_Store
