@@ -9,6 +9,7 @@ data/
 captures/
 outputs/
 results/
+datasets/
 *.ply
 *.pcd
 *.bag
