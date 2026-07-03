@@ -329,6 +329,21 @@ Press Enter to capture, or q to finish:
 Move the camera to a view, press Enter, move to another view, press Enter, and
 repeat. Type `q` to finish and save outputs.
 
+For automatic capture, use `--auto-capture`. The script will keep attempting
+captures at the requested interval until `--max-frames` accepted frames are
+reached, or until you stop it with `Ctrl+C`.
+
+```bash
+python3 scripts/zed_aruco_alignment/zed_aruco_tsdf_scan.py \
+  --auto-capture \
+  --auto-capture-interval-s 0.8 \
+  --max-frames 60
+```
+
+`--max-frames 0` means unlimited. The frame count is based on accepted frames,
+not raw attempts. A capture attempt can still be skipped if marker pose fails or
+there are not enough valid depth pixels.
+
 Default outputs:
 
 ```text
@@ -338,6 +353,60 @@ outputs/zed_aruco_poses.npy
 outputs/zed_aruco_scan.json
 outputs/zed_aruco_debug/scan_0000.png ...
 ```
+
+## Mesh and Point Cloud Tuning
+
+The current script fuses valid ZED depth into an Open3D TSDF volume. It does not
+yet isolate only the hand/object, so depth range, ROI, marker visibility, and
+TSDF settings matter.
+
+Main tuning parameters:
+
+| Parameter | Default | Effect |
+|---|---:|---|
+| `--min-depth-m` | `0.10` | Removes depth too close to the camera. |
+| `--max-depth-m` | `0.18` | Removes depth farther than the scan target. Lower values reduce table/background noise but can cut off the object. |
+| `--roi X0 Y0 X1 Y1` | `0 0 1 1` | Crops reconstruction depth in image space. Marker detection still uses the full RGB image. |
+| `--voxel-length-m` | `0.002` | TSDF voxel size. Smaller is denser but preserves more depth noise. |
+| `--sdf-trunc-m` | `0.012` | TSDF blending distance. Usually keep it around 4x to 8x the voxel size. |
+| `--min-markers` | `2` | Minimum visible board markers required for pose. Higher values reject weaker poses. |
+| `--min-valid-depth-px` | `5000` | Minimum valid depth pixels required before a frame is fused. |
+| `--marker-mask-padding-px` | `8` | Expands the marker depth mask so detected markers are less likely to enter the mesh. |
+
+For cleaner hand scans, start with a balanced setup instead of the smallest
+possible voxel size:
+
+```bash
+python3 scripts/zed_aruco_alignment/zed_aruco_tsdf_scan.py \
+  --resolution HD720 \
+  --depth-mode NEURAL_PLUS \
+  --auto-capture \
+  --auto-capture-interval-s 0.8 \
+  --max-frames 60 \
+  --min-depth-m 0.10 \
+  --max-depth-m 0.18 \
+  --voxel-length-m 0.0015 \
+  --sdf-trunc-m 0.008 \
+  --min-markers 3 \
+  --min-valid-depth-px 12000 \
+  --marker-mask-padding-px 35 \
+  --mesh-out outputs/aruco_scans/hand_mesh.ply \
+  --cloud-out outputs/aruco_scans/hand_cloud.ply \
+  --poses-out outputs/aruco_scans/hand.npy
+```
+
+Use smaller voxels only after the pose and depth are clean:
+
+```text
+balanced:      --voxel-length-m 0.0015 --sdf-trunc-m 0.008
+more detail:   --voxel-length-m 0.0012 --sdf-trunc-m 0.007
+high detail:   --voxel-length-m 0.0010 --sdf-trunc-m 0.006
+noise-prone:   --voxel-length-m 0.0008 --sdf-trunc-m 0.005
+```
+
+If the mesh becomes rougher when voxel size gets smaller, the scan is limited by
+depth noise or pose error, not TSDF resolution. In that case, increase voxel
+size, require more markers, reduce max depth, and capture fewer stable frames.
 
 ## Quality Checks
 
@@ -380,7 +449,35 @@ Use tighter reconstruction ROI or increase marker mask padding:
 --marker-mask-padding-px 16
 ```
 
-Later, add a world-space crop around the hand/object if table points remain.
+Marker masking only removes detected marker rectangles. It does not remove the
+paper sheet, table plane, cardboard, tools, or background. If those surfaces are
+inside the valid depth range, they can still be fused into the TSDF mesh.
+
+Reduce table/background noise with:
+
+```bash
+--max-depth-m 0.18
+--roi 0.15 0.10 0.85 0.95
+--min-markers 3
+--min-valid-depth-px 12000
+```
+
+Later, add world-space crop, table-plane removal, and outlier filtering around
+the hand/object if table points remain.
+
+### Mesh is dense but noisy
+
+Very small voxels make the extracted point cloud denser, but they also preserve
+ZED depth noise and pose jitter. If the mesh has spikes, doubled surfaces, or
+rough edges, avoid starting with `--voxel-length-m 0.0008`.
+
+Use this first:
+
+```bash
+--voxel-length-m 0.0015 --sdf-trunc-m 0.008
+```
+
+Then step down to `0.0012` or `0.0010` only if the result is already stable.
 
 ### Reprojection error is high
 
@@ -407,6 +504,9 @@ current scripts do not require it.
   multiple measured marker sheets will be better.
 - The script integrates RGB-D frames into TSDF but does not yet do final
   world-space object cropping.
+- The script does not yet remove the table plane, run statistical/radius
+  outlier removal, or smooth/clean connected mesh components after TSDF
+  extraction.
 - Marker detection requires visible markers in the RGB image. If the hand or
   robot blocks too many markers, that frame is skipped.
 
