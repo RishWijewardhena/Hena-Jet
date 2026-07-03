@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         default="NEURAL" if "NEURAL" in DEPTH_MODES else "NEURAL_LIGHT",
     )
     parser.add_argument("--min-depth-m", type=float, default=0.10)
-    parser.add_argument("--max-depth-m", type=float, default=0.21)
+    parser.add_argument("--max-depth-m", type=float, default=0.18)
     parser.add_argument(
         "--roi",
         type=float,
