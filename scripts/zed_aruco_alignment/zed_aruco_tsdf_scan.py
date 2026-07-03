@@ -95,6 +95,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cloud-out", type=Path, default=Path("outputs/aruco_scans/zed_aruco_tsdf_cloud.ply"))
     parser.add_argument("--poses-out", type=Path, default=Path("outputs/aruco_scans/zed_aruco_poses.npy"))
     parser.add_argument("--scan-json", type=Path, default=Path("outputs/aruco_scans/zed_aruco_scan.json"))
+    parser.add_argument("--auto-capture", action="store_true", help="Automatically capture frames without user input.")
+    parser.add_argument(
+        "--auto-capture-interval-s",
+        type=float,
+        default=0.5,
+        help="Seconds to wait between capture attempts when --auto-capture is enabled.",
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=0,
+        help="Stop after this many accepted frames. Use 0 for unlimited.",
+    )
     return parser.parse_args()
 
 
@@ -114,6 +127,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--sdf-trunc-m must be greater than --voxel-length-m")
     if args.marker_mask_padding_px < 0:
         raise ValueError("--marker-mask-padding-px must be zero or positive")
+    if args.auto_capture_interval_s <= 0.0:
+        raise ValueError("--auto-capture-interval-s must be positive")
+    if args.max_frames < 0:
+        raise ValueError("--max-frames must be zero or positive")
 
 
 def camera_intrinsics_from_zed(zed: sl.Camera, image_shape: tuple[int, int]) -> dict[str, float]:
@@ -237,9 +254,22 @@ def main() -> None:
 
         print("ZED ArUco TSDF scanner ready.")
         print("ArUco pose is the alignment source; mechanical angle is not required.")
+        if args.auto_capture:
+            print(
+                "Auto-capture enabled. "
+                f"Attempting one capture every {args.auto_capture_interval_s:.2f}s."
+            )
+            if args.max_frames:
+                print(f"Stopping after {args.max_frames} accepted frames.")
         while True:
             try:
-                if not prompt_for_capture():
+                if args.auto_capture:
+                    if args.max_frames and len(accepted) >= args.max_frames:
+                        print(f"Reached --max-frames={args.max_frames}; saving reconstruction.")
+                        break
+                    print(f"Auto-capture attempt; accepted_frames={len(accepted)}")
+                    time.sleep(args.auto_capture_interval_s)
+                elif not prompt_for_capture():
                     break
             except KeyboardInterrupt:
                 print("\nInterrupted; saving current reconstruction.")
