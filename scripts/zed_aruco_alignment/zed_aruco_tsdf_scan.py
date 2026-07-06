@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,7 @@ DEPTH_MODES = {
     for name in ("PERFORMANCE", "QUALITY", "ULTRA", "NEURAL", "NEURAL_LIGHT", "NEURAL_PLUS")
     if hasattr(sl.DEPTH_MODE, name)
 }
+STOP_COMMANDS = {"q", "quit", "exit", "done"}
 
 
 @dataclass
@@ -172,7 +174,7 @@ def make_tsdf_volume(args: argparse.Namespace) -> o3d.pipelines.integration.Scal
 
 def prompt_for_capture() -> bool:
     raw_value = input("Press Enter to capture, or q to finish: ").strip().lower()
-    return raw_value not in {"q", "quit", "exit"}
+    return raw_value not in STOP_COMMANDS
 
 
 def save_outputs(
@@ -243,6 +245,16 @@ def main() -> None:
     intrinsics = None
     open3d_intrinsic = None
     started_at = time.perf_counter()
+    stop_requested = False
+
+    def request_stop(signum: int, frame: object) -> None:
+        nonlocal stop_requested
+        if not stop_requested:
+            print("\nCtrl+C received; finishing current ZED step, then saving.")
+        stop_requested = True
+
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, request_stop)
 
     if args.save_overlays:
         args.debug_dir.mkdir(parents=True, exist_ok=True)
@@ -259,10 +271,13 @@ def main() -> None:
                 "Auto-capture enabled. "
                 f"Attempting one capture every {args.auto_capture_interval_s:.2f}s."
             )
+            print("Press Ctrl+C to stop after the current ZED step and save.")
             if args.max_frames:
                 print(f"Stopping after {args.max_frames} accepted frames.")
         while True:
             try:
+                if stop_requested:
+                    break
                 if args.auto_capture:
                     if args.max_frames and len(accepted) >= args.max_frames:
                         print(f"Reached --max-frames={args.max_frames}; saving reconstruction.")
@@ -273,14 +288,21 @@ def main() -> None:
                     break
             except KeyboardInterrupt:
                 print("\nInterrupted; saving current reconstruction.")
+                stop_requested = True
                 break
 
+            if stop_requested:
+                break
             if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
                 print("Grab failed; skipping.")
                 continue
+            if stop_requested:
+                break
 
             zed.retrieve_image(color_mat, sl.VIEW.LEFT)
             zed.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
+            if stop_requested:
+                break
             color_rgb = color_image_to_rgb(color_mat.get_data())
             raw_depth = depth_mat.get_data()
 
@@ -358,6 +380,7 @@ def main() -> None:
                 f"valid_px={valid_depth_px}  reproj={error_px:.2f}px"
             )
     finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
         zed.close()
 
     if intrinsics is None or open3d_intrinsic is None or not accepted:

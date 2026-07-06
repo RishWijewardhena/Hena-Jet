@@ -331,7 +331,9 @@ repeat. Type `q` to finish and save outputs.
 
 For automatic capture, use `--auto-capture`. The script will keep attempting
 captures at the requested interval until `--max-frames` accepted frames are
-reached, or until you stop it with `Ctrl+C`.
+reached, or until you press `Ctrl+C`. If the ZED SDK is currently grabbing or
+retrieving a frame, the script finishes that step first, then stops and saves
+the current reconstruction.
 
 ```bash
 python3 scripts/zed_aruco_alignment/zed_aruco_tsdf_scan.py \
