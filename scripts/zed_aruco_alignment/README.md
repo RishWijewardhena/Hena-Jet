@@ -371,6 +371,10 @@ Main tuning parameters:
 | `--roi X0 Y0 X1 Y1` | `0 0 1 1` | Crops reconstruction depth in image space. Marker detection still uses the full RGB image. |
 | `--voxel-length-m` | `0.002` | TSDF voxel size. Smaller is denser but preserves more depth noise. |
 | `--sdf-trunc-m` | `0.012` | TSDF blending distance. Usually keep it around 4x to 8x the voxel size. |
+| `--hole-fill-size-m` | `0.003` | Fills small mesh holes up to 3 mm after TSDF extraction. Use `--no-fill-holes` to disable. |
+| `--cleanup-outlier-neighbors` | `20` | Neighbor count for statistical outlier removal on the final point cloud. Use `--no-cleanup` to disable. |
+| `--cleanup-outlier-std-ratio` | `2.0` | Higher keeps more points; lower removes more noise and can delete thin details. |
+| `--cleanup-min-cluster-fraction` | `0.02` | Removes small disconnected mesh fragments below 2% of the largest triangle cluster. |
 | `--min-markers` | `2` | Minimum visible board markers required for pose. Higher values reject weaker poses. |
 | `--min-valid-depth-px` | `5000` | Minimum valid depth pixels required before a frame is fused. |
 | `--marker-mask-padding-px` | `8` | Expands the marker depth mask so detected markers are less likely to enter the mesh. |
@@ -389,6 +393,10 @@ python3 scripts/zed_aruco_alignment/zed_aruco_tsdf_scan.py \
   --max-depth-m 0.18 \
   --voxel-length-m 0.0015 \
   --sdf-trunc-m 0.008 \
+  --hole-fill-size-m 0.003 \
+  --cleanup-outlier-neighbors 20 \
+  --cleanup-outlier-std-ratio 2.0 \
+  --cleanup-min-cluster-fraction 0.02 \
   --min-markers 3 \
   --min-valid-depth-px 12000 \
   --marker-mask-padding-px 35 \

@@ -88,6 +88,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-valid-depth-px", type=int, default=5000)
     parser.add_argument("--voxel-length-m", type=float, default=0.002)
     parser.add_argument("--sdf-trunc-m", type=float, default=0.012)
+    parser.add_argument(
+        "--hole-fill-size-m",
+        type=float,
+        default=0.003,
+        help="Maximum hole size to fill in the extracted mesh, in meters.",
+    )
+    parser.add_argument("--no-fill-holes", action="store_true")
+    parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help="Skip final statistical point cleanup and small mesh fragment removal.",
+    )
+    parser.add_argument(
+        "--cleanup-outlier-neighbors",
+        type=int,
+        default=20,
+        help="Neighbor count used by statistical outlier removal on the final point cloud.",
+    )
+    parser.add_argument(
+        "--cleanup-outlier-std-ratio",
+        type=float,
+        default=2.0,
+        help="Std-dev ratio used by statistical outlier removal on the final point cloud.",
+    )
+    parser.add_argument(
+        "--cleanup-min-cluster-fraction",
+        type=float,
+        default=0.02,
+        help="Remove mesh triangle clusters smaller than this fraction of the largest cluster.",
+    )
     parser.add_argument("--axis-length-m", type=float, default=0.05)
     parser.add_argument("--marker-mask-padding-px", type=int, default=8)
     parser.add_argument("--no-mask-markers", action="store_true")
@@ -127,6 +157,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--voxel-length-m must be positive")
     if args.sdf_trunc_m <= args.voxel_length_m:
         raise ValueError("--sdf-trunc-m must be greater than --voxel-length-m")
+    if args.hole_fill_size_m <= 0.0:
+        raise ValueError("--hole-fill-size-m must be positive")
+    if args.cleanup_outlier_neighbors <= 0:
+        raise ValueError("--cleanup-outlier-neighbors must be positive")
+    if args.cleanup_outlier_std_ratio <= 0.0:
+        raise ValueError("--cleanup-outlier-std-ratio must be positive")
+    if not 0.0 < args.cleanup_min_cluster_fraction <= 1.0:
+        raise ValueError("--cleanup-min-cluster-fraction must be between 0 and 1")
     if args.marker_mask_padding_px < 0:
         raise ValueError("--marker-mask-padding-px must be zero or positive")
     if args.auto_capture_interval_s <= 0.0:
@@ -177,6 +215,46 @@ def prompt_for_capture() -> bool:
     return raw_value not in STOP_COMMANDS
 
 
+def fill_mesh_holes(
+    mesh: o3d.geometry.TriangleMesh,
+    hole_size_m: float,
+) -> o3d.geometry.TriangleMesh:
+    if len(mesh.triangles) == 0:
+        return mesh
+    tensor_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    return tensor_mesh.fill_holes(hole_size=hole_size_m).to_legacy()
+
+
+def clean_mesh_fragments(
+    mesh: o3d.geometry.TriangleMesh,
+    min_cluster_fraction: float,
+) -> o3d.geometry.TriangleMesh:
+    if len(mesh.triangles) == 0:
+        return mesh
+    triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
+    triangle_clusters = np.asarray(triangle_clusters)
+    cluster_n_triangles = np.asarray(cluster_n_triangles)
+    keep_threshold = max(1, int(cluster_n_triangles.max() * min_cluster_fraction))
+    triangles_to_remove = cluster_n_triangles[triangle_clusters] < keep_threshold
+    mesh.remove_triangles_by_mask(triangles_to_remove)
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def clean_point_cloud(
+    cloud: o3d.geometry.PointCloud,
+    nb_neighbors: int,
+    std_ratio: float,
+) -> o3d.geometry.PointCloud:
+    if len(cloud.points) == 0:
+        return cloud
+    cleaned, _ = cloud.remove_statistical_outlier(
+        nb_neighbors=nb_neighbors,
+        std_ratio=std_ratio,
+    )
+    return cleaned
+
+
 def save_outputs(
     volume: o3d.pipelines.integration.ScalableTSDFVolume,
     accepted: list[AcceptedFrame],
@@ -185,12 +263,31 @@ def save_outputs(
     args: argparse.Namespace,
 ) -> None:
     mesh = volume.extract_triangle_mesh()
+    if not args.no_fill_holes:
+        before = len(mesh.triangles)
+        mesh = fill_mesh_holes(mesh, args.hole_fill_size_m)
+        print(
+            f"Filled mesh holes up to {args.hole_fill_size_m:.4f} m "
+            f"({before} -> {len(mesh.triangles)} tris)"
+        )
+    if not args.no_cleanup:
+        before = len(mesh.triangles)
+        mesh = clean_mesh_fragments(mesh, args.cleanup_min_cluster_fraction)
+        print(f"Removed small mesh fragments ({before} -> {len(mesh.triangles)} tris)")
     mesh.compute_vertex_normals()
     args.mesh_out.parent.mkdir(parents=True, exist_ok=True)
     o3d.io.write_triangle_mesh(str(args.mesh_out), mesh)
     print(f"Mesh: {args.mesh_out}  ({len(mesh.vertices)} verts, {len(mesh.triangles)} tris)")
 
     cloud = volume.extract_point_cloud()
+    if not args.no_cleanup:
+        before = len(cloud.points)
+        cloud = clean_point_cloud(
+            cloud,
+            args.cleanup_outlier_neighbors,
+            args.cleanup_outlier_std_ratio,
+        )
+        print(f"Removed statistical point outliers ({before} -> {len(cloud.points)} pts)")
     args.cloud_out.parent.mkdir(parents=True, exist_ok=True)
     o3d.io.write_point_cloud(str(args.cloud_out), cloud)
     print(f"Cloud: {args.cloud_out}  ({len(cloud.points)} pts)")
@@ -211,6 +308,14 @@ def save_outputs(
             "roi": list(args.roi),
             "voxel_length_m": args.voxel_length_m,
             "sdf_trunc_m": args.sdf_trunc_m,
+            "hole_fill_size_m": None if args.no_fill_holes else args.hole_fill_size_m,
+            "cleanup": None
+            if args.no_cleanup
+            else {
+                "outlier_neighbors": args.cleanup_outlier_neighbors,
+                "outlier_std_ratio": args.cleanup_outlier_std_ratio,
+                "min_cluster_fraction": args.cleanup_min_cluster_fraction,
+            },
             "marker_mask_padding_px": 0 if args.no_mask_markers else args.marker_mask_padding_px,
             "frames": [
                 {
