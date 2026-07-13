@@ -26,6 +26,14 @@ class FrameQuality:
     eigenvalues: tuple[float, float, float]
 
 
+@dataclass(frozen=True)
+class PoseQuality:
+    accepted: bool
+    reason: str
+    translation_m: float
+    rotation_deg: float
+
+
 def _neighbor_of(mask: np.ndarray) -> np.ndarray:
     """Return pixels touching ``mask`` in an eight-connected neighborhood."""
     padded = np.pad(mask, 1, mode="constant", constant_values=False)
@@ -89,7 +97,9 @@ def filter_organized_cloud(
     depth = xyz[:, :, forward_axis]
     magnitude = np.linalg.norm(xyz, axis=2)
 
-    finite = np.isfinite(xyz).all(axis=2) & np.isfinite(rgba) & np.isfinite(confidence)
+    # RGBA is stored as packed bits in a float channel, so its numeric float
+    # interpretation may be NaN even when the color bytes are valid.
+    finite = np.isfinite(xyz).all(axis=2) & np.isfinite(confidence)
     in_range = (depth >= min_depth_m) & (depth <= max_depth_m)
     trusted = confidence <= confidence_threshold
     base_valid = finite & (magnitude > 1e-6) & in_range & trusted
@@ -245,6 +255,25 @@ def pose_step(previous: np.ndarray, current: np.ndarray) -> tuple[float, float]:
     translation_m = float(np.linalg.norm(delta[:3, 3]))
     cosine = float(np.clip((np.trace(delta[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))
     return translation_m, math.degrees(math.acos(cosine))
+
+
+def evaluate_pose_quality(
+    previous: np.ndarray,
+    current: np.ndarray,
+    *,
+    max_translation_m: float,
+    max_rotation_deg: float,
+) -> PoseQuality:
+    translation_m, rotation_deg = pose_step(previous, current)
+    accepted = (
+        translation_m <= max_translation_m and rotation_deg <= max_rotation_deg
+    )
+    return PoseQuality(
+        accepted=accepted,
+        reason="accepted" if accepted else "tracking_jump",
+        translation_m=translation_m,
+        rotation_deg=rotation_deg,
+    )
 
 
 class GlobalVoxelAccumulator:

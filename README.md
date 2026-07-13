@@ -77,3 +77,34 @@ Validate the concept with ZED-M:
 6. Inspect the merged point cloud in Open3D.
 
 See [docs/zed_m_feasibility.md](docs/zed_m_feasibility.md) for the checklist.
+
+## Reliable Close-Range KISS-ICP Scan
+
+The real-time scanner is tuned for a ZED Mini moving slowly around a stationary
+hand at a working distance of approximately 10–20 cm:
+
+```bash
+python scripts/kiss_icp_realtime.py \
+  --out outputs/kiss_icp_hand_map.ply
+```
+
+The default configuration uses `NEURAL_PLUS`, ZED confidence filtering, an
+11–22 cm reliable software depth window, deterministic 3 mm ICP sampling, and a
+frame-weighted 2 mm global map. Frames with sparse, low-coverage, degenerate, or
+excessively large pose changes are not fused.
+
+Stopping the scan saves three files:
+
+- `kiss_icp_hand_map.ply`: globally fused voxels observed in at least two frames.
+- `kiss_icp_hand_map_trajectory.npy`: accepted KISS-ICP poses only.
+- `kiss_icp_hand_map_quality.json`: settings, versions, frame rejection reasons,
+  depth coverage, pose steps, map statistics, and trajectory closure error.
+
+The active development Python environment currently has ZED SDK 5.3.1 but does
+not have the `kiss-icp` or `open3d` Python packages. Run the live scanner in the
+camera environment where those packages are installed. ZED depth confidence
+values near 100 are least trustworthy; the default threshold rejects values
+above 60 while leaving texture confidence at 100 to preserve low-texture skin.
+See the Stereolabs documentation for
+[confidence filtering](https://www.stereolabs.com/docs/depth-sensing/confidence-filtering)
+and [depth modes](https://docs.stereolabs.com/docs/development/zed-sdk/modules/depth-sensing/depth-modes).

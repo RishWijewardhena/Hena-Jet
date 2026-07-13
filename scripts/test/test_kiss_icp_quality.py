@@ -12,6 +12,7 @@ from kiss_icp_quality import (  # noqa: E402
     GlobalVoxelAccumulator,
     deterministic_voxel_sample,
     evaluate_frame_quality,
+    evaluate_pose_quality,
     filter_organized_cloud,
     pose_step,
 )
@@ -85,6 +86,25 @@ class OrganizedCloudFilterTests(unittest.TestCase):
         self.assertEqual(result.points.shape[0], 22)
         self.assertTrue(np.isfinite(result.points).all())
 
+    def test_packed_color_bits_do_not_invalidate_geometry(self) -> None:
+        cloud = np.zeros((1, 1, 4), dtype=np.float32)
+        cloud[0, 0, 0] = 0.15
+        cloud[0, 0, 3] = packed_bgra(255, 255, 255)
+
+        result = filter_organized_cloud(
+            cloud,
+            np.zeros((1, 1), dtype=np.float32),
+            min_depth_m=0.11,
+            max_depth_m=0.22,
+            coordinate_system="RIGHT_HANDED_Z_UP_X_FWD",
+            confidence_threshold=60,
+            edge_threshold_m=0.008,
+            erode_invalid_boundary=False,
+        )
+
+        self.assertEqual(result.points.shape[0], 1)
+        np.testing.assert_array_equal(result.colors[0], [255, 255, 255])
+
 
 class SamplingAndQualityTests(unittest.TestCase):
     def test_voxel_sampling_is_deterministic_and_bounded(self) -> None:
@@ -121,6 +141,14 @@ class SamplingAndQualityTests(unittest.TestCase):
         valid = points + np.array([0.0, 0.0, 0.15], dtype=np.float32)
         self.assertTrue(evaluate_frame_quality(valid, 0.5, min_points=100).accepted)
 
+    def test_frame_quality_rejects_insufficient_spatial_extent(self) -> None:
+        points = np.random.default_rng(9).normal(size=(500, 3)).astype(np.float32)
+        points *= np.array([0.001, 0.001, 0.001], dtype=np.float32)
+
+        quality = evaluate_frame_quality(points, 0.5, min_points=100)
+
+        self.assertEqual(quality.reason, "insufficient_spatial_extent")
+
 
 class PoseAndFusionTests(unittest.TestCase):
     def test_pose_step_reports_translation_and_rotation(self) -> None:
@@ -137,6 +165,20 @@ class PoseAndFusionTests(unittest.TestCase):
 
         self.assertAlmostEqual(translation_m, 0.03)
         self.assertAlmostEqual(rotation_deg, 6.0)
+
+    def test_pose_quality_rejects_excessive_step(self) -> None:
+        current = np.eye(4)
+        current[0, 3] = 0.021
+
+        quality = evaluate_pose_quality(
+            np.eye(4),
+            current,
+            max_translation_m=0.02,
+            max_rotation_deg=5.0,
+        )
+
+        self.assertFalse(quality.accepted)
+        self.assertEqual(quality.reason, "tracking_jump")
 
     def test_global_voxel_accumulator_averages_and_counts_frames(self) -> None:
         accumulator = GlobalVoxelAccumulator(voxel_m=0.01)

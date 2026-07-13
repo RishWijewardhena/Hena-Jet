@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
-"""Real-time ZED + KISS-ICP mapping with live Open3D visualisation.
+"""Reliable close-range ZED Mini + KISS-ICP mapping.
 
 The camera streams continuously. Every frame is:
     1. Grabbed from the ZED SDK
-    2. Depth-cropped to [min_depth_m, max_depth_m]
-    3. Registered against the previous frame with KISS-ICP
-    4. Accumulated into a global map
-    5. Displayed live in an Open3D viewer
+    2. Confidence, range, boundary, and depth-edge filtered
+    3. Quality-gated and deterministically sampled for KISS-ICP
+    4. Fused into a frame-weighted global voxel map
+    5. Displayed live and summarized in a JSON quality report
 
 Usage
 -----
 python scripts/kiss_icp_realtime.py \
-    --max-depth-m 0.35 \
-    --min-depth-m 0.05 \
-    --resolution HD720 \
-    --coordinate-system RIGHT_HANDED_Z_UP_X_FWD \
-    --voxel-m 0.002 \
     --out outputs/kiss_icp_map.ply
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
+import json
 import math
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import pyzed.sl as sl
+
+from kiss_icp_quality import (
+    FrameQuality,
+    GlobalVoxelAccumulator,
+    deterministic_voxel_sample,
+    evaluate_frame_quality,
+    evaluate_pose_quality,
+    filter_organized_cloud,
+    pose_step,
+)
 
 # ── KISS-ICP import ────────────────────────────────────────────────────────────
 try:
@@ -57,14 +65,32 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Real-time ZED + KISS-ICP mapping with live viewer."
     )
-    parser.add_argument("--max-depth-m", type=float, default=0.35,
-                        help="Far depth cutoff in metres (default: 0.35)")
-    parser.add_argument("--min-depth-m", type=float, default=0.05,
-                        help="Near depth cutoff in metres (default: 0.05)")
+    parser.add_argument("--camera-min-depth-m", type=float, default=0.10,
+                        help="ZED SDK near depth limit (default: 0.10)")
+    parser.add_argument("--camera-max-depth-m", type=float, default=0.25,
+                        help="ZED SDK far depth limit (default: 0.25)")
+    parser.add_argument("--min-depth-m", type=float, default=0.11,
+                        help="Reliable software near cutoff (default: 0.11)")
+    parser.add_argument("--max-depth-m", type=float, default=0.22,
+                        help="Reliable software far cutoff (default: 0.22)")
     parser.add_argument(
         "--resolution",
         choices=["HD2K", "HD1080", "HD720", "VGA"],
         default="HD720",
+    )
+    available_depth_modes = [
+        name
+        for name in (
+            "PERFORMANCE", "QUALITY", "ULTRA", "NEURAL",
+            "NEURAL_LIGHT", "NEURAL_PLUS",
+        )
+        if hasattr(sl.DEPTH_MODE, name)
+    ]
+    parser.add_argument(
+        "--depth-mode",
+        choices=available_depth_modes,
+        default="NEURAL_PLUS" if "NEURAL_PLUS" in available_depth_modes else "NEURAL",
+        help="ZED depth mode (default: NEURAL_PLUS when available)",
     )
     parser.add_argument(
         "--coordinate-system",
@@ -86,25 +112,62 @@ def parse_args() -> argparse.Namespace:
                         help="Output PLY path when you press Q to quit")
     parser.add_argument("--no-viz", action="store_true",
                         help="Disable Open3D live viewer (headless mode)")
-    parser.add_argument("--max-jump-m", type=float, default=0.15,
+    parser.add_argument("--min-map-observations", type=int, default=2,
+                        help="Remove final voxels seen by fewer frames (default: 2)")
+    parser.add_argument("--confidence-threshold", type=int, default=60,
+                        help="Reject ZED confidence errors above this value (default: 60)")
+    parser.add_argument("--texture-confidence-threshold", type=int, default=100,
+                        help="Preserve low-texture skin by default (default: 100)")
+    parser.add_argument("--edge-threshold-m", type=float, default=0.008,
+                        help="Reject depth jumps larger than this (default: 0.008)")
+    parser.add_argument("--no-erode-invalid-boundary", action="store_true",
+                        help="Keep pixels directly adjacent to invalid depth")
+    parser.add_argument("--min-reliable-points", type=int, default=2_000,
+                        help="Minimum filtered points required for ICP (default: 2000)")
+    parser.add_argument("--min-valid-coverage", type=float, default=0.05,
+                        help="Minimum filtered image coverage (default: 0.05)")
+    parser.add_argument("--max-jump-m", type=float, default=0.02,
                         help="Discard frames where pose jumps more than this many metres "
                              "in one step — guards against tracking loss after dropouts. "
-                             "Default 0.15m. Increase if you move the camera fast.")
-    parser.add_argument("--max-jump-deg", type=float, default=15.0,
+                             "Default 0.02m. Increase only for verified fast motion.")
+    parser.add_argument("--max-jump-deg", type=float, default=5.0,
                         help="Discard frames where pose jumps more than this many degrees "
-                             "in one step. Default 15.0 deg.")
+                             "in one step. Default 5.0 deg.")
+    parser.add_argument("--quality-report", type=Path, default=None,
+                        help="JSON report path (default: <out-stem>_quality.json)")
     # KISS-ICP tuning
-    parser.add_argument("--kiss-voxel-m", type=float, default=0.005,
-                        help="KISS-ICP internal voxel size (default: 0.005)")
-    parser.add_argument("--kiss-max-range-m", type=float, default=0.35,
-                        help="KISS-ICP max range — should match --max-depth-m")
-    parser.add_argument("--kiss-min-range-m", type=float, default=0.05,
-                        help="KISS-ICP min range — should match --min-depth-m")
-    parser.add_argument("--kiss-min-motion-m", type=float, default=0.0001,
-                        help="Minimum motion threshold for registering frames. Default 0.0001m (0.1mm)")
-    parser.add_argument("--kiss-initial-threshold-m", type=float, default=0.05,
-                        help="Initial maximum correspondence distance. Default 0.05m (5cm)")
+    parser.add_argument("--kiss-voxel-m", type=float, default=0.003,
+                        help="KISS-ICP internal voxel size (default: 0.003)")
+    parser.add_argument("--kiss-max-range-m", type=float, default=0.25,
+                        help="KISS-ICP radial maximum range (default: 0.25)")
+    parser.add_argument("--kiss-min-range-m", type=float, default=0.10,
+                        help="KISS-ICP radial minimum range (default: 0.10)")
+    parser.add_argument("--kiss-min-motion-m", type=float, default=0.005,
+                        help="Motion floor for adaptive-threshold updates (default: 0.005)")
+    parser.add_argument("--kiss-initial-threshold-m", type=float, default=0.02,
+                        help="Initial correspondence distance (default: 0.02)")
     return parser.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if not 0 < args.camera_min_depth_m < args.camera_max_depth_m:
+        raise ValueError("camera depth limits must be positive and increasing")
+    if not args.camera_min_depth_m <= args.min_depth_m < args.max_depth_m <= args.camera_max_depth_m:
+        raise ValueError("software depth limits must be inside the camera depth limits")
+    if args.voxel_m <= 0 or args.kiss_voxel_m <= 0:
+        raise ValueError("voxel sizes must be positive")
+    if args.max_points_per_frame <= 0 or args.min_reliable_points <= 0:
+        raise ValueError("point-count limits must be positive")
+    if args.max_map_points <= 0 or args.min_map_observations <= 0:
+        raise ValueError("map limits must be positive")
+    if not 0 <= args.confidence_threshold <= 100:
+        raise ValueError("--confidence-threshold must be in [0, 100]")
+    if not 0 <= args.texture_confidence_threshold <= 100:
+        raise ValueError("--texture-confidence-threshold must be in [0, 100]")
+    if args.edge_threshold_m < 0:
+        raise ValueError("--edge-threshold-m must be non-negative")
+    if not 0 <= args.min_valid_coverage <= 1:
+        raise ValueError("--min-valid-coverage must be in [0, 1]")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -129,65 +192,20 @@ def coordinate_system_enum(name: str) -> sl.COORDINATE_SYSTEM:
 
 def extract_points_and_colors(
     point_cloud: sl.Mat,
-    min_depth_m: float,
-    max_depth_m: float,
-    coordinate_system: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Extract filtered (N,3) XYZ float32 and (N,3) RGB uint8 from a ZED Mat.
-
-    Depth axis depends on coordinate system:
-        IMAGE:                  forward = Z axis (col 2)
-        RIGHT_HANDED_Z_UP_X_FWD: forward = X axis (col 0)
-    """
-    cloud = point_cloud.get_data()          # (H, W, 4) float32 XYZRGBA
-    xyz = cloud[:, :, :3].reshape(-1, 3)
-    rgba_raw = cloud[:, :, 3].reshape(-1)
-
-    # Finite mask — rejects NaN and Inf
-    finite = np.isfinite(xyz).all(axis=1)
-
-    # Zero-magnitude mask — KISS-ICP's Sophus SO3::exp crashes on zero/near-zero
-    # vectors. ZED emits exact (0,0,0) for pixels with no depth solution.
-    magnitude = np.linalg.norm(xyz, axis=1)
-    nonzero = magnitude > 1e-6
-
-    # Forward-depth mask
-    if coordinate_system == "IMAGE":
-        forward_depth = xyz[:, 2]
-    else:  # RIGHT_HANDED_Z_UP_X_FWD
-        forward_depth = xyz[:, 0]
-
-    in_range = (forward_depth >= min_depth_m) & (forward_depth <= max_depth_m)
-    valid = finite & nonzero & in_range
-
-    points = xyz[valid].astype(np.float32)
-
-    # BGRA → RGB  (ZED packs as BGRA in the float channel)
-    rgba_uint32 = rgba_raw[valid].view(np.uint32)
-    b = (rgba_uint32 & 0xFF).astype(np.uint8)
-    g = ((rgba_uint32 >> 8) & 0xFF).astype(np.uint8)
-    r = ((rgba_uint32 >> 16) & 0xFF).astype(np.uint8)
-    colors = np.stack([r, g, b], axis=1)
-
-    return points, colors
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Map helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def voxel_downsample_numpy(
-    points: np.ndarray,
-    colors: np.ndarray,
-    voxel_m: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Fast numpy voxel downsample — keeps one point per voxel cell."""
-    if voxel_m <= 0 or points.shape[0] == 0:
-        return points, colors
-    keys = np.floor(points / voxel_m).astype(np.int64)
-    _, idx = np.unique(keys, axis=0, return_index=True)
-    idx.sort()
-    return points[idx], colors[idx]
+    confidence_map: sl.Mat,
+    args: argparse.Namespace,
+):
+    """Apply organized close-range filtering to a ZED XYZRGBA measure."""
+    return filter_organized_cloud(
+        point_cloud.get_data(),
+        confidence_map.get_data(),
+        min_depth_m=args.min_depth_m,
+        max_depth_m=args.max_depth_m,
+        coordinate_system=args.coordinate_system,
+        confidence_threshold=args.confidence_threshold,
+        edge_threshold_m=args.edge_threshold_m,
+        erode_invalid_boundary=not args.no_erode_invalid_boundary,
+    )
 
 
 def transform_points(points: np.ndarray, pose: np.ndarray) -> np.ndarray:
@@ -250,7 +268,7 @@ class LiveVisualiser:
     update() call when we have real points. This is the only safe approach.
     """
 
-    UPDATE_EVERY_N_FRAMES = 5   # refresh display every N frames to save GPU
+    UPDATE_EVERY_N_FRAMES = 5
 
     def __init__(self) -> None:
         self.vis = o3d.visualization.Visualizer()
@@ -262,20 +280,12 @@ class LiveVisualiser:
         self.cloud = o3d.geometry.PointCloud()
         # FIX: do NOT add empty geometry here — deferred to first update()
         self._geometry_added = False
-        self._frame_count = 0
-
-        # render options
         opt = self.vis.get_render_option()
         opt.background_color = np.array([0.05, 0.05, 0.05])
         opt.point_size = 1.5
 
     def update(self, points: np.ndarray, colors: np.ndarray) -> bool:
         """Push new map data to the viewer. Returns False if window was closed."""
-        self._frame_count += 1
-        if self._frame_count % self.UPDATE_EVERY_N_FRAMES != 0:
-            self.vis.poll_events()
-            return True
-
         self.cloud.points = o3d.utility.Vector3dVector(points.astype(np.float64))
         self.cloud.colors = o3d.utility.Vector3dVector(
             colors.astype(np.float64) / 255.0
@@ -329,7 +339,8 @@ def build_kiss_icp(args: argparse.Namespace) -> KissICP:
     config = KISSConfig()
 
     # Print what the installed version actually exposes so debugging is easy
-    print(f"KISSConfig fields: {list(KISSConfig.model_fields.keys())}")
+    model_fields = getattr(KISSConfig, "model_fields", {})
+    print(f"KISSConfig fields: {list(model_fields.keys())}")
 
     # ── helper: try nested then flat ─────────────────────────────────────────
     def apply(nested_path: str, flat_name: str, value) -> None:
@@ -362,21 +373,57 @@ def build_kiss_icp(args: argparse.Namespace) -> KissICP:
     apply("registration.max_num_iterations", "max_num_iterations", 500)
     apply("registration.convergence_criterion", "convergence_criterion", 0.0001)
 
-    # ── CRITICAL for close-range scanning ─────────────────────────────────────
-    # Default min_motion_th=0.1 means KISS-ICP skips registration unless the
-    # camera moves >10cm between frames. At 0.35m max depth this effectively
-    # disables odometry entirely — pose stays at identity every frame.
-    # Set to a very small value so every frame is registered regardless of motion.
+    # min_motion_th controls which model deviations update KISS-ICP's adaptive
+    # correspondence threshold. It does not decide whether a frame is registered.
+    # A 5 mm floor prevents close-range depth noise from collapsing the threshold.
     apply("adaptive_threshold.min_motion_th",  "min_motion_th",   args.kiss_min_motion_m)
-    # initial_threshold: maximum correspondence distance for the first frame.
-    # Default 2.0m is for outdoor LiDAR. For close-range ZED at 0.35m we want
-    # ~0.05m — large enough to find correspondences at hand motion speeds,
-    # small enough to reject background noise matches.
+    # The LiDAR-scale default initial threshold is too permissive at 10-20 cm.
     apply("adaptive_threshold.initial_threshold", "initial_threshold", args.kiss_initial_threshold_m)
     # convergence_criterion — also present in registration in this version
     apply("odometry.convergence_criterion",    "convergence_criterion", 0.0001)
 
     return KissICP(config=config)
+
+
+def package_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def quality_to_dict(quality: FrameQuality) -> dict[str, object]:
+    return {
+        "accepted": quality.accepted,
+        "reason": quality.reason,
+        "point_count": quality.point_count,
+        "valid_coverage": quality.valid_coverage,
+        "extents_m": list(quality.extents_m),
+        "eigenvalues": list(quality.eigenvalues),
+    }
+
+
+def serializable_args(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+
+
+def write_quality_report(path: Path, report: dict[str, object]) -> None:
+    def json_safe(value):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        if isinstance(value, dict):
+            return {key: json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [json_safe(item) for item in value]
+        return value
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(json_safe(report), file, indent=2, allow_nan=False)
+        file.write("\n")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -385,39 +432,55 @@ def build_kiss_icp(args: argparse.Namespace) -> KissICP:
 
 def main() -> None:
     args = parse_args()
+    validate_args(args)
+    report_path = args.quality_report or args.out.with_name(
+        f"{args.out.stem}_quality.json"
+    )
 
     # ── open ZED ──────────────────────────────────────────────────────────────
     init = sl.InitParameters()
     init.camera_resolution = resolution_enum(args.resolution)
-    init.depth_mode = sl.DEPTH_MODE.NEURAL
+    if args.depth_mode == "NEURAL_PLUS" and not hasattr(sl.DEPTH_MODE, "NEURAL_PLUS"):
+        print("Warning: NEURAL_PLUS is unavailable; falling back to NEURAL.")
+        args.depth_mode = "NEURAL"
+    init.depth_mode = getattr(sl.DEPTH_MODE, args.depth_mode)
     init.coordinate_units = sl.UNIT.METER
     init.coordinate_system = coordinate_system_enum(args.coordinate_system)
-    init.depth_minimum_distance = args.min_depth_m
-    init.depth_maximum_distance = args.max_depth_m
+    init.depth_minimum_distance = args.camera_min_depth_m
+    init.depth_maximum_distance = args.camera_max_depth_m
 
     zed = sl.Camera()
     status = zed.open(init)
     if status != sl.ERROR_CODE.SUCCESS:
         raise RuntimeError(f"Could not open ZED camera: {status}")
+    zed_sdk_version = str(zed.get_sdk_version())
 
     runtime = sl.RuntimeParameters()
+    runtime.confidence_threshold = args.confidence_threshold
+    runtime.texture_confidence_threshold = args.texture_confidence_threshold
     point_cloud_mat = sl.Mat()
+    confidence_mat = sl.Mat()
 
     # ── warmup ────────────────────────────────────────────────────────────────
     print(f"Warming up ({args.warmup} frames)…")
     for i in range(args.warmup):
         if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+            zed.close()
             raise RuntimeError(f"Warmup frame {i + 1} failed")
     print("Warmup done. Starting mapping. Press Q in the viewer to stop.")
 
     # ── KISS-ICP ──────────────────────────────────────────────────────────────
-    kiss = build_kiss_icp(args)
+    try:
+        kiss = build_kiss_icp(args)
+    except Exception:
+        zed.close()
+        raise
 
-    # ── global map accumulators ───────────────────────────────────────────────
-    map_points: list[np.ndarray] = []
-    map_colors: list[np.ndarray] = []
-    map_point_count = 0
-    all_poses: list[np.ndarray] = []   # manual trajectory for v1.1+ compatibility
+    # ── global map and diagnostics ────────────────────────────────────────────
+    global_map = GlobalVoxelAccumulator(args.voxel_m)
+    all_poses: list[np.ndarray] = []
+    frame_records: list[dict[str, object]] = []
+    rejected_reasons: Counter[str] = Counter()
 
     # ── visualiser ────────────────────────────────────────────────────────────
     viz: LiveVisualiser | None = None
@@ -426,74 +489,76 @@ def main() -> None:
 
     # ── timing ────────────────────────────────────────────────────────────────
     frame_idx = 0
-    skipped_frames = 0
     t_start = time.perf_counter()
+    stop_reason = "unknown"
+    fatal_error: Exception | None = None
 
     try:
         while True:
             # ── check if viewer was closed ─────────────────────────────────
             if viz is not None and not viz.is_open():
                 print("Viewer closed — stopping.")
+                stop_reason = "viewer_closed"
                 break
 
             # ── grab frame ────────────────────────────────────────────────
             grab_status = zed.grab(runtime)
             if grab_status != sl.ERROR_CODE.SUCCESS:
                 print(f"Frame grab failed: {grab_status} — skipping")
+                rejected_reasons["grab_failed"] += 1
+                frame_records.append({
+                    "frame": frame_idx,
+                    "accepted": False,
+                    "reason": "grab_failed",
+                    "status": str(grab_status),
+                })
+                frame_idx += 1
                 continue
 
             zed.retrieve_measure(point_cloud_mat, sl.MEASURE.XYZRGBA)
+            zed.retrieve_measure(confidence_mat, sl.MEASURE.CONFIDENCE)
 
             # ── extract points ────────────────────────────────────────────
-            frame_pts, frame_col = extract_points_and_colors(
-                point_cloud_mat,
-                min_depth_m=args.min_depth_m,
-                max_depth_m=args.max_depth_m,
-                coordinate_system=args.coordinate_system,
+            filtered = extract_points_and_colors(
+                point_cloud_mat, confidence_mat, args
             )
+            frame_pts = filtered.points
+            frame_col = filtered.colors
+            coverage = float(filtered.metrics["filtered_valid_coverage"])
 
-            # ── sparse / empty frame guard ────────────────────────────────
-            # Below 500 points KISS-ICP can produce degenerate transforms.
-            # All sparse/empty frames are silently skipped and counted.
-            # A summary line prints every 30 skipped frames so you know
-            # the camera is out of range without flooding the terminal.
-            if frame_pts.shape[0] < 500:
-                skipped_frames += 1
-                if skipped_frames % 30 == 0:
-                    print(f"  [{skipped_frames} low-point frames skipped so far "
-                          f"— move camera closer to object]")
+            quality = evaluate_frame_quality(
+                frame_pts,
+                coverage,
+                min_points=args.min_reliable_points,
+                min_coverage=args.min_valid_coverage,
+            )
+            if not quality.accepted:
+                rejected_reasons[quality.reason] += 1
+                frame_records.append({
+                    "frame": frame_idx,
+                    **quality_to_dict(quality),
+                    "depth_filter": filtered.metrics,
+                })
+                print(
+                    f"Frame {frame_idx}: rejected {quality.reason} "
+                    f"({frame_pts.shape[0]} points, {coverage:.1%} coverage)"
+                )
                 frame_idx += 1
                 continue
-            # Reset skip counter when a good frame arrives
-            if skipped_frames > 0:
-                if skipped_frames >= 5:
-                    print(f"  [recovered after {skipped_frames} skipped frames]")
-                skipped_frames = 0
 
             # Diagnostic on first good frame — confirm points look sane
-            if frame_idx == 0:
+            if not all_poses:
                 print(f"First frame: {frame_pts.shape[0]} points")
                 print(f"  XYZ min:  {frame_pts.min(axis=0)}")
                 print(f"  XYZ max:  {frame_pts.max(axis=0)}")
                 print(f"  XYZ mean: {frame_pts.mean(axis=0)}")
 
             # ── per-frame subsampling for ICP ─────────────────────────────
-            # Keep original frame_pts/frame_col for the map.
-            # Feed a lighter subset to KISS-ICP — it voxelises internally
-            # so extra points don't help but do slow each iteration.
-            icp_pts = frame_pts
-            if frame_pts.shape[0] > args.max_points_per_frame:
-                idx = np.random.choice(
-                    frame_pts.shape[0], args.max_points_per_frame, replace=False
-                )
-                idx.sort()
-                icp_pts = icp_pts[idx]
-
-            # ── pre-voxel map frame to keep memory/disk usage bounded ─────
-            # At voxel_m=0.001 each raw frame has ~80k pts but after voxel
-            # only ~5-15k remain. Pre-voxelling here keeps the RAM accumulator
-            # 5-20x smaller and makes the final downsample instant.
-            map_pts, map_col = voxel_downsample_numpy(frame_pts, frame_col, args.voxel_m)
+            icp_pts = deterministic_voxel_sample(
+                frame_pts,
+                voxel_m=args.kiss_voxel_m,
+                max_points=args.max_points_per_frame,
+            )
 
             # ── KISS-ICP register ─────────────────────────────────────────
             try:
@@ -503,37 +568,79 @@ def main() -> None:
                 )
             except Exception as exc:
                 print(f"\nFrame {frame_idx}: KISS-ICP register failed: {exc} — skipping")
+                rejected_reasons["registration_failed"] += 1
+                frame_records.append({
+                    "frame": frame_idx,
+                    "accepted": False,
+                    "reason": "registration_failed",
+                    "error": str(exc),
+                    "depth_filter": filtered.metrics,
+                    "quality": quality_to_dict(quality),
+                })
                 frame_idx += 1
                 continue
 
             # ── get latest pose ───────────────────────────────────────────
             pose = kiss.last_pose.astype(np.float64)
+            if not np.isfinite(pose).all():
+                rejected_reasons["nonfinite_pose"] += 1
+                frame_records.append({
+                    "frame": frame_idx,
+                    "accepted": False,
+                    "reason": "nonfinite_pose",
+                })
+                stop_reason = "nonfinite_pose"
+                print(f"\nFrame {frame_idx}: non-finite pose — stopping")
+                frame_idx += 1
+                break
 
             # ── tracking loss detection ───────────────────────────────────
-            if args.max_jump_m > 0 and all_poses:
-                prev_pose = all_poses[-1]
-                curr_pose = pose
-
-                prev_t = prev_pose[:3, 3]
-                curr_t = curr_pose[:3, 3]
-                jump_m = float(np.linalg.norm(curr_t - prev_t))
-
-                rel_rot = np.linalg.inv(prev_pose[:3, :3]) @ curr_pose[:3, :3]
-                cos_angle = (float(np.trace(rel_rot)) - 1.0) / 2.0
-                cos_angle = max(-1.0, min(1.0, cos_angle))
-                jump_deg = math.degrees(math.acos(cos_angle))
-
-                if jump_m > args.max_jump_m or jump_deg > args.max_jump_deg:
-                    print(f"\nFrame {frame_idx}: tracking jump {jump_m:.3f}m / {jump_deg:.2f}deg > threshold — stopping")
-                    break
+            jump_m, jump_deg = (0.0, 0.0)
+            pose_quality = None
+            if all_poses:
+                pose_quality = evaluate_pose_quality(
+                    all_poses[-1],
+                    pose,
+                    max_translation_m=args.max_jump_m,
+                    max_rotation_deg=args.max_jump_deg,
+                )
+                jump_m = pose_quality.translation_m
+                jump_deg = pose_quality.rotation_deg
+            if pose_quality is not None and not pose_quality.accepted:
+                rejected_reasons["tracking_jump"] += 1
+                frame_records.append({
+                    "frame": frame_idx,
+                    "accepted": False,
+                    "reason": "tracking_jump",
+                    "translation_m": jump_m,
+                    "rotation_deg": jump_deg,
+                    "depth_filter": filtered.metrics,
+                    "quality": quality_to_dict(quality),
+                })
+                stop_reason = "tracking_jump"
+                print(
+                    f"\nFrame {frame_idx}: tracking jump {jump_m:.3f}m / "
+                    f"{jump_deg:.2f}deg > threshold — stopping"
+                )
+                frame_idx += 1
+                break
 
             all_poses.append(pose.copy())
 
-            # ── transform pre-voxelled frame to world and accumulate ──────
-            world_pts = transform_points(map_pts, pose)
-            map_points.append(world_pts)
-            map_colors.append(map_col)
-            map_point_count += world_pts.shape[0]
+            # ── globally fuse this accepted frame ─────────────────────────
+            world_pts = transform_points(frame_pts, pose)
+            global_map.update(world_pts, frame_col)
+            frame_records.append({
+                "frame": frame_idx,
+                "accepted": True,
+                "reason": "accepted",
+                "translation_m": jump_m,
+                "rotation_deg": jump_deg,
+                "icp_points": int(icp_pts.shape[0]),
+                "map_voxels": len(global_map),
+                "depth_filter": filtered.metrics,
+                "quality": quality_to_dict(quality),
+            })
 
             # ── fps display ───────────────────────────────────────────────
             frame_idx += 1
@@ -542,54 +649,104 @@ def main() -> None:
             t_xyz = pose[:3, 3]
             print(
                 f"Frame {frame_idx:5d} | "
-                f"icp={icp_pts.shape[0]:5d} map={map_pts.shape[0]:5d} | "
-                f"total={map_point_count:7d} | "
+                f"icp={icp_pts.shape[0]:5d} valid={frame_pts.shape[0]:6d} | "
+                f"voxels={len(global_map):7d} coverage={coverage:5.1%} | "
                 f"pos=({t_xyz[0]:.3f},{t_xyz[1]:.3f},{t_xyz[2]:.3f}) | "
                 f"fps={fps:.1f}",
                 end="\r",
             )
 
             # ── update viewer ─────────────────────────────────────────────
-            if viz is not None:
-                display_pts = np.concatenate(map_points, axis=0)
-                display_col = np.concatenate(map_colors, axis=0)
+            if (
+                viz is not None
+                and len(all_poses) % viz.UPDATE_EVERY_N_FRAMES == 0
+            ):
+                display_pts, display_col, _ = global_map.to_arrays(
+                    min_observations=1
+                )
                 viz.update(display_pts, display_col)
+
+            if len(global_map) > args.max_map_points:
+                stop_reason = "map_voxel_cap"
+                print(
+                    f"\nMap reached safety cap ({args.max_map_points} voxels) — stopping"
+                )
+                break
 
     except KeyboardInterrupt:
         print("\nKeyboard interrupt — saving map…")
+        stop_reason = "keyboard_interrupt"
+    except Exception as exc:
+        fatal_error = exc
+        stop_reason = "fatal_error"
+        print(f"\nFatal error — preserving accepted output: {exc}")
     finally:
         zed.close()
         if viz is not None:
             viz.destroy()
 
-    # ── final downsample and save ─────────────────────────────────────────────
-    print(f"\nTotal frames processed: {frame_idx}")
-    if not map_points:
-        print("No points accumulated — nothing saved.")
-        return
+    # ── final map, trajectory, and quality report ─────────────────────────────
+    elapsed = time.perf_counter() - t_start
+    final_pts, final_col, final_counts = global_map.to_arrays(
+        min_observations=args.min_map_observations
+    )
+    print(f"\nTotal frames captured: {frame_idx}")
+    print(f"Accepted poses: {len(all_poses)}")
+    print(f"Final map: {final_pts.shape[0]} voxels")
 
-    # Points were pre-voxelled per frame — just concatenate and save
-    final_pts = np.concatenate(map_points, axis=0)
-    final_col = np.concatenate(map_colors, axis=0)
-    # No second voxel pass needed — already done per frame
-    print(f"Final map: {final_pts.shape[0]} points")
+    if final_pts.shape[0] > 0:
+        write_binary_ply(args.out, final_pts, final_col)
+        print(f"Saved → {args.out}")
+    else:
+        print("No voxels met the final observation threshold; no PLY was written.")
 
-    write_binary_ply(args.out, final_pts, final_col)
-    print(f"Saved → {args.out}")
+    trajectory_path = args.out.with_name(
+        f"{args.out.stem}_trajectory.npy"
+    )
+    if all_poses:
+        np.save(trajectory_path, np.stack(all_poses, axis=0))
+        print(f"Trajectory saved → {trajectory_path} ({len(all_poses)} poses)")
 
-    # ── also save trajectory ──────────────────────────────────────────────────
-    # Handle both v0.x (kiss.poses list) and v1.1+ (no stored trajectory).
-    # In v1.1+ we accumulated poses manually into all_poses during the loop.
-    trajectory = None
-    if hasattr(kiss, 'poses') and len(kiss.poses) > 0:
-        trajectory = np.stack(kiss.poses, axis=0)
-    elif all_poses:
-        trajectory = np.stack(all_poses, axis=0)
+    closure_m, closure_deg = (0.0, 0.0)
+    if len(all_poses) > 1:
+        closure_m, closure_deg = pose_step(all_poses[0], all_poses[-1])
 
-    if trajectory is not None:
-        traj_path = args.out.with_stem(args.out.stem + '_trajectory').with_suffix('.npy')
-        np.save(traj_path, trajectory)
-        print(f'Trajectory saved → {traj_path}  ({len(trajectory)} poses)')
+    report = {
+        "output": str(args.out),
+        "trajectory": str(trajectory_path) if all_poses else None,
+        "stop_reason": stop_reason,
+        "versions": {
+            "zed_sdk": zed_sdk_version,
+            "kiss_icp": package_version("kiss-icp"),
+            "open3d": package_version("open3d"),
+            "numpy": np.__version__,
+        },
+        "config": serializable_args(args),
+        "summary": {
+            "captured_frames": frame_idx,
+            "accepted_frames": len(all_poses),
+            "rejected_frames": int(sum(rejected_reasons.values())),
+            "rejection_reasons": dict(rejected_reasons),
+            "elapsed_s": elapsed,
+            "capture_fps": frame_idx / elapsed if elapsed > 0 else 0.0,
+            "global_voxels_before_observation_filter": len(global_map),
+            "final_voxels": int(final_pts.shape[0]),
+            "final_observation_count_min": (
+                int(final_counts.min()) if final_counts.size else None
+            ),
+            "final_observation_count_median": (
+                float(np.median(final_counts)) if final_counts.size else None
+            ),
+            "closure_translation_m": closure_m,
+            "closure_rotation_deg": closure_deg,
+        },
+        "frames": frame_records,
+    }
+    write_quality_report(report_path, report)
+    print(f"Quality report saved → {report_path}")
+
+    if fatal_error is not None:
+        raise RuntimeError("Scan stopped after a fatal error") from fatal_error
 
 
 if __name__ == "__main__":
