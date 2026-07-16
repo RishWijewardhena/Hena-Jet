@@ -5,10 +5,56 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
+import re
+import time
 
 import numpy as np
 import pyzed.sl as sl
+
+
+FULL_REVOLUTION_DEGREES = 360.0
+SEGMENT_ACKNOWLEDGEMENT = re.compile(
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s+degree\s+ok",
+    re.IGNORECASE,
+)
+
+
+def parse_segment_acknowledgement(line: str) -> float | None:
+    """Return the relative segment angle from a ``<angle> degree ok`` line."""
+    match = SEGMENT_ACKNOWLEDGEMENT.fullmatch(line.strip())
+    if match is None:
+        return None
+    return float(match.group(1))
+
+
+def advance_capture_angle(current_angle_deg: float, segment_angle_deg: float) -> float:
+    """Advance a cumulative scanner angle without allowing a revolution overrun."""
+    if not math.isfinite(segment_angle_deg) or segment_angle_deg <= 0:
+        raise ValueError(f"Invalid segment angle from controller: {segment_angle_deg}")
+
+    next_angle = current_angle_deg + segment_angle_deg
+    if next_angle > FULL_REVOLUTION_DEGREES + 1e-6:
+        raise ValueError(
+            f"Controller angle overrun: {current_angle_deg:g} + "
+            f"{segment_angle_deg:g} exceeds 360 degrees"
+        )
+    if math.isclose(next_angle, FULL_REVOLUTION_DEGREES, abs_tol=1e-6):
+        return FULL_REVOLUTION_DEGREES
+    return next_angle
+
+
+def serial_start_command(step_degrees: float, pulses_per_revolution: int) -> bytes:
+    """Format the motor firmware's ``start,<degrees>,<ppr>`` command."""
+    step = float(step_degrees)
+    ppr = int(pulses_per_revolution)
+    if not math.isfinite(step) or step <= 0 or step > FULL_REVOLUTION_DEGREES:
+        raise ValueError(f"Invalid serial step angle: {step_degrees}")
+    if ppr <= 0 or ppr > 100_000:
+        raise ValueError(f"Invalid pulses per revolution: {pulses_per_revolution}")
+    step_text = f"{step:.6f}".rstrip("0").rstrip(".")
+    return f"start,{step_text},{ppr}\n".encode("ascii")
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +81,9 @@ def parse_args() -> argparse.Namespace:
         HD1080, HD720, and VGA. The default is HD720.
     --coordinate-system: ZED point-cloud coordinate system. IMAGE is the ZED
         image/depth convention: +X right, +Y down, +Z forward.
+    --serial-port: Optional motor-controller port, for example /dev/ttyACM0.
+        When supplied, this script owns the port, starts the 360-degree sequence,
+        and captures only after each '<angle> degree ok' acknowledgement.
     """
     parser = argparse.ArgumentParser(
         description="Capture one RGB/depth point cloud from a ZED camera."
@@ -53,6 +102,12 @@ def parse_args() -> argparse.Namespace:
         choices=["IMAGE", "RIGHT_HANDED_Z_UP_X_FWD"],
         default="IMAGE",
     )
+    parser.add_argument("--serial-port", default=None)
+    parser.add_argument("--serial-baud", type=int, default=115200)
+    parser.add_argument("--step-deg", type=float, default=None)
+    parser.add_argument("--pulses-per-revolution", type=int, default=None)
+    parser.add_argument("--serial-timeout-s", type=float, default=30.0)
+    parser.add_argument("--serial-reset-delay-s", type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -71,6 +126,22 @@ def validate_args(args: argparse.Namespace) -> None:
             f"--max-depth-m ({args.max_depth_m}) must be greater than "
             f"--min-depth-m ({args.min_depth_m})"
         )
+    if args.angle_deg is not None and args.serial_port is not None:
+        raise ValueError("--angle-deg and --serial-port cannot be used together")
+    if args.serial_port is not None:
+        if args.step_deg is None:
+            raise ValueError("--step-deg is required with --serial-port")
+        if args.pulses_per_revolution is None:
+            raise ValueError(
+                "--pulses-per-revolution is required with --serial-port"
+            )
+        serial_start_command(args.step_deg, args.pulses_per_revolution)
+        if args.serial_baud <= 0:
+            raise ValueError("--serial-baud must be positive")
+        if args.serial_timeout_s <= 0:
+            raise ValueError("--serial-timeout-s must be positive")
+        if args.serial_reset_delay_s < 0:
+            raise ValueError("--serial-reset-delay-s cannot be negative")
 
 
 def resolution_from_name(name: str) -> sl.RESOLUTION:
@@ -331,6 +402,132 @@ def prompt_for_angle() -> float | None:
             print(f"Invalid input '{raw_value}'. Please enter a number or q.")
 
 
+def capture_from_serial(
+    zed: sl.Camera,
+    runtime: sl.RuntimeParameters,
+    point_cloud: sl.Mat,
+    depth_mat: sl.Mat,
+    color_mat: sl.Mat,
+    args: argparse.Namespace,
+) -> None:
+    """Run a full scan, capturing once after every completed motor segment.
+
+    This mode owns the serial port. The Tkinter motor GUI must be disconnected
+    while it runs because two processes cannot safely consume the same device
+    messages.
+    """
+    import serial
+
+    try:
+        connection = serial.Serial(
+            args.serial_port,
+            args.serial_baud,
+            timeout=0.2,
+            write_timeout=1,
+        )
+    except serial.SerialException as exc:
+        raise RuntimeError(
+            f"Could not open motor controller {args.serial_port}: {exc}"
+        ) from exc
+
+    command = serial_start_command(args.step_deg, args.pulses_per_revolution)
+    current_angle_deg = 0.0
+    capture_count = 0
+    last_message_at = time.monotonic()
+
+    def request_stop() -> None:
+        try:
+            connection.write(b"stop\n")
+            connection.flush()
+            print("TX  stop")
+        except (serial.SerialException, serial.SerialTimeoutException, OSError):
+            pass
+
+    try:
+        if args.serial_reset_delay_s:
+            time.sleep(args.serial_reset_delay_s)
+        connection.reset_input_buffer()
+        connection.write(command)
+        connection.flush()
+        print(f"TX  {command.decode('ascii').strip()}")
+
+        while True:
+            raw_line = connection.readline()
+            if not raw_line:
+                if time.monotonic() - last_message_at > args.serial_timeout_s:
+                    raise RuntimeError(
+                        f"No motor-controller message for "
+                        f"{args.serial_timeout_s:g} seconds"
+                    )
+                continue
+
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            last_message_at = time.monotonic()
+            print(f"RX  {line}")
+
+            segment_angle_deg = parse_segment_acknowledgement(line)
+            if segment_angle_deg is not None:
+                expected_segment = min(
+                    args.step_deg,
+                    FULL_REVOLUTION_DEGREES - current_angle_deg,
+                )
+                if not math.isclose(
+                    segment_angle_deg,
+                    expected_segment,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ):
+                    raise RuntimeError(
+                        f"Expected a {expected_segment:g}-degree acknowledgement, "
+                        f"received {segment_angle_deg:g} degrees"
+                    )
+
+                current_angle_deg = advance_capture_angle(
+                    current_angle_deg,
+                    segment_angle_deg,
+                )
+                capture_angle(
+                    zed,
+                    runtime,
+                    point_cloud,
+                    depth_mat,
+                    color_mat,
+                    args,
+                    current_angle_deg,
+                    flush=True,
+                )
+                capture_count += 1
+                last_message_at = time.monotonic()
+                continue
+
+            normalized = line.lower()
+            if normalized == "completed":
+                if not math.isclose(
+                    current_angle_deg,
+                    FULL_REVOLUTION_DEGREES,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ):
+                    raise RuntimeError(
+                        f"Controller completed at cumulative angle "
+                        f"{current_angle_deg:g}, expected 360"
+                    )
+                print(f"Serial scan completed with {capture_count} captures.")
+                return
+            if normalized in {"stopped", "alert"} or normalized.startswith("error,"):
+                raise RuntimeError(f"Motor controller stopped the scan: {line}")
+    except KeyboardInterrupt:
+        request_stop()
+        print("Serial scan interrupted.")
+    except Exception:
+        request_stop()
+        raise
+    finally:
+        connection.close()
+
+
 def main() -> None:
     """Capture one filtered XYZRGBA point cloud and save RGB-D data plus metadata.
 
@@ -367,6 +564,17 @@ def main() -> None:
             status = zed.grab(runtime)
             if status != sl.ERROR_CODE.SUCCESS:
                 raise RuntimeError(f"Warmup frame {index + 1} failed: {status}")
+
+        if args.serial_port is not None:
+            capture_from_serial(
+                zed,
+                runtime,
+                point_cloud,
+                depth_mat,
+                color_mat,
+                args,
+            )
+            return
 
         if args.angle_deg is not None:
             # Single-angle mode: warmup already done above, no extra flush needed
