@@ -39,16 +39,9 @@ def parse_args() -> argparse.Namespace:
     --override-radius-m and --override-height-m: Replace the saved capture
         radius/height metadata during fusion. Use these when the physical
         measurement was taken from the camera body instead of the optical center.
-    --camera-yaw-deg, --camera-pitch-deg, and --camera-roll-deg: Small camera
-        mounting corrections applied after the ideal look-at-center pose.
-    --heading-mode: Use look-at for a camera that turns to face the scanner
-        center at every angle, or fixed for a camera whose heading does not
-        rotate with the circular position.
-    --fixed-heading-deg: World angle used by fixed heading mode.
-    --open3d-camera-coords: Select the camera-axis convention used while
-        converting Open3D RGB-D coordinates into the ZED scanner coordinates.
-        image uses X right, Y down, Z forward. y-up uses X right, Y up,
-        Z backward.
+    The camera is assumed to stay level and face the scanner center while it
+    moves around the pillar. Captures use IMAGE coordinates: +X right, +Y down,
+    +Z forward.
     """
     parser = argparse.ArgumentParser(
         description="Fuse ZED RGB-D captures into a mesh using Open3D TSDF."
@@ -69,62 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center-offset-y-m", type=float, default=0.0)
     parser.add_argument("--override-radius-m", type=float, default=None)
     parser.add_argument("--override-height-m", type=float, default=None)
-    parser.add_argument("--camera-yaw-deg", type=float, default=0.0)
-    parser.add_argument("--camera-pitch-deg", type=float, default=0.0)
-    parser.add_argument("--camera-roll-deg", type=float, default=0.0)
-    parser.add_argument("--heading-mode", choices=["look-at", "fixed"], default="look-at")
-    parser.add_argument("--fixed-heading-deg", type=float, default=0.0)
-    parser.add_argument(
-        "--open3d-camera-coords",
-        choices=["image", "y-up"],
-        default="image",
-    )
     return parser.parse_args()
-
-
-def rotation_x(degrees: float) -> np.ndarray:
-    """Return a 3D rotation matrix around the camera/local X axis."""
-    radians = math.radians(degrees)
-    cos_value = math.cos(radians)
-    sin_value = math.sin(radians)
-    return np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [0.0, cos_value, -sin_value],
-            [0.0, sin_value, cos_value],
-        ],
-        dtype=np.float64,
-    )
-
-
-def rotation_y(degrees: float) -> np.ndarray:
-    """Return a 3D rotation matrix around the camera/local Y axis."""
-    radians = math.radians(degrees)
-    cos_value = math.cos(radians)
-    sin_value = math.sin(radians)
-    return np.array(
-        [
-            [cos_value, 0.0, sin_value],
-            [0.0, 1.0, 0.0],
-            [-sin_value, 0.0, cos_value],
-        ],
-        dtype=np.float64,
-    )
-
-
-def rotation_z(degrees: float) -> np.ndarray:
-    """Return a 3D rotation matrix around the camera/local Z axis."""
-    radians = math.radians(degrees)
-    cos_value = math.cos(radians)
-    sin_value = math.sin(radians)
-    return np.array(
-        [
-            [cos_value, -sin_value, 0.0],
-            [sin_value, cos_value, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
 
 
 def corrected_angle(angle_deg: float, invert_angles: bool, angle_offset_deg: float) -> float:
@@ -133,43 +71,8 @@ def corrected_angle(angle_deg: float, invert_angles: bool, angle_offset_deg: flo
     return signed_angle + angle_offset_deg
 
 
-def zed_from_open3d_axes(open3d_camera_coords: str) -> np.ndarray:
-    """Convert selected Open3D camera axes into ZED camera-local axes.
-
-    ZED point-cloud coordinates are +X forward, +Y left, +Z up. The image mode
-    matches normal RGB-D image unprojection: +X right, +Y down, +Z forward. The
-    y-up mode matches the Open3D/OpenGL-style camera convention: +X right,
-    +Y up, +Z backward.
-    """
-    if open3d_camera_coords == "image":
-        return np.array(
-            [
-                [0.0, 0.0, 1.0],
-                [-1.0, 0.0, 0.0],
-                [0.0, -1.0, 0.0],
-            ],
-            dtype=np.float64,
-        )
-    if open3d_camera_coords == "y-up":
-        return np.array(
-            [
-                [0.0, 0.0, -1.0],
-                [-1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-            ],
-            dtype=np.float64,
-        )
-    raise ValueError(f"Unsupported Open3D camera coordinate mode: {open3d_camera_coords}")
-
-
-def camera_points_from_depth(depth: np.ndarray, meta: dict, open3d_camera_coords: str) -> np.ndarray:
-    """Unproject a depth image into the selected Open3D camera coordinate mode.
-
-    The ZED depth image stores forward distance per pixel. For image mode this
-    becomes Open3D RGB-D style +Z forward and +Y down. For y-up mode we convert
-    the same pixels into +Y up and +Z backward before applying the matching
-    camera-to-world transform.
-    """
+def camera_points_from_depth(depth: np.ndarray, meta: dict) -> np.ndarray:
+    """Unproject an IMAGE-coordinate depth map into camera-local 3D points."""
     intrinsics = meta["camera_intrinsics"]
     fx = float(intrinsics["fx"])
     fy = float(intrinsics["fy"])
@@ -180,13 +83,7 @@ def camera_points_from_depth(depth: np.ndarray, meta: dict, open3d_camera_coords
     x_right = (cols - cx) * z_forward / fx
     y_down = (rows - cy) * z_forward / fy
 
-    if open3d_camera_coords == "image":
-        camera_points = np.stack([x_right, y_down, z_forward], axis=-1)
-    elif open3d_camera_coords == "y-up":
-        camera_points = np.stack([x_right, -y_down, -z_forward], axis=-1)
-    else:
-        raise ValueError(f"Unsupported Open3D camera coordinate mode: {open3d_camera_coords}")
-    return camera_points.reshape(-1, 3)
+    return np.stack([x_right, y_down, z_forward], axis=-1).reshape(-1, 3)
 
 
 def scanner_radius(meta: dict, override_radius_m: float | None) -> float:
@@ -211,49 +108,26 @@ def camera_to_world_matrix(
     angle_offset_deg: float = 0.0,
     center_offset_x_m: float = 0.0,
     center_offset_y_m: float = 0.0,
-    camera_yaw_deg: float = 0.0,
-    camera_pitch_deg: float = 0.0,
-    camera_roll_deg: float = 0.0,
-    heading_mode: str = "look-at",
-    fixed_heading_deg: float = 0.0,
-    open3d_camera_coords: str = "image",
 ) -> np.ndarray:
-    """Build the Open3D camera-to-world transform for one scanner angle.
+    """Build a level, inward-facing IMAGE camera pose for one scanner angle.
 
     The scanner setup is a fixed object at the origin and a camera orbiting
-    around table/world Z. Open3D RGB-D camera coordinates are +X right, +Y down,
-    +Z forward. ZED point-cloud coordinates used elsewhere in this project are
-    +X forward, +Y left, +Z up, so this function includes that axis conversion.
-    The optional correction parameters let you tune real-world mounting errors
-    without capturing the full scan again.
+    around world Z. The camera stays horizontal and its IMAGE +Z axis always
+    points toward the scanner center. IMAGE +X points right and +Y points down.
     """
     angle_deg = corrected_angle(angle_deg, invert_angles, angle_offset_deg)
     theta = math.radians(angle_deg)
     center = np.array([center_offset_x_m, center_offset_y_m, 0.0], dtype=np.float64)
     radial_out = np.array([math.cos(theta), math.sin(theta), 0.0], dtype=np.float64)
-    if heading_mode == "look-at":
-        zed_forward = -radial_out
-    elif heading_mode == "fixed":
-        heading_theta = math.radians(fixed_heading_deg)
-        zed_forward = np.array(
-            [-math.cos(heading_theta), -math.sin(heading_theta), 0.0],
-            dtype=np.float64,
-        )
-    else:
-        raise ValueError(f"Unsupported heading mode: {heading_mode}")
-    zed_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    zed_left = np.cross(zed_up, zed_forward)
-
-    world_from_zed = np.column_stack([zed_forward, zed_left, zed_up])
-    zed_from_open3d = zed_from_open3d_axes(open3d_camera_coords)
+    camera_forward = -radial_out
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    camera_right = np.cross(camera_forward, world_up)
+    camera_down = -world_up
 
     transform = np.eye(4, dtype=np.float64)
-    mount_correction = (
-        rotation_z(camera_yaw_deg)
-        @ rotation_y(camera_pitch_deg)
-        @ rotation_x(camera_roll_deg)
+    transform[:3, :3] = np.column_stack(
+        [camera_right, camera_down, camera_forward]
     )
-    transform[:3, :3] = world_from_zed @ mount_correction @ zed_from_open3d
     transform[:3, 3] = np.array(
         [radius_m * math.cos(theta), radius_m * math.sin(theta), height_m],
         dtype=np.float64,
@@ -302,22 +176,9 @@ def make_intrinsic(meta: dict) -> o3d.camera.PinholeCameraIntrinsic:
 def apply_depth_filters(
     depth: np.ndarray,
     meta: dict,
-    max_depth_over_radius_m: float,
-    min_world_z: float | None,
-    max_world_z: float | None,
-    max_world_radius_m: float | None,
-    invert_angles: bool,
-    angle_offset_deg: float,
-    center_offset_x_m: float,
-    center_offset_y_m: float,
-    override_radius_m: float | None,
-    override_height_m: float | None,
-    camera_yaw_deg: float,
-    camera_pitch_deg: float,
-    camera_roll_deg: float,
-    heading_mode: str,
-    fixed_heading_deg: float,
-    open3d_camera_coords: str,
+    radius_m: float,
+    camera_to_world: np.ndarray,
+    args: argparse.Namespace,
 ) -> np.ndarray:
     """Zero invalid depth pixels before they are integrated into the TSDF.
 
@@ -328,44 +189,34 @@ def apply_depth_filters(
     filtered = depth.copy()
     valid = np.isfinite(filtered) & (filtered > 0.0)
 
-    if max_depth_over_radius_m > 0:
-        max_camera_depth_m = scanner_radius(meta, override_radius_m) + max_depth_over_radius_m
-        valid &= filtered <= max_camera_depth_m
+    if args.max_depth_over_radius_m > 0:
+        valid &= filtered <= radius_m + args.max_depth_over_radius_m
 
-    if min_world_z is not None or max_world_z is not None or max_world_radius_m is not None:
-        camera_points = camera_points_from_depth(
-            filtered,
-            meta,
-            open3d_camera_coords=open3d_camera_coords,
-        )
-
-        camera_to_world = camera_to_world_matrix(
-            angle_deg=float(meta["angle_deg"]),
-            radius_m=scanner_radius(meta, override_radius_m),
-            height_m=scanner_height(meta, override_height_m),
-            invert_angles=invert_angles,
-            angle_offset_deg=angle_offset_deg,
-            center_offset_x_m=center_offset_x_m,
-            center_offset_y_m=center_offset_y_m,
-            camera_yaw_deg=camera_yaw_deg,
-            camera_pitch_deg=camera_pitch_deg,
-            camera_roll_deg=camera_roll_deg,
-            heading_mode=heading_mode,
-            fixed_heading_deg=fixed_heading_deg,
-            open3d_camera_coords=open3d_camera_coords,
-        )
+    world_crop_requested = any(
+        value is not None
+        for value in (args.min_world_z, args.max_world_z, args.max_world_radius_m)
+    )
+    if world_crop_requested:
+        camera_points = camera_points_from_depth(filtered, meta)
         rotation = camera_to_world[:3, :3]
         translation = camera_to_world[:3, 3]
         world_points = camera_points @ rotation.T + translation
-        world_points = world_points.reshape(filtered.shape[0], filtered.shape[1], 3)
+        world_points = world_points.reshape(*filtered.shape, 3)
 
-        if min_world_z is not None:
-            valid &= world_points[:, :, 2] >= min_world_z
-        if max_world_z is not None:
-            valid &= world_points[:, :, 2] <= max_world_z
-        if max_world_radius_m is not None:
-            center_xy = np.array([center_offset_x_m, center_offset_y_m], dtype=np.float64)
-            valid &= np.linalg.norm(world_points[:, :, :2] - center_xy, axis=2) <= max_world_radius_m
+        if args.min_world_z is not None:
+            valid &= world_points[:, :, 2] >= args.min_world_z
+        if args.max_world_z is not None:
+            valid &= world_points[:, :, 2] <= args.max_world_z
+        if args.max_world_radius_m is not None:
+            center_xy = np.array(
+                [args.center_offset_x_m, args.center_offset_y_m],
+                dtype=np.float64,
+            )
+            distance_from_center = np.linalg.norm(
+                world_points[:, :, :2] - center_xy,
+                axis=2,
+            )
+            valid &= distance_from_center <= args.max_world_radius_m
 
     filtered[~valid] = 0.0
     return filtered.astype(np.float32)
@@ -382,68 +233,48 @@ def make_rgbd(color: np.ndarray, depth: np.ndarray, depth_trunc_m: float) -> o3d
     )
 
 
-def main() -> None:
-    """Integrate all captures into a scalable TSDF volume and extract a mesh."""
-    args = parse_args()
-    meta_paths = sorted(args.capture_dir.glob("angle_*.json"))
-    if not meta_paths:
-        raise RuntimeError(f"No angle_*.json captures found in {args.capture_dir}")
-
-    volume = o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=args.voxel_length_m,
-        sdf_trunc=args.sdf_trunc_m,
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+def capture_pose(meta: dict, args: argparse.Namespace) -> tuple[float, np.ndarray]:
+    """Return the calibrated scanner radius and camera-to-world transform."""
+    radius_m = scanner_radius(meta, args.override_radius_m)
+    camera_to_world = camera_to_world_matrix(
+        angle_deg=float(meta["angle_deg"]),
+        radius_m=radius_m,
+        height_m=scanner_height(meta, args.override_height_m),
+        invert_angles=args.invert_angles,
+        angle_offset_deg=args.angle_offset_deg,
+        center_offset_x_m=args.center_offset_x_m,
+        center_offset_y_m=args.center_offset_y_m,
     )
+    return radius_m, camera_to_world
 
-    for index, meta_path in enumerate(meta_paths):
-        meta, depth, color = load_capture(meta_path)
-        depth = apply_depth_filters(
-            depth,
-            meta,
-            max_depth_over_radius_m=args.max_depth_over_radius_m,
-            min_world_z=args.min_world_z,
-            max_world_z=args.max_world_z,
-            max_world_radius_m=args.max_world_radius_m,
-            invert_angles=args.invert_angles,
-            angle_offset_deg=args.angle_offset_deg,
-            center_offset_x_m=args.center_offset_x_m,
-            center_offset_y_m=args.center_offset_y_m,
-            override_radius_m=args.override_radius_m,
-            override_height_m=args.override_height_m,
-            camera_yaw_deg=args.camera_yaw_deg,
-            camera_pitch_deg=args.camera_pitch_deg,
-            camera_roll_deg=args.camera_roll_deg,
-            heading_mode=args.heading_mode,
-            fixed_heading_deg=args.fixed_heading_deg,
-            open3d_camera_coords=args.open3d_camera_coords,
-        )
-        depth_trunc_m = (
-            args.depth_trunc_m
-            if args.depth_trunc_m is not None
-            else scanner_radius(meta, args.override_radius_m)
-            + max(args.max_depth_over_radius_m, 0.0)
-        )
-        rgbd = make_rgbd(color, depth, depth_trunc_m=depth_trunc_m)
-        intrinsic = make_intrinsic(meta)
-        camera_to_world = camera_to_world_matrix(
-            angle_deg=float(meta["angle_deg"]),
-            radius_m=scanner_radius(meta, args.override_radius_m),
-            height_m=scanner_height(meta, args.override_height_m),
-            invert_angles=args.invert_angles,
-            angle_offset_deg=args.angle_offset_deg,
-            center_offset_x_m=args.center_offset_x_m,
-            center_offset_y_m=args.center_offset_y_m,
-            camera_yaw_deg=args.camera_yaw_deg,
-            camera_pitch_deg=args.camera_pitch_deg,
-            camera_roll_deg=args.camera_roll_deg,
-            heading_mode=args.heading_mode,
-            fixed_heading_deg=args.fixed_heading_deg,
-            open3d_camera_coords=args.open3d_camera_coords,
-        )
-        world_to_camera = np.linalg.inv(camera_to_world)
-        volume.integrate(rgbd, intrinsic, world_to_camera)
-        valid_pixels = int(np.count_nonzero(depth))
-        print(f"Integrated {index + 1}/{len(meta_paths)} {meta_path.name}: {valid_pixels} depth pixels")
+
+def integrate_capture(
+    volume: o3d.pipelines.integration.ScalableTSDFVolume,
+    meta_path: Path,
+    args: argparse.Namespace,
+) -> int:
+    """Load, filter, and integrate one capture; return its valid pixel count."""
+    meta, depth, color = load_capture(meta_path)
+    radius_m, camera_to_world = capture_pose(meta, args)
+    depth = apply_depth_filters(depth, meta, radius_m, camera_to_world, args)
+
+    depth_trunc_m = args.depth_trunc_m
+    if depth_trunc_m is None:
+        depth_trunc_m = radius_m + max(args.max_depth_over_radius_m, 0.0)
+
+    volume.integrate(
+        make_rgbd(color, depth, depth_trunc_m),
+        make_intrinsic(meta),
+        np.linalg.inv(camera_to_world),
+    )
+    return int(np.count_nonzero(depth))
+
+
+def save_outputs(
+    volume: o3d.pipelines.integration.ScalableTSDFVolume,
+    args: argparse.Namespace,
+) -> None:
+    """Extract and save the requested mesh and optional point cloud."""
 
     mesh = volume.extract_triangle_mesh()
     mesh.compute_vertex_normals()
@@ -458,6 +289,29 @@ def main() -> None:
         o3d.io.write_point_cloud(str(args.cloud_out), cloud)
         print(f"Saved TSDF cloud with {len(cloud.points)} points")
         print(args.cloud_out)
+
+
+def main() -> None:
+    """Integrate all captures into a scalable TSDF volume and save the result."""
+    args = parse_args()
+    meta_paths = sorted(args.capture_dir.glob("angle_*.json"))
+    if not meta_paths:
+        raise RuntimeError(f"No angle_*.json captures found in {args.capture_dir}")
+
+    volume = o3d.pipelines.integration.ScalableTSDFVolume(
+        voxel_length=args.voxel_length_m,
+        sdf_trunc=args.sdf_trunc_m,
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+    )
+
+    for index, meta_path in enumerate(meta_paths, start=1):
+        valid_pixels = integrate_capture(volume, meta_path, args)
+        print(
+            f"Integrated {index}/{len(meta_paths)} {meta_path.name}: "
+            f"{valid_pixels} depth pixels"
+        )
+
+    save_outputs(volume, args)
 
 
 if __name__ == "__main__":
