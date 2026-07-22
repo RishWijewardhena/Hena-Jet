@@ -10,10 +10,12 @@
 
 namespace {
 
-constexpr double MOTOR_RPM = 1.0;
+constexpr double MOTOR_RPM = 0.25;
 constexpr double START_RPM = 0.25;
 constexpr double ACCELERATION_RPM_PER_SECOND = 3.0;
-constexpr uint32_t SEGMENT_DELAY_MS = 1000;
+constexpr double MINIMUM_CONTINUOUS_RPM = 0.05;
+constexpr double MAXIMUM_CONTINUOUS_RPM = 2.0;
+constexpr uint32_t SEGMENT_DELAY_MS = 200;
 constexpr uint32_t PULSE_HIGH_US = 100;
 constexpr uint32_t MINIMUM_PULSES_PER_REVOLUTION = 1;
 constexpr uint32_t MAXIMUM_PULSES_PER_REVOLUTION = 100000;
@@ -32,6 +34,7 @@ enum class MotionState {
     Idle,
     Stepping,
     WaitingBetweenSegments,
+    AwaitingNextSegment,
 };
 
 MotionState motionState = MotionState::Idle;
@@ -55,6 +58,9 @@ uint32_t stopBrakingPulsesEmitted = 0;
 bool pulseIsHigh = false;
 bool stopRequested = false;
 bool currentPulseIsBraking = false;
+bool synchronizedSequence = false;
+bool continuousSequence = false;
+double nextCaptureAngleDegrees = 0.0;
 
 char commandBuffer[COMMAND_BUFFER_SIZE] = {};
 size_t commandLength = 0;
@@ -104,6 +110,8 @@ void stopMotion(bool announce)
     stopBrakingPulsesEmitted = 0;
     stopRequested = false;
     currentPulseIsBraking = false;
+    continuousSequence = false;
+    nextCaptureAngleDegrees = 0.0;
 
     if (announce) {
         Serial.println("stopped");
@@ -111,6 +119,32 @@ void stopMotion(bool announce)
 }
 
 void finishCurrentSegment();
+
+void reportContinuousCaptureEvents()
+{
+    while (nextCaptureAngleDegrees > 0.0
+           && nextCaptureAngleDegrees <= motion::FULL_REVOLUTION_DEGREES) {
+        const uint32_t targetPulses = motion::continuousPulseTarget(
+            nextCaptureAngleDegrees, activePulsesPerRevolution);
+        if (emittedPulses < targetPulses) {
+            return;
+        }
+
+        Serial.print("angle_ok,");
+        printDegrees(nextCaptureAngleDegrees);
+        Serial.print(",");
+        Serial.println(emittedPulses);
+
+        if (nextCaptureAngleDegrees + 1e-9
+            >= motion::FULL_REVOLUTION_DEGREES) {
+            nextCaptureAngleDegrees = 0.0;
+        } else {
+            nextCaptureAngleDegrees = std::fmin(
+                nextCaptureAngleDegrees + requestedIncrementDegrees,
+                motion::FULL_REVOLUTION_DEGREES);
+        }
+    }
+}
 
 void beginNextSegment()
 {
@@ -154,8 +188,12 @@ void finishCurrentSegment()
         return;
     }
 
-    segmentWaitStartedMs = millis();
-    motionState = MotionState::WaitingBetweenSegments;
+    if (synchronizedSequence) {
+        motionState = MotionState::AwaitingNextSegment;
+    } else {
+        segmentWaitStartedMs = millis();
+        motionState = MotionState::WaitingBetweenSegments;
+    }
 }
 
 void serviceMotion()
@@ -233,6 +271,18 @@ void serviceMotion()
         return;
     }
 
+    if (continuousSequence) {
+        reportContinuousCaptureEvents();
+        if (segmentPulsesEmitted >= segmentPulseTotal) {
+            stopMotion(false);
+            Serial.println("completed");
+        } else {
+            nextPulseTransitionUs =
+                now + currentPulsePeriodUs - PULSE_HIGH_US;
+        }
+        return;
+    }
+
     if (segmentPulsesEmitted == segmentPulseTotal) {
         finishCurrentSegment();
     } else {
@@ -281,7 +331,73 @@ void lowercase(char *text)
     }
 }
 
-void startSequence(double incrementDegrees, uint32_t pulsesPerRevolution)
+void startContinuousSequence(
+    double incrementDegrees,
+    uint32_t pulsesPerRevolution,
+    double targetRpm)
+{
+    if (isMotionActive()) {
+        Serial.println("error,busy");
+        return;
+    }
+    if (digitalRead(ALARM_PIN) == ALARM_ACTIVE_LEVEL) {
+        Serial.println("error,alarm_active");
+        return;
+    }
+    if (pulsesPerRevolution < MINIMUM_PULSES_PER_REVOLUTION
+        || pulsesPerRevolution > MAXIMUM_PULSES_PER_REVOLUTION) {
+        Serial.println("error,invalid_ppr");
+        return;
+    }
+    if (!motion::isValidIncrement(incrementDegrees, pulsesPerRevolution)) {
+        Serial.println("error,invalid_degree");
+        return;
+    }
+    if (!std::isfinite(targetRpm) || targetRpm < MINIMUM_CONTINUOUS_RPM
+        || targetRpm > MAXIMUM_CONTINUOUS_RPM) {
+        Serial.println("error,invalid_rpm");
+        return;
+    }
+
+    activePulsesPerRevolution = pulsesPerRevolution;
+    startPulseRateHz = std::fmin(START_RPM, targetRpm)
+        * activePulsesPerRevolution / 60.0;
+    maximumPulseRateHz = targetRpm * activePulsesPerRevolution / 60.0;
+    pulseAccelerationHzPerSecond =
+        ACCELERATION_RPM_PER_SECOND * activePulsesPerRevolution / 60.0;
+    requestedIncrementDegrees = incrementDegrees;
+    completedDegrees = 0.0;
+    currentSegmentDegrees = motion::continuousRunoutDegrees(incrementDegrees);
+    emittedPulses = 0;
+    segmentPulsesEmitted = 0;
+    segmentPulseTotal = motion::continuousPulseTarget(
+        currentSegmentDegrees, activePulsesPerRevolution);
+    stopRequested = false;
+    synchronizedSequence = false;
+    continuousSequence = true;
+    nextCaptureAngleDegrees = std::fmin(
+        incrementDegrees, motion::FULL_REVOLUTION_DEGREES);
+    currentPulseRateHz = 0.0;
+    currentPulsePeriodUs = 0;
+    currentPulseIsBraking = false;
+    pulseIsHigh = false;
+    digitalWrite(PULSE_PIN, LOW);
+    nextPulseTransitionUs = micros();
+    motionState = MotionState::Stepping;
+
+    Serial.print("started_continuous,");
+    printDegrees(incrementDegrees);
+    Serial.print(",");
+    Serial.print(activePulsesPerRevolution);
+    Serial.print(",");
+    printDegrees(targetRpm);
+    Serial.println();
+}
+
+void startSequence(
+    double incrementDegrees,
+    uint32_t pulsesPerRevolution,
+    bool synchronized)
 {
     if (isMotionActive()) {
         Serial.println("error,busy");
@@ -311,8 +427,9 @@ void startSequence(double incrementDegrees, uint32_t pulsesPerRevolution)
     currentSegmentDegrees = 0.0;
     emittedPulses = 0;
     stopRequested = false;
+    synchronizedSequence = synchronized;
 
-    Serial.print("started,");
+    Serial.print(synchronized ? "started_sync," : "started,");
     printDegrees(requestedIncrementDegrees);
     Serial.print(',');
     Serial.print(activePulsesPerRevolution);
@@ -330,13 +447,82 @@ void processCommand(char *rawCommand)
         return;
     }
 
+    if (strcmp(command, "next") == 0) {
+        if (motionState != MotionState::AwaitingNextSegment) {
+            Serial.println("error,invalid_state");
+            return;
+        }
+        beginNextSegment();
+        return;
+    }
+
+    constexpr char START_CONTINUOUS_PREFIX[] = "start_continuous,";
+    if (strncmp(command, START_CONTINUOUS_PREFIX,
+                sizeof(START_CONTINUOUS_PREFIX) - 1) == 0) {
+        char *angleText = trimWhitespace(
+            command + sizeof(START_CONTINUOUS_PREFIX) - 1);
+        char *firstSeparator = strchr(angleText, ',');
+        if (firstSeparator == nullptr) {
+            Serial.println("error,invalid_command");
+            return;
+        }
+        *firstSeparator = '\0';
+        char *pprText = trimWhitespace(firstSeparator + 1);
+        char *secondSeparator = strchr(pprText, ',');
+        if (secondSeparator == nullptr) {
+            Serial.println("error,invalid_command");
+            return;
+        }
+        *secondSeparator = '\0';
+        char *rpmText = trimWhitespace(secondSeparator + 1);
+
+        char *angleEnd = nullptr;
+        const double angle = strtod(angleText, &angleEnd);
+        angleEnd = trimWhitespace(angleEnd);
+        if (angleText == angleEnd || *angleEnd != '\0'
+            || !std::isfinite(angle)) {
+            Serial.println("error,invalid_degree");
+            return;
+        }
+
+        char *pprEnd = nullptr;
+        const unsigned long parsedPpr = strtoul(pprText, &pprEnd, 10);
+        pprEnd = trimWhitespace(pprEnd);
+        if (pprText == pprEnd || *pprEnd != '\0' || *pprText == '-'
+            || parsedPpr > UINT32_MAX) {
+            Serial.println("error,invalid_ppr");
+            return;
+        }
+
+        char *rpmEnd = nullptr;
+        const double rpm = strtod(rpmText, &rpmEnd);
+        rpmEnd = trimWhitespace(rpmEnd);
+        if (rpmText == rpmEnd || *rpmEnd != '\0'
+            || !std::isfinite(rpm)) {
+            Serial.println("error,invalid_rpm");
+            return;
+        }
+
+        startContinuousSequence(
+            angle, static_cast<uint32_t>(parsedPpr), rpm);
+        return;
+    }
+
     constexpr char START_PREFIX[] = "start,";
-    if (strncmp(command, START_PREFIX, sizeof(START_PREFIX) - 1) != 0) {
+    constexpr char START_SYNC_PREFIX[] = "start_sync,";
+    const bool synchronized = strncmp(
+        command, START_SYNC_PREFIX, sizeof(START_SYNC_PREFIX) - 1) == 0;
+    const bool automatic = strncmp(
+        command, START_PREFIX, sizeof(START_PREFIX) - 1) == 0;
+    if (!synchronized && !automatic) {
         Serial.println("error,invalid_command");
         return;
     }
 
-    char *angleText = trimWhitespace(command + sizeof(START_PREFIX) - 1);
+    char *angleText = trimWhitespace(
+        command + (synchronized
+            ? sizeof(START_SYNC_PREFIX) - 1
+            : sizeof(START_PREFIX) - 1));
     char *separator = strchr(angleText, ',');
     if (separator == nullptr) {
         Serial.println("error,invalid_command");
@@ -362,7 +548,7 @@ void processCommand(char *rawCommand)
         return;
     }
 
-    startSequence(angle, static_cast<uint32_t>(parsedPpr));
+    startSequence(angle, static_cast<uint32_t>(parsedPpr), synchronized);
 }
 
 void serviceSerial()

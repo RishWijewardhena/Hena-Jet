@@ -8,6 +8,8 @@ import re
 MAXIMUM_ANGLE_DEGREES = 360.0
 MINIMUM_PULSES_PER_REVOLUTION = 1
 MAXIMUM_PULSES_PER_REVOLUTION = 100_000
+MINIMUM_CONTINUOUS_RPM = 0.05
+MAXIMUM_CONTINUOUS_RPM = 2.0
 
 
 @dataclass(frozen=True)
@@ -15,13 +17,22 @@ class DeviceMessage:
     kind: str
     value: float | str | None = None
     pulses_per_revolution: int | None = None
+    rpm: float | None = None
+    pulse_count: int | None = None
 
 
 def format_degrees(value: float) -> str:
     return f"{value:.6f}".rstrip("0").rstrip(".")
 
 
-def format_start_command(angle_degrees: float, pulses_per_revolution: int) -> bytes:
+def format_start_command(
+    angle_degrees: float,
+    pulses_per_revolution: int,
+    *,
+    synchronized: bool = False,
+    continuous: bool = False,
+    rpm: float | None = None,
+) -> bytes:
     angle = float(angle_degrees)
     ppr_value = float(pulses_per_revolution)
     if (
@@ -36,6 +47,19 @@ def format_start_command(angle_degrees: float, pulses_per_revolution: int) -> by
             f"{MAXIMUM_PULSES_PER_REVOLUTION}"
         )
     ppr = int(ppr_value)
+    if synchronized and continuous:
+        raise ValueError("Synchronized and continuous modes are mutually exclusive")
+    if continuous:
+        if rpm is None or not math.isfinite(float(rpm)):
+            raise ValueError("Continuous mode requires a finite RPM")
+        rpm = float(rpm)
+        if rpm < MINIMUM_CONTINUOUS_RPM or rpm > MAXIMUM_CONTINUOUS_RPM:
+            raise ValueError(
+                f"RPM must be between {MINIMUM_CONTINUOUS_RPM:g} and "
+                f"{MAXIMUM_CONTINUOUS_RPM:g}"
+            )
+    elif rpm is not None:
+        raise ValueError("RPM is only valid in continuous mode")
     minimum_angle = 360.0 / ppr
     if (
         not math.isfinite(angle)
@@ -46,7 +70,13 @@ def format_start_command(angle_degrees: float, pulses_per_revolution: int) -> by
             f"Angle must be between {minimum_angle:.6g} and "
             f"{MAXIMUM_ANGLE_DEGREES} degrees"
         )
-    return f"start,{format_degrees(angle)},{ppr}\n".encode("ascii")
+    if continuous:
+        return (
+            f"start_continuous,{format_degrees(angle)},{ppr},"
+            f"{format_degrees(rpm)}\n"
+        ).encode("ascii")
+    prefix = "start_sync" if synchronized else "start"
+    return f"{prefix},{format_degrees(angle)},{ppr}\n".encode("ascii")
 
 
 def parse_device_message(line: str) -> DeviceMessage:
@@ -54,6 +84,33 @@ def parse_device_message(line: str) -> DeviceMessage:
 
     if normalized in {"ready", "completed", "stopped", "alert"}:
         return DeviceMessage(normalized)
+
+    if normalized.startswith("started_continuous,"):
+        parts = normalized.split(",")
+        try:
+            if len(parts) != 4:
+                raise ValueError
+            return DeviceMessage(
+                "started_continuous",
+                float(parts[1]),
+                int(parts[2]),
+                float(parts[3]),
+            )
+        except ValueError:
+            return DeviceMessage("unknown")
+
+    if normalized.startswith("angle_ok,"):
+        parts = normalized.split(",")
+        try:
+            if len(parts) != 3:
+                raise ValueError
+            return DeviceMessage(
+                "angle_ok",
+                float(parts[1]),
+                pulse_count=int(parts[2]),
+            )
+        except ValueError:
+            return DeviceMessage("unknown")
 
     if normalized.startswith("started,"):
         parts = normalized.split(",")

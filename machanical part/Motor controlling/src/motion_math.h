@@ -27,6 +27,22 @@ inline uint32_t cumulativePulseTarget(double completedDegrees,
         boundedDegrees * pulsesPerRevolution / FULL_REVOLUTION_DEGREES));
 }
 
+inline uint32_t continuousPulseTarget(double degrees,
+                                      uint32_t pulsesPerRevolution)
+{
+    if (!std::isfinite(degrees) || degrees <= 0.0
+        || pulsesPerRevolution == 0) {
+        return 0;
+    }
+    return static_cast<uint32_t>(std::lround(
+        degrees * pulsesPerRevolution / FULL_REVOLUTION_DEGREES));
+}
+
+inline double continuousRunoutDegrees(double incrementDegrees)
+{
+    return FULL_REVOLUTION_DEGREES + incrementDegrees;
+}
+
 inline uint32_t additionalPulsesToTarget(uint32_t emittedPulses,
                                          uint32_t targetPulses)
 {

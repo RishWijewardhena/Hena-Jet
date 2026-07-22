@@ -9,26 +9,22 @@ The firmware uses 115200 baud and newline-terminated ASCII commands.
 
 | Direction | Message | Meaning |
 | --- | --- | --- |
-| PC → ESP32 | `start,5,52100` | Run one 360° sequence in nominal 5° segments at 52,100 PPR |
+| PC → ESP32 | `start,5,52100` | Run the legacy segmented 360° sequence |
+| PC → ESP32 | `start_sync,5,52100` | Move 5° and wait for `next` after each segment |
+| PC → ESP32 | `start_continuous,5,52100,0.5` | Run continuously at 0.5 RPM and report 5° crossings |
 | PC → ESP32 | `stop` | Stop the active sequence immediately |
-| ESP32 → PC | `started,5,52100` | Start command and runtime PPR accepted |
+| ESP32 → PC | `started,5,52100` | Legacy start command accepted |
+| ESP32 → PC | `started_continuous,5,52100,0.5` | Continuous command and runtime RPM accepted |
+| ESP32 → PC | `angle_ok,5,724` | Cumulative angle crossed at the reported pulse count |
 | ESP32 → PC | `5 degree ok` | One requested segment completed |
 | ESP32 → PC | `completed` | The 360° sequence completed |
 | ESP32 → PC | `alert` | A driver alarm edge was detected |
 | ESP32 → PC | `stopped` | The sequence was cancelled |
 | ESP32 → PC | `error,<reason>` | The command could not be performed |
 
-There is a one-second delay between segments. Pulses per revolution is supplied
-with every Start command instead of being compiled into the firmware. At 52,100
-PPR, one pulse is approximately 0.00691°. Cumulative rounding makes the final
-360° position exactly the requested PPR even when an individual segment is not
-an exact number of pulses.
+Legacy automatic mode inserts a 200 ms delay between segments. Synchronized mode waits for `next`. Continuous mode uses one uninterrupted pulse train, reports cumulative angle crossings, passes through 360°, and stops after one increment of runout so the 360° frame is captured before stop vibration. Pulses per revolution is supplied at runtime; cumulative rounding keeps angle events aligned to integer pulse counts.
 
-Each segment uses a symmetric quintic S-curve: it starts at 0.5 RPM, smoothly
-accelerates toward the configured 2 RPM maximum, and smoothly decelerates
-before the final pulse. The 8 RPM/s setting determines the nominal ramp length.
-A Serial `stop` command uses an S-curve controlled stop. A driver alarm remains
-an emergency condition and stops STEP pulses immediately.
+Legacy segments use a symmetric quintic S-curve. Continuous mode ramps once to the requested 0.05–2 RPM speed and decelerates only during the runout. A serial `stop` performs a controlled stop; a driver alarm remains an emergency condition and stops STEP pulses immediately.
 
 ## Alarm wiring warning
 

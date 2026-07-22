@@ -17,6 +17,8 @@ int main()
     assert(motion::cumulativePulseTarget(5.0, pulsesPerRevolution) == 724);
     assert(motion::cumulativePulseTarget(10.0, pulsesPerRevolution) == 1447);
     assert(motion::cumulativePulseTarget(360.0, pulsesPerRevolution) == 52100);
+    assert(motion::continuousPulseTarget(365.0, pulsesPerRevolution) == 52824);
+    assert(motion::continuousRunoutDegrees(5.0) == 365.0);
     assert(motion::additionalPulsesToTarget(52100, 52100) == 0);
     assert(motion::additionalPulsesToTarget(51376, 52100) == 724);
 
