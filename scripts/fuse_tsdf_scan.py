@@ -7,9 +7,42 @@ import argparse
 import json
 import math
 from pathlib import Path
+import re
 
 import numpy as np
 import open3d as o3d
+
+
+MULTILEVEL_PASS_DIRECTORY = re.compile(r"pass_(\d+)_height_(\d+)mm$")
+
+
+def discover_capture_paths(capture_dir: Path) -> list[Path]:
+    """Discover legacy flat captures or ordered multilevel pass captures."""
+    capture_dir = Path(capture_dir)
+    flat_paths = list(capture_dir.glob("angle_*.json"))
+    multilevel_paths = list(
+        capture_dir.glob("pass_*_height_*mm/angle_*.json")
+    )
+    if flat_paths and multilevel_paths:
+        raise RuntimeError(
+            "Capture directory mixes flat and multilevel captures; separate the datasets"
+        )
+    if flat_paths:
+        return sorted(flat_paths)
+
+    def multilevel_key(path: Path) -> tuple[int, int, int, str]:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+        directory_match = MULTILEVEL_PASS_DIRECTORY.fullmatch(path.parent.name)
+        if directory_match is None:
+            raise RuntimeError(f"Invalid multilevel pass directory: {path.parent}")
+        return (
+            int(metadata.get("multilevel_pass_index", directory_match.group(1))),
+            int(metadata.get("multilevel_capture_index", 2**63 - 1)),
+            int(metadata.get("timestamp_ns", 0)),
+            path.name,
+        )
+
+    return sorted(multilevel_paths, key=multilevel_key)
 
 
 def parse_args() -> argparse.Namespace:
@@ -437,7 +470,7 @@ def main() -> None:
     configure_object_frame(args)
     if not 0 <= args.max_depth_confidence <= 100:
         raise ValueError("--max-depth-confidence must be between 0 and 100")
-    meta_paths = sorted(args.capture_dir.glob("angle_*.json"))
+    meta_paths = discover_capture_paths(args.capture_dir)
     if not meta_paths:
         raise RuntimeError(f"No angle_*.json captures found in {args.capture_dir}")
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +36,9 @@ class CaptureFrame:
     prior_pose: np.ndarray
     cloud: o3d.geometry.PointCloud
     valid_depth_pixels: int
+    pass_index: int
+    height_offset_m: float
+    timestamp_ns: int
 
 
 @dataclass
@@ -51,6 +55,117 @@ class RegistrationEdge:
     rmse_m: float
     correction_m: float
     correction_deg: float
+    kind: str = "sequential"
+
+
+MULTILEVEL_PASS_DIRECTORY = re.compile(
+    r"pass_(\d+)_height_(\d+)mm$"
+)
+
+
+def discover_capture_paths(capture_dir: Path) -> list[Path]:
+    """Discover legacy flat captures or ordered multilevel pass captures."""
+    capture_dir = Path(capture_dir)
+    flat_paths = list(capture_dir.glob("angle_*.json"))
+    multilevel_paths = list(
+        capture_dir.glob("pass_*_height_*mm/angle_*.json")
+    )
+    if flat_paths and multilevel_paths:
+        raise RuntimeError(
+            "Capture directory mixes flat and multilevel captures; separate the datasets"
+        )
+    if flat_paths:
+        return sorted(flat_paths)
+    if not multilevel_paths:
+        return []
+
+    def multilevel_key(path: Path) -> tuple[int, int, int, str]:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+        directory_match = MULTILEVEL_PASS_DIRECTORY.fullmatch(path.parent.name)
+        if directory_match is None:
+            raise RuntimeError(f"Invalid multilevel pass directory: {path.parent}")
+        pass_index = int(
+            metadata.get("multilevel_pass_index", directory_match.group(1))
+        )
+        capture_index = int(metadata.get("multilevel_capture_index", 2**63 - 1))
+        timestamp_ns = int(metadata.get("timestamp_ns", 0))
+        return pass_index, capture_index, timestamp_ns, path.name
+
+    return sorted(multilevel_paths, key=multilevel_key)
+
+
+def _frame_groups_by_pass(frames: list[CaptureFrame]) -> list[list[int]]:
+    groups: dict[int, list[int]] = {}
+    for index, frame in enumerate(frames):
+        groups.setdefault(int(frame.pass_index), []).append(index)
+    return [groups[pass_index] for pass_index in sorted(groups)]
+
+
+def _radial_camera_direction(
+    frame: CaptureFrame,
+    center: np.ndarray,
+    up: np.ndarray,
+) -> np.ndarray:
+    relative = np.asarray(frame.prior_pose[:3, 3], dtype=np.float64) - center
+    radial = relative - float(relative @ up) * up
+    norm = float(np.linalg.norm(radial))
+    if norm <= 1e-12:
+        raise RuntimeError("Camera pose lies on the object up axis")
+    return radial / norm
+
+
+def registration_pair_plan(
+    frames: list[CaptureFrame],
+    *,
+    center: np.ndarray | None,
+    up: np.ndarray | None,
+    include_loop_closure: bool,
+) -> list[tuple[str, int, int]]:
+    """Plan within-pass and geometry-matched cross-height registrations."""
+    groups = _frame_groups_by_pass(frames)
+    plan: list[tuple[str, int, int]] = []
+    for group in groups:
+        plan.extend(
+            ("sequential", source, target)
+            for source, target in zip(group, group[1:])
+        )
+        if include_loop_closure and len(group) > 2:
+            plan.append(("loop_closure", group[0], group[-1]))
+
+    if len(groups) <= 1:
+        return plan
+    if center is None or up is None:
+        raise RuntimeError(
+            "Multilevel fusion requires an object center and up vector"
+        )
+    center_array = np.asarray(center, dtype=np.float64)
+    up_array = np.asarray(up, dtype=np.float64)
+    up_norm = float(np.linalg.norm(up_array))
+    if center_array.shape != (3,) or up_array.shape != (3,) or up_norm <= 0.0:
+        raise RuntimeError("Invalid object frame for multilevel registration")
+    up_array = up_array / up_norm
+
+    for lower_group, upper_group in zip(groups, groups[1:]):
+        available = set(lower_group)
+        lower_directions = {
+            index: _radial_camera_direction(frames[index], center_array, up_array)
+            for index in lower_group
+        }
+        for upper_index in upper_group:
+            upper_direction = _radial_camera_direction(
+                frames[upper_index], center_array, up_array
+            )
+            candidates = available if available else set(lower_group)
+            lower_index = min(
+                candidates,
+                key=lambda index: (
+                    1.0 - float(lower_directions[index] @ upper_direction),
+                    index,
+                ),
+            )
+            available.discard(lower_index)
+            plan.append(("cross_height", lower_index, upper_index))
+    return plan
 
 
 def parse_args() -> argparse.Namespace:
@@ -371,6 +486,11 @@ def load_frames(
             prior_pose=prior_pose,
             cloud=cloud,
             valid_depth_pixels=int(np.count_nonzero(filtered_depth)),
+            pass_index=int(meta.get("multilevel_pass_index", 0)),
+            height_offset_m=float(
+                meta.get("height_offset_m", meta.get("height_m", 0.0))
+            ),
+            timestamp_ns=int(meta.get("timestamp_ns", 0)),
         )
         frames.append(frame)
         print(
@@ -497,29 +617,36 @@ def build_pose_graph(
         )
 
     diagnostics: list[RegistrationEdge] = []
-    for target_id in range(1, len(frames)):
-        source_id = target_id - 1
+    pair_plan = registration_pair_plan(
+        frames,
+        center=args.object_center_m,
+        up=args.object_up,
+        include_loop_closure=not args.no_loop_closure,
+    )
+    for kind, source_id, target_id in pair_plan:
         edge = register_pair(source_id, target_id, frames, args)
+        edge.kind = kind
         diagnostics.append(edge)
-        prior = relative_camera_transform(
-            frames[source_id].prior_pose,
-            frames[target_id].prior_pose,
-        )
-        prior_information = information_matrix(
-            frames[source_id].cloud,
-            frames[target_id].cloud,
-            prior,
-            args,
-        ) * args.orbit_prior_weight
-        graph.edges.append(
-            o3d.pipelines.registration.PoseGraphEdge(
-                source_id,
-                target_id,
-                prior,
-                prior_information,
-                uncertain=False,
+        if kind != "loop_closure":
+            prior = relative_camera_transform(
+                frames[source_id].prior_pose,
+                frames[target_id].prior_pose,
             )
-        )
+            prior_information = information_matrix(
+                frames[source_id].cloud,
+                frames[target_id].cloud,
+                prior,
+                args,
+            ) * args.orbit_prior_weight
+            graph.edges.append(
+                o3d.pipelines.registration.PoseGraphEdge(
+                    source_id,
+                    target_id,
+                    prior,
+                    prior_information,
+                    uncertain=False,
+                )
+            )
         if edge.accepted:
             graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
@@ -530,23 +657,8 @@ def build_pose_graph(
                     uncertain=True,
                 )
             )
-        print_edge(edge, "Sequential")
-
-    if not args.no_loop_closure and len(frames) > 2:
-        loop = register_pair(0, len(frames) - 1, frames, args)
-        diagnostics.append(loop)
-        print_edge(loop, "Loop")
-        if loop.accepted:
-            graph.edges.append(
-                o3d.pipelines.registration.PoseGraphEdge(
-                    loop.source_id,
-                    loop.target_id,
-                    loop.transform,
-                    loop.information,
-                    uncertain=True,
-                )
-            )
-        else:
+        print_edge(edge, kind.replace("_", " ").title())
+        if kind == "loop_closure" and not edge.accepted:
             print("Rejected loop closure was not added to the pose graph.")
     return graph, diagnostics
 
@@ -660,6 +772,7 @@ def save_geometry(
 
 def edge_as_json(edge: RegistrationEdge) -> dict:
     return {
+        "kind": edge.kind,
         "source_id": edge.source_id,
         "target_id": edge.target_id,
         "accepted": edge.accepted,
@@ -696,9 +809,18 @@ def build_vslam_feasibility_report(
         and frame.meta.get("odometry_status") == "OK"
         for frame in frames
     )
+    session_path = args.capture_dir / "scan_session.json"
+    session = (
+        json.loads(session_path.read_text(encoding="utf-8"))
+        if session_path.exists()
+        else {}
+    )
+    groups = _frame_groups_by_pass(frames)
+    captures_per_pass = int(session.get("captures_per_pass", 72))
+    required_capture_count = captures_per_pass * max(1, len(groups))
     report = {
         "pose_source": "vslam",
-        "required_capture_count": 72,
+        "required_capture_count": required_capture_count,
         "capture_count": len(frames),
         "all_capture_poses_ok": capture_status_ok,
         "trajectory_samples": len(samples),
@@ -718,19 +840,62 @@ def build_vslam_feasibility_report(
         report["failure_reason"] = "Missing object frame or valid continuous trajectory"
         return report
 
-    poses = np.stack([frame.prior_pose for frame in frames])
-    initial_pose = np.asarray(
-        valid_samples[0]["camera_to_vslam_world"],
-        dtype=np.float64,
-    )
-    metrics = vslam_orbit_metrics(
-        poses,
-        center=np.asarray(args.object_center_m),
-        up=np.asarray(args.object_up),
-        initial_pose=initial_pose,
-    )
-    metrics["radius_bias_m"] = abs(metrics["fitted_radius_m"] - frames[0].radius_m)
-    report["metrics"] = metrics
+    pass_records = {
+        int(item["pass_index"]): item
+        for item in session.get("passes", [])
+        if "pass_index" in item
+    }
+    pass_reports = []
+    for group in groups:
+        pass_index = int(frames[group[0]].pass_index)
+        record = pass_records.get(pass_index, {})
+        initial_pose_value = record.get("start_camera_to_vslam_world")
+        if initial_pose_value is None and len(groups) == 1:
+            initial_pose_value = valid_samples[0]["camera_to_vslam_world"]
+        if initial_pose_value is None:
+            pass_reports.append(
+                {
+                    "pass_index": pass_index,
+                    "capture_count": len(group),
+                    "passed": False,
+                    "failure_reason": "Missing pass-start VSLAM pose",
+                }
+            )
+            continue
+        pass_frames = [frames[index] for index in group]
+        metrics = vslam_orbit_metrics(
+            np.stack([frame.prior_pose for frame in pass_frames]),
+            center=np.asarray(args.object_center_m),
+            up=np.asarray(args.object_up),
+            initial_pose=np.asarray(initial_pose_value, dtype=np.float64),
+        )
+        metrics["radius_bias_m"] = abs(
+            metrics["fitted_radius_m"] - pass_frames[0].radius_m
+        )
+        pass_status_ok = all(
+            frame.meta.get("tracking_state") == "OK"
+            and frame.meta.get("odometry_status") == "OK"
+            for frame in pass_frames
+        )
+        pass_ok = bool(
+            len(pass_frames) == captures_per_pass
+            and pass_status_ok
+            and metrics["radius_rmse_m"] <= 0.002
+            and metrics["radius_bias_m"] <= 0.002
+            and metrics["closure_translation_m"] <= 0.002
+            and metrics["closure_rotation_deg"] <= 1.0
+        )
+        pass_reports.append(
+            {
+                "pass_index": pass_index,
+                "height_offset_m": float(pass_frames[0].height_offset_m),
+                "capture_count": len(pass_frames),
+                "all_capture_poses_ok": pass_status_ok,
+                "metrics": metrics,
+                "passed": pass_ok,
+            }
+        )
+    report["passes"] = pass_reports
 
     covariance_diagonals = []
     for frame in frames:
@@ -743,17 +908,13 @@ def build_vslam_feasibility_report(
         report["pose_covariance_diagonal_max"] = np.max(diagonals, axis=0).tolist()
 
     report["passed"] = bool(
-        len(frames) == 72
+        len(frames) == required_capture_count
         and capture_status_ok
-        and metrics["radius_rmse_m"] <= 0.002
-        and metrics["radius_bias_m"] <= 0.002
-        and metrics["closure_translation_m"] <= 0.002
-        and metrics["closure_rotation_deg"] <= 1.0
+        and len(pass_reports) == len(groups)
+        and all(item["passed"] for item in pass_reports)
     )
     if not report["passed"]:
-        report["failure_reason"] = (
-            "Camera-only VSLAM did not meet the 2 mm authoritative-fusion gate"
-        )
+        report["failure_reason"] = "VSLAM did not meet the per-pass precision gate"
     return report
 
 
@@ -841,7 +1002,7 @@ def main() -> None:
     args = parse_args()
     configure_object_frame(args)
     validate_args(args)
-    meta_paths = sorted(args.capture_dir.glob("angle_*.json"))
+    meta_paths = discover_capture_paths(args.capture_dir)
     if len(meta_paths) < 2:
         raise RuntimeError(
             f"Need at least two angle_*.json captures in {args.capture_dir}"
