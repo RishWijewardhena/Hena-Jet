@@ -126,6 +126,8 @@ class PassResult:
     capture_count: int
     first_capture_index: int
     final_capture_index: int
+    start_camera_to_vslam_world: list[list[float]]
+    final_capture_camera_to_vslam_world: list[list[float]]
     end_camera_to_vslam_world: list[list[float]]
 
 
@@ -434,6 +436,17 @@ def capture_continuous_pass(
     pass_args = argparse.Namespace(**pass_values)
     progress = ContinuousPassProgress(args.step_deg)
     pending_writes: list[Future] = []
+    pose = sl.Pose()
+    start_sample, start_acceptable = grab_vslam_frame(
+        zed, runtime, pose, trajectory
+    )
+    start_sample["multilevel_phase"] = "pass_start"
+    start_sample["multilevel_pass_index"] = pass_index
+    start_sample["height_offset_m"] = height_offset_m
+    if not start_acceptable:
+        raise RuntimeError(
+            f"VSLAM tracking was invalid before pass {pass_index + 1} started"
+        )
     command = serial_start_command(
         args.step_deg,
         args.pulses_per_revolution,
@@ -449,10 +462,11 @@ def capture_continuous_pass(
     last_message_ns = time.monotonic_ns()
     latest_sample: dict | None = None
     latest_acceptable = False
+    final_capture_pose: list[list[float]] | None = None
 
     while True:
         latest_sample, latest_acceptable = grab_vslam_frame(
-            zed, runtime, sl.Pose(), trajectory
+            zed, runtime, pose, trajectory
         )
         latest_sample["multilevel_phase"] = "orbit"
         latest_sample["multilevel_pass_index"] = pass_index
@@ -519,6 +533,13 @@ def capture_continuous_pass(
             )
             if future is not None:
                 pending_writes.append(future)
+            if math.isclose(
+                capture_event.angle_deg,
+                360.0,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ):
+                final_capture_pose = latest_sample["camera_to_vslam_world"]
             progress.mark_captured()
 
         if progress.completed_received:
@@ -526,6 +547,10 @@ def capture_continuous_pass(
             if not latest_acceptable or latest_sample is None:
                 raise RuntimeError(
                     f"VSLAM tracking was invalid when pass {pass_index + 1} completed"
+                )
+            if final_capture_pose is None:
+                raise RuntimeError(
+                    f"Pass {pass_index + 1} has no saved 360-degree pose"
                 )
             for future in pending_writes:
                 future.result()
@@ -537,6 +562,10 @@ def capture_continuous_pass(
                 capture_count=progress.captured_count,
                 first_capture_index=first_capture_index,
                 final_capture_index=final_capture_index,
+                start_camera_to_vslam_world=start_sample[
+                    "camera_to_vslam_world"
+                ],
+                final_capture_camera_to_vslam_world=final_capture_pose,
                 end_camera_to_vslam_world=latest_sample[
                     "camera_to_vslam_world"
                 ],
@@ -571,10 +600,11 @@ def perform_height_transition(
     expected_delta_m = target_height_m - from_result.height_offset_m
     transition_started = time.monotonic()
     confirmation = _confirmation_prompt(target_height_m)
+    pose = sl.Pose()
 
     def grab_transition_sample() -> tuple[dict, bool]:
         sample, acceptable = grab_vslam_frame(
-            zed, runtime, sl.Pose(), trajectory
+            zed, runtime, pose, trajectory
         )
         sample["multilevel_phase"] = "height_transition"
         sample["multilevel_pass_index"] = target_pass_index
