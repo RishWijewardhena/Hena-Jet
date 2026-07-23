@@ -34,7 +34,6 @@ python3 scripts/capture_zed_multilevel.py \
   --motor-rpm 0.25 \
   --first-pass-direction forward \
   --height-offsets-m 0 0.02 0.04 \
-  --between-pass-wait-s 30 \
   --out-dir captures/zed_m_vslam_multilevel
 ```
 
@@ -53,12 +52,23 @@ After a revolution completes:
 
 1. Raise the camera to the absolute height printed by the prompt.
 2. Keep the camera facing and orbit radius unchanged.
-3. Press Enter after positioning it. Pressing early is safe: the next pass
-   cannot start until at least 30 seconds have elapsed.
-4. The script checks the VSLAM displacement. Vertical and lateral errors must
-   each be at most 2 mm and orientation change must be at most 1 degree.
-5. If validation fails, adjust the mount and press Enter again. ZED tracking
-   remains active during every retry.
+3. Press Enter after positioning it. The script grabs three settling frames,
+   records the measured displacement, and starts the next orbit.
+
+The default flow trusts the mechanically measured height for pipeline testing.
+It does not reject the lift using the current initial-camera-axis assumption.
+The session is marked `authoritative_lift_geometry: false`, and its feasibility
+report fails the authoritative gate even though mesh and cloud fusion still run.
+
+To enable the original strict check, add:
+
+```bash
+--validate-lift-pose --between-pass-wait-s 30
+```
+
+Strict mode waits at least 30 seconds, then requires 20±2 mm vertical movement,
+at most 2 mm lateral movement, and at most 1 degree orientation change. A failed
+strict check requests another adjustment while keeping ZED tracking active.
 
 If tracking becomes invalid during a lift, the command aborts and marks the
 session failed. Preserve that directory for diagnostics, return the camera to
@@ -81,7 +91,9 @@ captures/zed_m_vslam_multilevel/
 Each capture stores its pass index, absolute height offset, global capture
 index, depth confidence map, and camera-to-VSLAM-world pose. The top-level
 manifest records pass-start, saved 360-degree, and stopped/runout poses so loop
-closure and manual-lift validation use the correct measurements.
+closure and lift diagnostics use the correct measurements. It also records
+whether lift-pose validation was enabled and whether the height geometry is
+authoritative.
 
 ## Fusion
 
@@ -113,4 +125,6 @@ nearest VSLAM camera geometry rather than matching repeated angle filenames.
 
 The feasibility report passes only when every height contains the expected 72
 valid captures and each pass independently satisfies the configured 2 mm orbit
-radius/closure and 1-degree rotation gates.
+radius/closure and 1-degree rotation gates. Pipeline-mode datasets additionally
+report `passed: false` because their physical lifts were not pose-validated;
+this does not prevent output geometry from being written.

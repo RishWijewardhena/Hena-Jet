@@ -105,14 +105,13 @@ class OrbitPoseGraphTests(unittest.TestCase):
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
+            session_payload = {
+                "height_offsets_m": [0.0, 0.02],
+                "captures_per_pass": 72,
+                "passes": pass_records,
+            }
             (root / "scan_session.json").write_text(
-                __import__("json").dumps(
-                    {
-                        "height_offsets_m": [0.0, 0.02],
-                        "captures_per_pass": 72,
-                        "passes": pass_records,
-                    }
-                ),
+                __import__("json").dumps(session_payload),
                 encoding="utf-8",
             )
             (root / "vslam_trajectory.jsonl").write_text(
@@ -129,11 +128,20 @@ class OrbitPoseGraphTests(unittest.TestCase):
             )
 
             report = build_vslam_feasibility_report(frames, args)
+            session_payload["authoritative_lift_geometry"] = False
+            (root / "scan_session.json").write_text(
+                __import__("json").dumps(session_payload),
+                encoding="utf-8",
+            )
+            bypass_report = build_vslam_feasibility_report(frames, args)
 
         self.assertEqual(report["required_capture_count"], 144)
         self.assertEqual(len(report["passes"]), 2)
         self.assertTrue(all(item["passed"] for item in report["passes"]))
         self.assertTrue(report["passed"])
+        self.assertFalse(bypass_report["passed"])
+        self.assertFalse(bypass_report["authoritative_lift_geometry"])
+        self.assertIn("not pose-validated", bypass_report["failure_reason"])
 
     def test_registration_plan_keeps_passes_separate_and_pairs_nearest_views(self):
         def frame(pass_index, xyz):

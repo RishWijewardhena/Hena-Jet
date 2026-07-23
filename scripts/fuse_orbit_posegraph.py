@@ -818,6 +818,9 @@ def build_vslam_feasibility_report(
     groups = _frame_groups_by_pass(frames)
     captures_per_pass = int(session.get("captures_per_pass", 72))
     required_capture_count = captures_per_pass * max(1, len(groups))
+    authoritative_lift_geometry = bool(
+        session.get("authoritative_lift_geometry", True)
+    )
     report = {
         "pose_source": "vslam",
         "required_capture_count": required_capture_count,
@@ -828,6 +831,7 @@ def build_vslam_feasibility_report(
         "valid_tracking_fraction": (
             len(valid_samples) / len(samples) if samples else 0.0
         ),
+        "authoritative_lift_geometry": authoritative_lift_geometry,
         "thresholds": {
             "radius_rmse_m": 0.002,
             "radius_bias_m": 0.002,
@@ -910,11 +914,17 @@ def build_vslam_feasibility_report(
     report["passed"] = bool(
         len(frames) == required_capture_count
         and capture_status_ok
+        and authoritative_lift_geometry
         and len(pass_reports) == len(groups)
         and all(item["passed"] for item in pass_reports)
     )
     if not report["passed"]:
-        report["failure_reason"] = "VSLAM did not meet the per-pass precision gate"
+        report["failure_reason"] = (
+            "Multilevel lift geometry was not pose-validated; fusion output is "
+            "available for pipeline testing but is non-authoritative"
+            if not authoritative_lift_geometry
+            else "VSLAM did not meet the per-pass precision gate"
+        )
     return report
 
 
