@@ -7,6 +7,7 @@ import numpy as np
 from scripts.capture_zed_multilevel import (
     ContinuousPassProgress,
     capture_metadata_for_pass,
+    direction_for_pass,
     lift_pose_metrics,
     normalize_height_offsets_m,
     parse_args,
@@ -183,6 +184,7 @@ class CaptureZedMultilevelTests(unittest.TestCase):
             pass_index=2,
             height_offset_m=0.04,
             capture_index=144,
+            motor_direction="forward",
         )
         self.assertEqual(
             metadata,
@@ -191,6 +193,7 @@ class CaptureZedMultilevelTests(unittest.TestCase):
                 "multilevel_pass_index": 2,
                 "height_offset_m": 0.04,
                 "multilevel_capture_index": 144,
+                "motor_direction": "forward",
             },
         )
 
@@ -209,6 +212,15 @@ class CaptureZedMultilevelTests(unittest.TestCase):
         self.assertEqual(args.step_deg, 5.0)
         self.assertEqual(args.between_pass_wait_s, 30.0)
         self.assertTrue(args.vslam_use_imu)
+        self.assertEqual(args.first_pass_direction, "forward")
+
+    def test_alternates_motor_direction_to_unwind_the_camera_cable(self):
+        self.assertEqual(
+            [direction_for_pass(index, "forward") for index in range(4)],
+            ["forward", "reverse", "forward", "reverse"],
+        )
+        self.assertEqual(direction_for_pass(0, "reverse"), "reverse")
+        self.assertEqual(direction_for_pass(1, "reverse"), "forward")
 
     def test_pass_progress_associates_one_ordered_event_with_next_frame(self):
         progress = ContinuousPassProgress(5.0)

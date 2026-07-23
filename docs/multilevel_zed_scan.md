@@ -15,8 +15,10 @@ only between revolutions so the camera mount can be raised manually.
 - ZED IMU fusion is enabled by default. Use `--no-vslam-use-imu` only for a
   deliberate camera-only experiment.
 
-No firmware change is required. Every pass uses the existing
-`start_continuous,<step>,<ppr>,<rpm>` command.
+Direction alternation requires the current motor-controller firmware. It
+extends the continuous command with an optional direction field:
+`start_continuous,<step>,<ppr>,<rpm>,<forward|reverse>`. Upload that firmware
+before running a multilevel scan.
 
 ## Capture
 
@@ -30,6 +32,7 @@ python3 scripts/capture_zed_multilevel.py \
   --pulses-per-revolution 10000 \
   --step-deg 5 \
   --motor-rpm 0.25 \
+  --first-pass-direction forward \
   --height-offsets-m 0 0.02 0.04 \
   --between-pass-wait-s 30 \
   --out-dir captures/zed_m_vslam_multilevel
@@ -38,6 +41,13 @@ python3 scripts/capture_zed_multilevel.py \
 Replace the serial port and pulses per revolution with the controller's actual
 values. A 5-degree step produces 72 captures per pass and 216 captures across
 the default three heights.
+
+Pass directions automatically alternate `forward`, `reverse`, `forward` for
+the default three heights. `forward` preserves the firmware's original DIR-pin
+polarity. If the first orbit must use the opposite physical direction, start
+with `--first-pass-direction reverse`; the following passes still alternate.
+The second pass therefore unwinds the first pass instead of adding another
+cable turn.
 
 After a revolution completes:
 

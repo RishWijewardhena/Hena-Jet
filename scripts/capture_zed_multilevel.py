@@ -122,6 +122,7 @@ class PassResult:
 
     pass_index: int
     height_offset_m: float
+    motor_direction: str
     output_directory: str
     capture_count: int
     first_capture_index: int
@@ -163,6 +164,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step-deg", type=float, default=5.0)
     parser.add_argument("--pulses-per-revolution", type=int, required=True)
     parser.add_argument("--motor-rpm", type=float, default=0.25)
+    parser.add_argument(
+        "--first-pass-direction",
+        choices=["forward", "reverse"],
+        default="forward",
+        help=(
+            "Motor direction for pass 1. Later passes automatically alternate "
+            "to prevent cable winding."
+        ),
+    )
     parser.add_argument("--serial-timeout-s", type=float, default=30.0)
     parser.add_argument("--serial-reset-delay-s", type=float, default=2.0)
     parser.add_argument("--camera-yaw-deg", type=float, default=-6.0)
@@ -203,8 +213,20 @@ def validate_args(args: argparse.Namespace) -> tuple[float, ...]:
         args.pulses_per_revolution,
         continuous=True,
         motor_rpm=args.motor_rpm,
+        direction=args.first_pass_direction,
     )
     return offsets
+
+
+def direction_for_pass(pass_index: int, first_direction: str) -> str:
+    """Alternate direction after every revolution to unwind camera cables."""
+    if pass_index < 0:
+        raise ValueError("Pass index must be non-negative")
+    if first_direction not in {"forward", "reverse"}:
+        raise ValueError("First pass direction must be 'forward' or 'reverse'")
+    if pass_index % 2 == 0:
+        return first_direction
+    return "reverse" if first_direction == "forward" else "forward"
 
 
 def normalize_height_offsets_m(values: list[float]) -> tuple[float, ...]:
@@ -317,18 +339,22 @@ def capture_metadata_for_pass(
     pass_index: int,
     height_offset_m: float,
     capture_index: int,
+    motor_direction: str,
 ) -> dict:
     """Attach multilevel identity without mutating the trajectory sample."""
     if pass_index < 0 or capture_index < 0:
         raise ValueError("Pass and capture indices must be non-negative")
     if not math.isfinite(height_offset_m) or height_offset_m < 0.0:
         raise ValueError("Height offset must be finite and non-negative")
+    if motor_direction not in {"forward", "reverse"}:
+        raise ValueError("Motor direction must be 'forward' or 'reverse'")
     metadata = dict(vslam_sample)
     metadata.update(
         {
             "multilevel_pass_index": int(pass_index),
             "height_offset_m": float(height_offset_m),
             "multilevel_capture_index": int(capture_index),
+            "motor_direction": motor_direction,
         }
     )
     return metadata
@@ -434,6 +460,9 @@ def capture_continuous_pass(
         }
     )
     pass_args = argparse.Namespace(**pass_values)
+    motor_direction = direction_for_pass(
+        pass_index, args.first_pass_direction
+    )
     progress = ContinuousPassProgress(args.step_deg)
     pending_writes: list[Future] = []
     pose = sl.Pose()
@@ -452,12 +481,13 @@ def capture_continuous_pass(
         args.pulses_per_revolution,
         continuous=True,
         motor_rpm=args.motor_rpm,
+        direction=motor_direction,
     )
     connection.write(command)
     connection.flush()
     print(
         f"Pass {pass_index + 1}: TX {command.decode('ascii').strip()} "
-        f"at {height_offset_m * 1000.0:.1f} mm"
+        f"at {height_offset_m * 1000.0:.1f} mm ({motor_direction})"
     )
     last_message_ns = time.monotonic_ns()
     latest_sample: dict | None = None
@@ -517,6 +547,7 @@ def capture_continuous_pass(
                 pass_index=pass_index,
                 height_offset_m=height_offset_m,
                 capture_index=global_capture_index,
+                motor_direction=motor_direction,
             )
             future = capture_angle(
                 zed,
@@ -558,6 +589,7 @@ def capture_continuous_pass(
             result = PassResult(
                 pass_index=pass_index,
                 height_offset_m=height_offset_m,
+                motor_direction=motor_direction,
                 output_directory=str(pass_dir),
                 capture_count=progress.captured_count,
                 first_capture_index=first_capture_index,
@@ -707,6 +739,8 @@ def save_session_files(
         "lift_rotation_tolerance_deg": args.lift_rotation_tolerance_deg,
         "step_deg": args.step_deg,
         "motor_rpm": args.motor_rpm,
+        "first_pass_direction": args.first_pass_direction,
+        "direction_policy": "alternate_each_pass",
         "captures_per_pass": len(continuous_capture_angles(args.step_deg)),
         "capture_count": sum(result.capture_count for result in passes),
         "passes": [asdict(result) for result in passes],
