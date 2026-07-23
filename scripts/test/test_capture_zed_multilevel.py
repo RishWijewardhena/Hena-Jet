@@ -178,6 +178,55 @@ class CaptureZedMultilevelTests(unittest.TestCase):
         self.assertTrue(metrics["accepted"])
         np.testing.assert_allclose(sample["camera_to_vslam_world"], corrected)
 
+    def test_default_pipeline_mode_accepts_after_three_settling_frames(self):
+        before = np.eye(4)
+        measured = np.eye(4)
+        measured[:3, 3] = [0.011, -0.011, 0.0]
+        grabs = []
+
+        _, metrics = wait_for_validated_lift(
+            before_pose=before,
+            expected_height_delta_m=0.02,
+            object_up=np.array([0.0, -1.0, 0.0]),
+            minimum_wait_s=0.0,
+            translation_tolerance_m=0.002,
+            rotation_tolerance_deg=1.0,
+            grab_sample=lambda: (
+                grabs.append(len(grabs))
+                or {"camera_to_vslam_world": measured.tolist()},
+                True,
+            ),
+            operator_confirmed=lambda: True,
+            elapsed_s=lambda: 0.0,
+            reset_confirmation=lambda _: self.fail(
+                "Pipeline mode must not request repositioning"
+            ),
+            validate_pose=False,
+            settling_frames=3,
+        )
+
+        self.assertEqual(len(grabs), 3)
+        self.assertTrue(metrics["accepted"])
+        self.assertTrue(metrics["validation_skipped"])
+        self.assertFalse(metrics["pose_validation_passed"])
+
+    def test_pipeline_mode_still_aborts_on_tracking_loss(self):
+        with self.assertRaisesRegex(RuntimeError, "tracking became invalid"):
+            wait_for_validated_lift(
+                before_pose=np.eye(4),
+                expected_height_delta_m=0.02,
+                object_up=np.array([0.0, -1.0, 0.0]),
+                minimum_wait_s=0.0,
+                translation_tolerance_m=0.002,
+                rotation_tolerance_deg=1.0,
+                grab_sample=lambda: ({"tracking_state": "UNAVAILABLE"}, False),
+                operator_confirmed=lambda: True,
+                elapsed_s=lambda: 0.0,
+                reset_confirmation=lambda _: None,
+                validate_pose=False,
+                settling_frames=3,
+            )
+
     def test_capture_metadata_records_pass_and_absolute_height(self):
         metadata = capture_metadata_for_pass(
             {"tracking_state": "OK"},
@@ -213,6 +262,21 @@ class CaptureZedMultilevelTests(unittest.TestCase):
         self.assertEqual(args.between_pass_wait_s, 30.0)
         self.assertTrue(args.vslam_use_imu)
         self.assertEqual(args.first_pass_direction, "forward")
+        self.assertFalse(args.validate_lift_pose)
+        self.assertEqual(args.lift_settling_frames, 3)
+
+        strict_args = parse_args(
+            [
+                "--radius-m",
+                "0.192",
+                "--serial-port",
+                "/dev/ttyACM0",
+                "--pulses-per-revolution",
+                "10000",
+                "--validate-lift-pose",
+            ]
+        )
+        self.assertTrue(strict_args.validate_lift_pose)
 
     def test_alternates_motor_direction_to_unwind_the_camera_cable(self):
         self.assertEqual(

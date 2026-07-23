@@ -151,6 +151,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--between-pass-wait-s", type=float, default=30.0)
     parser.add_argument("--lift-translation-tolerance-m", type=float, default=0.002)
     parser.add_argument("--lift-rotation-tolerance-deg", type=float, default=1.0)
+    parser.add_argument(
+        "--validate-lift-pose",
+        action="store_true",
+        help=(
+            "Enable the strict 30-second 2 mm/1 degree lift gate. By default "
+            "the physical lift is trusted for pipeline testing."
+        ),
+    )
+    parser.add_argument(
+        "--lift-settling-frames",
+        type=int,
+        default=3,
+        help="Tracked frames to grab after Enter in default pipeline mode.",
+    )
     parser.add_argument("--max-depth-m", type=float, default=1.0)
     parser.add_argument("--min-depth-m", type=float, default=0.05)
     parser.add_argument("--warmup", type=int, default=20)
@@ -200,8 +214,10 @@ def validate_args(args: argparse.Namespace) -> tuple[float, ...]:
         raise ValueError("Serial baud and timeout must be positive")
     if args.serial_reset_delay_s < 0.0:
         raise ValueError("Serial reset delay cannot be negative")
-    if args.between_pass_wait_s < 30.0:
+    if args.validate_lift_pose and args.between_pass_wait_s < 30.0:
         raise ValueError("--between-pass-wait-s must be at least 30 seconds")
+    if args.lift_settling_frames < 1:
+        raise ValueError("--lift-settling-frames must be at least 1")
     if args.lift_translation_tolerance_m <= 0.0:
         raise ValueError("Lift translation tolerance must be positive")
     if args.lift_rotation_tolerance_deg <= 0.0:
@@ -372,8 +388,13 @@ def wait_for_validated_lift(
     operator_confirmed: Callable[[], bool],
     elapsed_s: Callable[[], float],
     reset_confirmation: Callable[[dict], None],
+    validate_pose: bool = True,
+    settling_frames: int = 1,
 ) -> tuple[dict, dict]:
     """Keep tracking during a manual lift until its measured pose is accepted."""
+    if settling_frames < 1:
+        raise ValueError("settling_frames must be at least 1")
+    ready_frame_count = 0
     while True:
         sample, acceptable = grab_sample()
         if not acceptable:
@@ -384,6 +405,10 @@ def wait_for_validated_lift(
         if not transition_is_ready(
             elapsed_s(), minimum_wait_s, operator_confirmed()
         ):
+            ready_frame_count = 0
+            continue
+        ready_frame_count += 1
+        if ready_frame_count < settling_frames:
             continue
         if "camera_to_vslam_world" not in sample:
             raise RuntimeError("Validated VSLAM sample has no camera pose")
@@ -395,9 +420,16 @@ def wait_for_validated_lift(
             translation_tolerance_m=translation_tolerance_m,
             rotation_tolerance_deg=rotation_tolerance_deg,
         )
-        if metrics["accepted"]:
+        pose_validation_passed = bool(metrics["accepted"])
+        metrics["pose_validation_passed"] = pose_validation_passed
+        metrics["validation_skipped"] = not validate_pose
+        if not validate_pose:
+            metrics["accepted"] = True
+            return sample, metrics
+        if pose_validation_passed:
             return sample, metrics
         reset_confirmation(metrics)
+        ready_frame_count = 0
 
 
 def _confirmation_prompt(target_height_m: float) -> Event:
@@ -659,24 +691,43 @@ def perform_height_transition(
         before_pose=before_pose,
         expected_height_delta_m=expected_delta_m,
         object_up=np.array([0.0, -1.0, 0.0]),
-        minimum_wait_s=args.between_pass_wait_s,
+        minimum_wait_s=(
+            args.between_pass_wait_s if args.validate_lift_pose else 0.0
+        ),
         translation_tolerance_m=args.lift_translation_tolerance_m,
         rotation_tolerance_deg=args.lift_rotation_tolerance_deg,
         grab_sample=grab_transition_sample,
         operator_confirmed=lambda: confirmation.is_set(),
         elapsed_s=lambda: time.monotonic() - transition_started,
         reset_confirmation=reset_confirmation,
+        validate_pose=args.validate_lift_pose,
+        settling_frames=(1 if args.validate_lift_pose else args.lift_settling_frames),
     )
-    print(
-        f"Lift accepted: {metrics['vertical_translation_m'] * 1000.0:.2f} mm "
-        f"vertical, {metrics['lateral_error_m'] * 1000.0:.2f} mm lateral, "
-        f"{metrics['rotation_error_deg']:.2f} deg."
-    )
+    if args.validate_lift_pose:
+        print(
+            f"Lift accepted: {metrics['vertical_translation_m'] * 1000.0:.2f} mm "
+            f"vertical, {metrics['lateral_error_m'] * 1000.0:.2f} mm lateral, "
+            f"{metrics['rotation_error_deg']:.2f} deg."
+        )
+    else:
+        print(
+            "Lift pose validation bypassed for pipeline testing: "
+            f"measured {metrics['vertical_translation_m'] * 1000.0:.2f} mm "
+            f"vertical, {metrics['lateral_error_m'] * 1000.0:.2f} mm lateral, "
+            f"{metrics['rotation_error_deg']:.2f} deg."
+        )
     return {
         "from_pass_index": from_result.pass_index,
         "to_pass_index": target_pass_index,
         "target_height_offset_m": target_height_m,
-        "minimum_wait_s": args.between_pass_wait_s,
+        "minimum_wait_s": (
+            args.between_pass_wait_s if args.validate_lift_pose else 0.0
+        ),
+        "settling_frames": (
+            1 if args.validate_lift_pose else args.lift_settling_frames
+        ),
+        "pose_validation_enabled": bool(args.validate_lift_pose),
+        "authoritative_lift_geometry": bool(args.validate_lift_pose),
         "accepted_pose_timestamp_ns": int(sample.get("timestamp_ns", 0)),
         "metrics": metrics,
     }
@@ -735,6 +786,9 @@ def save_session_files(
         "object_up_vslam_world": [0.0, -1.0, 0.0],
         "height_offsets_m": list(offsets),
         "between_pass_wait_s": args.between_pass_wait_s,
+        "lift_pose_validation_enabled": bool(args.validate_lift_pose),
+        "authoritative_lift_geometry": bool(args.validate_lift_pose),
+        "lift_settling_frames": args.lift_settling_frames,
         "lift_translation_tolerance_m": args.lift_translation_tolerance_m,
         "lift_rotation_tolerance_deg": args.lift_rotation_tolerance_deg,
         "step_deg": args.step_deg,
