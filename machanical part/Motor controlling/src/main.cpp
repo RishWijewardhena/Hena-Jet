@@ -17,6 +17,7 @@ constexpr double MINIMUM_CONTINUOUS_RPM = 0.05;
 constexpr double MAXIMUM_CONTINUOUS_RPM = 2.0;
 constexpr uint32_t SEGMENT_DELAY_MS = 200;
 constexpr uint32_t PULSE_HIGH_US = 100;
+constexpr uint32_t DIRECTION_SETUP_US = 10;
 constexpr uint32_t MINIMUM_PULSES_PER_REVOLUTION = 1;
 constexpr uint32_t MAXIMUM_PULSES_PER_REVOLUTION = 100000;
 constexpr size_t COMMAND_BUFFER_SIZE = 64;
@@ -25,6 +26,9 @@ constexpr uint8_t DIRECTION_PIN = D6;
 constexpr uint8_t ENABLE_PIN = D5;
 constexpr uint8_t ALARM_PIN = D4;
 constexpr uint8_t PULSE_PIN = D3;
+// Forward preserves the original firmware polarity and existing installation.
+constexpr uint8_t FORWARD_DIRECTION_LEVEL = LOW;
+constexpr uint8_t REVERSE_DIRECTION_LEVEL = HIGH;
 
 // D4 must be driven by a 0-3.3 V conditioned signal. Never connect a 5 V
 // alarm signal directly to the XIAO ESP32-S3 GPIO.
@@ -334,7 +338,9 @@ void lowercase(char *text)
 void startContinuousSequence(
     double incrementDegrees,
     uint32_t pulsesPerRevolution,
-    double targetRpm)
+    double targetRpm,
+    bool forwardDirection,
+    bool announceDirection)
 {
     if (isMotionActive()) {
         Serial.println("error,busy");
@@ -382,7 +388,10 @@ void startContinuousSequence(
     currentPulseIsBraking = false;
     pulseIsHigh = false;
     digitalWrite(PULSE_PIN, LOW);
-    nextPulseTransitionUs = micros();
+    digitalWrite(
+        DIRECTION_PIN,
+        forwardDirection ? FORWARD_DIRECTION_LEVEL : REVERSE_DIRECTION_LEVEL);
+    nextPulseTransitionUs = micros() + DIRECTION_SETUP_US;
     motionState = MotionState::Stepping;
 
     Serial.print("started_continuous,");
@@ -391,6 +400,10 @@ void startContinuousSequence(
     Serial.print(activePulsesPerRevolution);
     Serial.print(",");
     printDegrees(targetRpm);
+    if (announceDirection) {
+        Serial.print(",");
+        Serial.print(forwardDirection ? "forward" : "reverse");
+    }
     Serial.println();
 }
 
@@ -475,6 +488,16 @@ void processCommand(char *rawCommand)
         }
         *secondSeparator = '\0';
         char *rpmText = trimWhitespace(secondSeparator + 1);
+        char *directionText = nullptr;
+        char *thirdSeparator = strchr(rpmText, ',');
+        if (thirdSeparator != nullptr) {
+            *thirdSeparator = '\0';
+            directionText = trimWhitespace(thirdSeparator + 1);
+            if (*directionText == '\0' || strchr(directionText, ',') != nullptr) {
+                Serial.println("error,invalid_direction");
+                return;
+            }
+        }
 
         char *angleEnd = nullptr;
         const double angle = strtod(angleText, &angleEnd);
@@ -503,8 +526,24 @@ void processCommand(char *rawCommand)
             return;
         }
 
+        bool forwardDirection = true;
+        if (directionText != nullptr) {
+            if (strcmp(directionText, "forward") == 0) {
+                forwardDirection = true;
+            } else if (strcmp(directionText, "reverse") == 0) {
+                forwardDirection = false;
+            } else {
+                Serial.println("error,invalid_direction");
+                return;
+            }
+        }
+
         startContinuousSequence(
-            angle, static_cast<uint32_t>(parsedPpr), rpm);
+            angle,
+            static_cast<uint32_t>(parsedPpr),
+            rpm,
+            forwardDirection,
+            directionText != nullptr);
         return;
     }
 
@@ -609,7 +648,7 @@ void setup()
     pinMode(PULSE_PIN, OUTPUT);
 
     digitalWrite(PULSE_PIN, LOW);
-    digitalWrite(DIRECTION_PIN, HIGH);
+    digitalWrite(DIRECTION_PIN, FORWARD_DIRECTION_LEVEL);
     digitalWrite(ENABLE_PIN, LOW); // HBT4248C enabled with the existing wiring.
 
     attachInterrupt(digitalPinToInterrupt(ALARM_PIN), onAlarmRisingEdge, RISING);

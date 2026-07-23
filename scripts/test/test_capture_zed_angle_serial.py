@@ -53,6 +53,16 @@ class CaptureZedAngleSerialTests(unittest.TestCase):
             ),
             b"start_continuous,5,10000,0.5\n",
         )
+        self.assertEqual(
+            serial_start_command(
+                5.0,
+                10000,
+                continuous=True,
+                motor_rpm=0.5,
+                direction="reverse",
+            ),
+            b"start_continuous,5,10000,0.5,reverse\n",
+        )
 
     def test_parses_cumulative_continuous_angle_event(self):
         self.assertEqual(

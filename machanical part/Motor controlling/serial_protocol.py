@@ -19,6 +19,7 @@ class DeviceMessage:
     pulses_per_revolution: int | None = None
     rpm: float | None = None
     pulse_count: int | None = None
+    direction: str | None = None
 
 
 def format_degrees(value: float) -> str:
@@ -32,6 +33,7 @@ def format_start_command(
     synchronized: bool = False,
     continuous: bool = False,
     rpm: float | None = None,
+    direction: str | None = None,
 ) -> bytes:
     angle = float(angle_degrees)
     ppr_value = float(pulses_per_revolution)
@@ -58,8 +60,12 @@ def format_start_command(
                 f"RPM must be between {MINIMUM_CONTINUOUS_RPM:g} and "
                 f"{MAXIMUM_CONTINUOUS_RPM:g}"
             )
+        if direction not in {None, "forward", "reverse"}:
+            raise ValueError("Direction must be 'forward' or 'reverse'")
     elif rpm is not None:
         raise ValueError("RPM is only valid in continuous mode")
+    elif direction is not None:
+        raise ValueError("Direction is only valid in continuous mode")
     minimum_angle = 360.0 / ppr
     if (
         not math.isfinite(angle)
@@ -71,10 +77,13 @@ def format_start_command(
             f"{MAXIMUM_ANGLE_DEGREES} degrees"
         )
     if continuous:
-        return (
+        command = (
             f"start_continuous,{format_degrees(angle)},{ppr},"
-            f"{format_degrees(rpm)}\n"
-        ).encode("ascii")
+            f"{format_degrees(rpm)}"
+        )
+        if direction is not None:
+            command += f",{direction}"
+        return f"{command}\n".encode("ascii")
     prefix = "start_sync" if synchronized else "start"
     return f"{prefix},{format_degrees(angle)},{ppr}\n".encode("ascii")
 
@@ -88,13 +97,17 @@ def parse_device_message(line: str) -> DeviceMessage:
     if normalized.startswith("started_continuous,"):
         parts = normalized.split(",")
         try:
-            if len(parts) != 4:
+            if len(parts) not in {4, 5}:
+                raise ValueError
+            direction = None if len(parts) == 4 else parts[4]
+            if direction not in {None, "forward", "reverse"}:
                 raise ValueError
             return DeviceMessage(
                 "started_continuous",
                 float(parts[1]),
                 int(parts[2]),
                 float(parts[3]),
+                direction=direction,
             )
         except ValueError:
             return DeviceMessage("unknown")

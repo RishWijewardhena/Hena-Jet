@@ -106,6 +106,7 @@ def serial_start_command(
     synchronized: bool = False,
     continuous: bool = False,
     motor_rpm: float | None = None,
+    direction: str | None = None,
 ) -> bytes:
     """Format the motor firmware's ``start,<degrees>,<ppr>`` command."""
     step = float(step_degrees)
@@ -123,10 +124,17 @@ def serial_start_command(
         rpm = float(motor_rpm)
         if rpm < 0.05 or rpm > 2.0:
             raise ValueError("Continuous motor RPM must be between 0.05 and 2")
+        if direction not in {None, "forward", "reverse"}:
+            raise ValueError("Continuous direction must be 'forward' or 'reverse'")
         rpm_text = f"{rpm:.6f}".rstrip("0").rstrip(".")
-        return f"start_continuous,{step_text},{ppr},{rpm_text}\n".encode("ascii")
+        suffix = "" if direction is None else f",{direction}"
+        return (
+            f"start_continuous,{step_text},{ppr},{rpm_text}{suffix}\n"
+        ).encode("ascii")
     if motor_rpm is not None:
         raise ValueError("Motor RPM is only valid in continuous mode")
+    if direction is not None:
+        raise ValueError("Direction is only valid in continuous mode")
     prefix = "start_sync" if synchronized else "start"
     return f"{prefix},{step_text},{ppr}\n".encode("ascii")
 

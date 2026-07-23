@@ -13,6 +13,30 @@ class SerialProtocolTests(unittest.TestCase):
             b"start_continuous,5,52100,0.5\n",
         )
 
+    def test_formats_optional_continuous_direction_without_changing_legacy_command(self):
+        self.assertEqual(
+            format_start_command(
+                5.0,
+                52100,
+                continuous=True,
+                rpm=0.5,
+                direction="reverse",
+            ),
+            b"start_continuous,5,52100,0.5,reverse\n",
+        )
+        self.assertEqual(
+            format_start_command(5.0, 52100, continuous=True, rpm=0.5),
+            b"start_continuous,5,52100,0.5\n",
+        )
+
+    def test_rejects_invalid_or_noncontinuous_direction(self):
+        with self.assertRaises(ValueError):
+            format_start_command(
+                5.0, 52100, continuous=True, rpm=0.5, direction="sideways"
+            )
+        with self.assertRaises(ValueError):
+            format_start_command(5.0, 52100, direction="reverse")
+
     def test_continuous_start_requires_valid_rpm(self):
         with self.assertRaises(ValueError):
             format_start_command(5.0, 52100, continuous=True)
@@ -53,6 +77,12 @@ class SerialProtocolTests(unittest.TestCase):
         self.assertEqual(started.value, 5.0)
         self.assertEqual(started.pulses_per_revolution, 52100)
         self.assertEqual(started.rpm, 0.5)
+
+        reversed_start = parse_device_message(
+            "started_continuous,5,52100,0.5,reverse"
+        )
+        self.assertEqual(reversed_start.kind, "started_continuous")
+        self.assertEqual(reversed_start.direction, "reverse")
 
         event = parse_device_message("angle_ok,125,18090")
         self.assertEqual(event.kind, "angle_ok")

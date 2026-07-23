@@ -12,9 +12,12 @@ The firmware uses 115200 baud and newline-terminated ASCII commands.
 | PC → ESP32 | `start,5,52100` | Run the legacy segmented 360° sequence |
 | PC → ESP32 | `start_sync,5,52100` | Move 5° and wait for `next` after each segment |
 | PC → ESP32 | `start_continuous,5,52100,0.5` | Run continuously at 0.5 RPM and report 5° crossings |
+| PC → ESP32 | `start_continuous,5,52100,0.5,forward` | Run using the original DIR-pin polarity |
+| PC → ESP32 | `start_continuous,5,52100,0.5,reverse` | Run using the opposite DIR-pin polarity |
 | PC → ESP32 | `stop` | Stop the active sequence immediately |
 | ESP32 → PC | `started,5,52100` | Legacy start command accepted |
 | ESP32 → PC | `started_continuous,5,52100,0.5` | Continuous command and runtime RPM accepted |
+| ESP32 → PC | `started_continuous,5,52100,0.5,reverse` | Continuous command and explicit direction accepted |
 | ESP32 → PC | `angle_ok,5,724` | Cumulative angle crossed at the reported pulse count |
 | ESP32 → PC | `5 degree ok` | One requested segment completed |
 | ESP32 → PC | `completed` | The 360° sequence completed |
@@ -23,6 +26,12 @@ The firmware uses 115200 baud and newline-terminated ASCII commands.
 | ESP32 → PC | `error,<reason>` | The command could not be performed |
 
 Legacy automatic mode inserts a 200 ms delay between segments. Synchronized mode waits for `next`. Continuous mode uses one uninterrupted pulse train, reports cumulative angle crossings, passes through 360°, and stops after one increment of runout so the 360° frame is captured before stop vibration. Pulses per revolution is supplied at runtime; cumulative rounding keeps angle events aligned to integer pulse counts.
+
+The optional continuous direction is backward compatible. Omitting it preserves
+the original DIR-pin LOW polarity. `forward` selects that same polarity and
+`reverse` selects the opposite polarity. The multilevel ZED capture alternates
+these values after every revolution so the camera cable unwinds instead of
+accumulating turns.
 
 Legacy segments use a symmetric quintic S-curve. Continuous mode ramps once to the requested 0.05–2 RPM speed and decelerates only during the runout. A serial `stop` performs a controlled stop; a driver alarm remains an emergency condition and stops STEP pulses immediately.
 
