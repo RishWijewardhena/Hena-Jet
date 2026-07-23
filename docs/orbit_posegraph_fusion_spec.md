@@ -27,23 +27,26 @@ mechanical orbit with an unconstrained estimate.
 
 ## Pipeline
 
-1. Load and sort matching `angle_*.json` and `angle_*.npz` captures.
+1. Load and sort matching `angle_*.json` and `angle_*.npz` captures. Accept
+   either the legacy flat directory or ordered `pass_*_height_*mm` directories.
 2. Build one analytic camera-to-world pose per saved motor angle using the
    radius, height, angle direction, angle offset, camera mounting yaw, and
    pivot offset.
 3. Apply the same depth and world-space filters used by
    `fuse_tsdf_scan.py`.
 4. Create a downsampled local camera cloud with normals for every frame.
-5. Register each adjacent pair with point-to-plane ICP initialized by the
-   analytic relative pose.
+5. Register each adjacent pair within the same height pass with point-to-plane
+   ICP initialized by the selected relative pose.
 6. Add a high-weight analytic edge for every adjacent capture so the optimized
    graph retains the measured orbit. Add accepted ICP results as uncertain
    auxiliary edges rather than replacing the mechanical constraints.
 7. Reject an ICP result when its fitness/RMSE is poor or its correction from
    the analytic prior exceeds configured translation/rotation limits. A
    rejected result is recorded but is not added to the graph.
-8. Add the first-to-last loop edge when the orbit closes. Treat it as an
-   uncertain loop closure and apply the same acceptance guards.
+8. Add a first-to-last loop edge for every height pass. For multilevel data,
+   connect adjacent heights using one-to-one nearest radial camera positions
+   from saved VSLAM geometry; repeated relative angle labels are not assumed to
+   identify the same physical viewpoint after motor runout.
 9. Optimize the pose graph with node 0 fixed.
 10. Rebuild the TSDF using the optimized camera-to-world node poses.
 11. Apply configurable statistical outlier removal to the extracted point
@@ -77,6 +80,8 @@ the mascot from static background without a region of interest.
   falls back to the analytic orbit and records the reason.
 - A rejected loop edge is omitted.
 - Existing captures and the original `fuse_tsdf_scan.py` are never modified.
+- Multilevel fusion fails clearly when its top-level session lacks the fixed
+  object center or up vector needed for geometry-based cross-height pairing.
 
 ## Verification
 
