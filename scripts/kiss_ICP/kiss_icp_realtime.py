@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import pyzed.sl as sl
 
-from kiss_icp_quality import (
+from scripts.kiss_ICP.kiss_icp_quality import (
     FrameQuality,
     GlobalVoxelAccumulator,
     deterministic_voxel_sample,
