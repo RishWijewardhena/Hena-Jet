@@ -33,7 +33,7 @@ class MotorControllerApp:
 
         self.port_var = tk.StringVar()
         self.angle_var = tk.StringVar(value="5")
-        self.ppr_var = tk.StringVar(value="52100")
+        self.ppr_var = tk.StringVar(value="10000")
         self.connection_var = tk.StringVar(value="Disconnected")
         self.motion_var = tk.StringVar(value="Idle")
         self.alarm_var = tk.StringVar(value="Alarm monitor disconnected")
