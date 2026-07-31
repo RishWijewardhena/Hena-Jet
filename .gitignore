@@ -20,6 +20,9 @@ datasets/
 .polyscope.ini
 imgui.ini
 
+# Licensed MANO model distribution (keep local)
+Mano/
+
 # OS/editor
 .DS_Store
 .idea/
