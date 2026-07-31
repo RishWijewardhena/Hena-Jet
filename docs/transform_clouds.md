@@ -5,12 +5,21 @@ angle-indexed ZED-M captures into one reference frame, preserves the measured
 platform, produces a cleaned merged PLY, and optionally reconstructs a Poisson
 mesh.
 
-The pipeline does not require ArUco markers or VSLAM poses. It combines three
-independent constraints:
+The pipeline does not require ArUco markers or VSLAM poses. For hand scanning,
+the default is deliberately simple:
 
 1. Motor angles provide the yaw and circular-orbit prior.
-2. The visible platform provides pitch, roll, and height correction.
-3. Guarded object-only ICP provides local geometric refinements.
+2. A previously calibrated fixed axis and pivot define the camera orbit.
+3. Guarded hand-only ICP provides small local refinements.
+
+Platform correction is optional and disabled by default:
+
+```python
+USE_PLATFORM_ALIGNMENT = False
+```
+
+Set it to `True` only for a calibration object scan where the platform is
+clearly visible. A hand scan does not require or attempt a platform fit.
 
 The absolute poses are optimized together in an Open3D pose graph. This avoids
 the cumulative drift caused by progressively registering every scan against an
@@ -106,8 +115,7 @@ R&t\\
 \end{bmatrix}
 \]
 
-When `AUTO_CALIBRATE_ORBIT_AXIS=True`, the script robustly averages reliable
-platform normals. If there are no reliable planes, it uses:
+In the default hand mode, the script directly uses:
 
 ```python
 ORBIT_AXIS_IN_REFERENCE = np.array(
@@ -115,7 +123,14 @@ ORBIT_AXIS_IN_REFERENCE = np.array(
 )
 ```
 
+This fixed axis and `PIVOT_IN_REFERENCE` must be calibrated once while the
+camera mount and motor geometry are unchanged. When
+`USE_PLATFORM_ALIGNMENT=True` and `AUTO_CALIBRATE_ORBIT_AXIS=True`, visible
+platform normals can refine the axis.
+
 ### Platform correction
+
+This section applies only when `USE_PLATFORM_ALIGNMENT=True`.
 
 Every raw scan receives an Open3D RANSAC plane fit. The fit:
 
@@ -136,17 +151,20 @@ plane again so unconstrained 6-DoF ICP cannot reintroduce platform layering.
 
 ## Processing Stages
 
-### 1. Platform calibration and pose priors
+### 1. Calibrated orbit initialization
 
-The script loads all raw PLY files, fits each platform plane, estimates the
-orbit axis, creates the motor prior, and creates the plane-corrected pose for
-every scan.
+In default hand mode, the script uses the fixed calibrated axis, pivot, and
+motor angle to create every pose prior. It does not search for a platform.
+
+In optional platform mode, it additionally fits each platform plane, estimates
+the orbit axis, and creates plane-corrected poses.
 
 ### 2. Object-only registration and global optimization
 
-The platform is retained for final output but removed from registration clouds.
-Points within 4 mm of the fitted plane are excluded. Remaining points are
-cropped, downsampled to 2 mm, and assigned normals from a 6 mm neighborhood.
+In hand mode, the cropped hand points are downsampled to 2 mm and assigned
+normals from a 6 mm neighborhood. In platform mode, the platform is retained
+for final output but points within 4 mm of its fitted plane are excluded from
+registration.
 
 Coarse and fine point-to-plane ICP run for:
 
@@ -239,12 +257,17 @@ outputs are stopped unless all of these pass:
 
 | Metric | Requirement |
 |---|---:|
-| Reliable platform planes | at least 80% |
 | Usable sequential constraints | at least 90% |
-| Optimized platform-normal residual p90 | at most 0.5 degrees |
-| Optimized platform height span | at most 2 mm |
 | Optimized orbit loop translation | at most 3 mm |
 | Optimized orbit loop rotation | at most 1 degree |
+
+When `USE_PLATFORM_ALIGNMENT=True`, three additional gates apply:
+
+| Platform metric | Requirement |
+|---|---:|
+| Reliable platform planes | at least 80% |
+| Optimized platform-normal residual p90 | at most 0.5 degrees |
+| Optimized platform height span | at most 2 mm |
 
 Loop residual compares the optimized final-to-reference relation with the
 motor/plane relation. Raw ICP correction is still recorded, but it is not a
@@ -258,7 +281,7 @@ produce an explicitly experimental output after inspecting the diagnostics.
 | Area | Settings |
 |---|---|
 | Geometry | `REFERENCE_ANGLE_DEG`, `ORBIT_RADIUS_M`, `PIVOT_IN_REFERENCE`, `ANGLE_SIGN` |
-| Axis | `AUTO_CALIBRATE_ORBIT_AXIS`, `ORBIT_AXIS_IN_REFERENCE` |
+| Mode and axis | `USE_PLATFORM_ALIGNMENT`, `AUTO_CALIBRATE_ORBIT_AXIS`, `ORBIT_AXIS_IN_REFERENCE` |
 | Plane ROI | `PLANE_FIT_BOUNDS_M`, `PLANE_EXCLUSION_RADIUS_M` |
 | Plane RANSAC | `PLANE_RANSAC_DISTANCE_M`, `PLANE_MIN_INLIERS`, `PLANE_MIN_INLIER_RATIO` |
 | Registration | `REGISTRATION_VOXEL_M`, `REGISTRATION_NORMAL_RADIUS_M`, `ICP_COARSE_DISTANCE_M`, `ICP_FINE_DISTANCE_M` |

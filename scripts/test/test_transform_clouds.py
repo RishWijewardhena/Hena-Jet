@@ -420,6 +420,64 @@ class TransformCloudsGeometryTests(unittest.TestCase):
             any("loop closure" in reason for reason in quality["failure_reasons"])
         )
 
+    def test_quality_gate_can_run_without_platform_for_hand_scans(self):
+        no_plane = PlaneModel(
+            normal=np.array([0.0, 1.0, 0.0]),
+            offset=0.0,
+            inlier_count=0,
+            candidate_count=0,
+            rmse_m=float("inf"),
+            reliable=False,
+            reason="platform alignment disabled",
+        )
+        sequential = RegistrationEdge(
+            source_id=0,
+            target_id=1,
+            kind="sequential",
+            transform=np.eye(4),
+            information=np.eye(6),
+            accepted=False,
+            reason="used motor prior",
+            fitness=0.8,
+            rmse_m=0.002,
+            correction_m=0.02,
+            correction_deg=5.0,
+            usable=True,
+        )
+        loop = RegistrationEdge(
+            source_id=0,
+            target_id=1,
+            kind="loop",
+            transform=np.eye(4),
+            information=np.eye(6),
+            accepted=True,
+            reason="accepted",
+            fitness=0.8,
+            rmse_m=0.002,
+            correction_m=0.001,
+            correction_deg=0.2,
+        )
+
+        quality = evaluate_registration_quality(
+            planes=[no_plane, no_plane],
+            optimized_poses=[np.eye(4), np.eye(4)],
+            plane_corrected_poses=[np.eye(4), np.eye(4)],
+            edges=[sequential, loop],
+            pivot=np.array([0.025, 0.0, 0.175]),
+            require_platform_alignment=False,
+            minimum_plane_fit_fraction=0.8,
+            minimum_sequential_usable_fraction=0.9,
+            maximum_plane_normal_p90_deg=0.5,
+            maximum_plane_height_span_m=0.002,
+            maximum_loop_correction_m=0.003,
+            maximum_loop_correction_deg=1.0,
+        )
+
+        self.assertTrue(quality["passed"])
+        self.assertFalse(quality["platform_alignment_required"])
+        self.assertIsNone(quality["plane_normal_residual_p90_deg"])
+        self.assertIsNone(quality["plane_height_span_m"])
+
     def test_quality_gate_counts_guarded_prior_fallback_as_usable(self):
         plane = PlaneModel(
             normal=np.array([0.0, 1.0, 0.0]),

@@ -51,7 +51,9 @@ PIVOT_IN_REFERENCE = np.array(
 )
 
 # The platform-plane calibration measured this axis approximately 2.3 degrees
-# away from camera Y. Reliable per-scan platform fits refine it automatically.
+# away from camera Y. Hand scans normally have no visible platform, so the
+# simple default uses this fixed calibration plus motor angles and guarded ICP.
+USE_PLATFORM_ALIGNMENT = False
 AUTO_CALIBRATE_ORBIT_AXIS = True
 ORBIT_AXIS_IN_REFERENCE = np.array(
     [0.03097, 0.99918, -0.02609],
@@ -444,6 +446,7 @@ def evaluate_registration_quality(
     plane_corrected_poses: list[np.ndarray] | None = None,
     edges: list[RegistrationEdge],
     pivot: np.ndarray,
+    require_platform_alignment: bool = True,
     minimum_plane_fit_fraction: float,
     minimum_sequential_usable_fraction: float,
     maximum_plane_normal_p90_deg: float,
@@ -537,7 +540,10 @@ def evaluate_registration_quality(
     )
 
     failure_reasons = []
-    if plane_fit_fraction < minimum_plane_fit_fraction:
+    if (
+        require_platform_alignment
+        and plane_fit_fraction < minimum_plane_fit_fraction
+    ):
         failure_reasons.append(
             "platform plane fit fraction is below the quality gate"
         )
@@ -545,11 +551,17 @@ def evaluate_registration_quality(
         failure_reasons.append(
             "usable sequential registration is below the quality gate"
         )
-    if normal_p90 > maximum_plane_normal_p90_deg:
+    if (
+        require_platform_alignment
+        and normal_p90 > maximum_plane_normal_p90_deg
+    ):
         failure_reasons.append(
             "platform plane normal residual exceeds the quality gate"
         )
-    if height_span > maximum_plane_height_span_m:
+    if (
+        require_platform_alignment
+        and height_span > maximum_plane_height_span_m
+    ):
         failure_reasons.append(
             "platform plane height span exceeds the quality gate"
         )
@@ -559,13 +571,18 @@ def evaluate_registration_quality(
     return {
         "passed": not failure_reasons,
         "failure_reasons": failure_reasons,
+        "platform_alignment_required": require_platform_alignment,
         "plane_fit_fraction": plane_fit_fraction,
         "sequential_usable_fraction": sequential_usable,
         "sequential_icp_acceptance_fraction": sequential_icp_acceptance,
         # Retained for readers of diagnostics schema version 1.
         "sequential_acceptance_fraction": sequential_icp_acceptance,
-        "plane_normal_residual_p90_deg": normal_p90,
-        "plane_height_span_m": height_span,
+        "plane_normal_residual_p90_deg": (
+            normal_p90 if require_platform_alignment else None
+        ),
+        "plane_height_span_m": (
+            height_span if require_platform_alignment else None
+        ),
         "loop_closure_passed": loop_passed,
         "loop_closure_translation_m": (
             loop_translation_m if np.isfinite(loop_translation_m) else None
@@ -1385,6 +1402,7 @@ def save_registration_diagnostics(
             )
         ),
         "settings": {
+            "use_platform_alignment": USE_PLATFORM_ALIGNMENT,
             "pivot_in_reference": PIVOT_IN_REFERENCE.tolist(),
             "registration_voxel_m": REGISTRATION_VOXEL_M,
             "icp_coarse_distance_m": ICP_COARSE_DISTANCE_M,
@@ -1731,13 +1749,31 @@ def main() -> None:
     print(f"Orbit radius: {ORBIT_RADIUS_M:.4f} m")
     print(f"Pivot in reference frame: {PIVOT_IN_REFERENCE}")
 
-    print("\nStage 1/5: markerless platform calibration")
-    planes = load_plane_fits(o3d, ply_files)
-    orbit_axis, used_axis_fallback = estimate_orbit_axis(
-        planes,
-        fallback=ORBIT_AXIS_IN_REFERENCE,
-        auto_calibrate=AUTO_CALIBRATE_ORBIT_AXIS,
-    )
+    print("\nStage 1/5: calibrated orbit initialization")
+    if USE_PLATFORM_ALIGNMENT:
+        planes = load_plane_fits(o3d, ply_files)
+        orbit_axis, used_axis_fallback = estimate_orbit_axis(
+            planes,
+            fallback=ORBIT_AXIS_IN_REFERENCE,
+            auto_calibrate=AUTO_CALIBRATE_ORBIT_AXIS,
+        )
+    else:
+        print(
+            "Platform alignment disabled: using the fixed calibrated orbit "
+            "axis, motor angles, and object-only ICP."
+        )
+        planes = [
+            unreliable_plane(
+                candidate_count=0,
+                reason="platform alignment disabled",
+            )
+            for _ in ply_files
+        ]
+        orbit_axis = normalized_vector(
+            ORBIT_AXIS_IN_REFERENCE,
+            name="ORBIT_AXIS_IN_REFERENCE",
+        )
+        used_axis_fallback = True
     print(
         f"Orbit axis: {orbit_axis} "
         f"(fallback={'yes' if used_axis_fallback else 'no'})"
@@ -1749,10 +1785,12 @@ def main() -> None:
             orbit_axis,
         )
     )
-    print(
-        "Reference plane: "
-        f"normal={reference_plane.normal}, offset={reference_plane.offset:.6f}"
-    )
+    if USE_PLATFORM_ALIGNMENT:
+        print(
+            "Reference plane: "
+            f"normal={reference_plane.normal}, "
+            f"offset={reference_plane.offset:.6f}"
+        )
 
     print("\nStage 2/5: guarded ICP and global pose graph")
     frames = load_registration_frames(
@@ -1764,11 +1802,12 @@ def main() -> None:
     )
     graph, edges = build_pose_graph(o3d, frames)
     optimized_poses = optimize_pose_graph(o3d, graph)
-    optimized_poses = enforce_platform_alignment(
-        planes,
-        optimized_poses,
-        reference_plane,
-    )
+    if USE_PLATFORM_ALIGNMENT:
+        optimized_poses = enforce_platform_alignment(
+            planes,
+            optimized_poses,
+            reference_plane,
+        )
     save_pose_matrices(frames, optimized_poses)
 
     quality = evaluate_registration_quality(
@@ -1777,6 +1816,7 @@ def main() -> None:
         plane_corrected_poses=plane_corrected_poses,
         edges=edges,
         pivot=PIVOT_IN_REFERENCE,
+        require_platform_alignment=USE_PLATFORM_ALIGNMENT,
         minimum_plane_fit_fraction=MINIMUM_PLANE_FIT_FRACTION,
         minimum_sequential_usable_fraction=(
             MINIMUM_SEQUENTIAL_USABILITY
@@ -1794,19 +1834,33 @@ def main() -> None:
         edges=edges,
         quality=quality,
     )
-    print(
-        "Quality: "
-        f"passed={quality['passed']}, "
-        f"plane_fit={quality['plane_fit_fraction']:.1%}, "
-        f"sequential_usable="
-        f"{quality['sequential_usable_fraction']:.1%}, "
-        f"sequential_ICP="
-        f"{quality['sequential_icp_acceptance_fraction']:.1%}, "
-        f"plane_normal_p90="
-        f"{quality['plane_normal_residual_p90_deg']:.3f} deg, "
-        f"plane_height_span={quality['plane_height_span_m']:.4f} m, "
-        f"loop={quality['loop_closure_passed']}"
-    )
+    quality_parts = [
+        f"passed={quality['passed']}",
+        (
+            "sequential_usable="
+            f"{quality['sequential_usable_fraction']:.1%}"
+        ),
+        (
+            "sequential_ICP="
+            f"{quality['sequential_icp_acceptance_fraction']:.1%}"
+        ),
+        f"loop={quality['loop_closure_passed']}",
+    ]
+    if USE_PLATFORM_ALIGNMENT:
+        quality_parts.extend(
+            [
+                f"plane_fit={quality['plane_fit_fraction']:.1%}",
+                (
+                    "plane_normal_p90="
+                    f"{quality['plane_normal_residual_p90_deg']:.3f} deg"
+                ),
+                (
+                    "plane_height_span="
+                    f"{quality['plane_height_span_m']:.4f} m"
+                ),
+            ]
+        )
+    print("Quality: " + ", ".join(quality_parts))
     if not quality["passed"] and not ALLOW_LOW_QUALITY_OUTPUT:
         reasons = "\n- ".join(quality["failure_reasons"])
         raise RuntimeError(
