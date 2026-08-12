@@ -346,6 +346,7 @@ def vslam_pose_is_acceptable(
         return False
     if covariance.size == 0 or not np.all(np.isfinite(covariance)):
         return False
+
     rotation = transform[:3, :3]
     return bool(
         np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-3)
