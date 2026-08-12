@@ -10,8 +10,8 @@
 
 namespace {
 
-constexpr double MOTOR_RPM = 0.25;
-constexpr double START_RPM = 0.25;
+constexpr double MOTOR_RPM = 0.5;
+constexpr double START_RPM = 0.4;
 constexpr double ACCELERATION_RPM_PER_SECOND = 3.0;
 constexpr double MINIMUM_CONTINUOUS_RPM = 0.05;
 constexpr double MAXIMUM_CONTINUOUS_RPM = 2.0;
