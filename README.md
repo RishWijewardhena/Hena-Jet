@@ -77,6 +77,8 @@ Validate the concept with ZED-M:
 6. Inspect the merged point cloud in Open3D.
 
 See [docs/zed_m_feasibility.md](docs/zed_m_feasibility.md) for the checklist.
+See [docs/transform_clouds.md](docs/transform_clouds.md) for the complete
+known-angle transformation, progressive ICP, cleanup, and meshing pipeline.
 
 ## Reliable Close-Range KISS-ICP Scan
 
