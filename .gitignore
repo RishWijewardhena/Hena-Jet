@@ -23,6 +23,9 @@ imgui.ini
 # Licensed MANO model distribution (keep local)
 Mano/
 
+# Local dataset-backed fixtures
+/examples/zed_full_test/
+
 # OS/editor
 .DS_Store
 .idea/

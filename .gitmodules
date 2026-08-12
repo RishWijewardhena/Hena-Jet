@@ -1,0 +1,3 @@
+[submodule "lingbot-depth"]
+	path = lingbot-depth
+	url = https://github.com/robbyant/lingbot-depth.git
