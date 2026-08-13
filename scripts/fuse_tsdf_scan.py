@@ -56,8 +56,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-world-z", type=float, default=None)
     parser.add_argument("--max-world-z", type=float, default=None)
     parser.add_argument("--max-world-radius-m", type=float, default=None)
+    parser.add_argument("--pose-source", choices=["orbit", "vslam"], default="orbit")
+    parser.add_argument("--max-depth-confidence", type=int, default=100)
+    parser.add_argument("--object-center-m", type=float, nargs=3, default=None)
+    parser.add_argument("--object-up", type=float, nargs=3, default=None)
+    parser.add_argument("--max-object-radius-m", type=float, default=None)
+    parser.add_argument("--min-object-height-m", type=float, default=None)
+    parser.add_argument("--max-object-height-m", type=float, default=None)
     parser.add_argument("--invert-angles", action="store_true")
     parser.add_argument("--angle-offset-deg", type=float, default=0.0)
+    parser.add_argument(
+        "--camera-yaw-deg",
+        type=float,
+        default=0.0,
+        help="Constant camera mounting yaw relative to the inward radial direction.",
+    )
     parser.add_argument("--center-offset-x-m", type=float, default=0.0)
     parser.add_argument("--center-offset-y-m", type=float, default=0.0)
     parser.add_argument("--override-radius-m", type=float, default=None)
@@ -106,6 +119,7 @@ def camera_to_world_matrix(
     height_m: float,
     invert_angles: bool = False,
     angle_offset_deg: float = 0.0,
+    camera_yaw_deg: float = 0.0,
     center_offset_x_m: float = 0.0,
     center_offset_y_m: float = 0.0,
 ) -> np.ndarray:
@@ -125,9 +139,19 @@ def camera_to_world_matrix(
     camera_down = -world_up
 
     transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = np.column_stack(
+    camera_to_world_rotation = np.column_stack(
         [camera_right, camera_down, camera_forward]
     )
+    yaw = math.radians(camera_yaw_deg)
+    local_yaw = np.array(
+        [
+            [math.cos(yaw), 0.0, math.sin(yaw)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(yaw), 0.0, math.cos(yaw)],
+        ],
+        dtype=np.float64,
+    )
+    transform[:3, :3] = camera_to_world_rotation @ local_yaw
     transform[:3, 3] = np.array(
         [radius_m * math.cos(theta), radius_m * math.sin(theta), height_m],
         dtype=np.float64,
@@ -173,6 +197,58 @@ def make_intrinsic(meta: dict) -> o3d.camera.PinholeCameraIntrinsic:
     )
 
 
+def load_confidence_image(meta_path: Path, expected_shape: tuple[int, int]) -> np.ndarray | None:
+    """Load an optional confidence map while remaining compatible with old captures."""
+    data = np.load(meta_path.with_suffix(".npz"))
+    if "confidence_image" not in data.files:
+        return None
+    confidence = data["confidence_image"].astype(np.uint8)
+    if confidence.shape != expected_shape:
+        raise RuntimeError(
+            f"{meta_path}: confidence shape {confidence.shape} does not match depth {expected_shape}"
+        )
+    return confidence
+
+
+def depth_confidence_mask(
+    confidence: np.ndarray,
+    maximum_confidence: int,
+) -> np.ndarray:
+    """Keep ZED confidence values at or below the 0-best/100-worst limit."""
+    if not 0 <= maximum_confidence <= 100:
+        raise ValueError("--max-depth-confidence must be between 0 and 100")
+    return np.asarray(confidence) <= maximum_confidence
+
+
+def object_crop_mask(
+    world_points: np.ndarray,
+    *,
+    center: np.ndarray,
+    up: np.ndarray,
+    min_height_m: float | None,
+    max_height_m: float | None,
+    max_radius_m: float | None,
+) -> np.ndarray:
+    """Return an object-relative cylindrical crop mask in any world frame."""
+    center = np.asarray(center, dtype=np.float64)
+    up = np.asarray(up, dtype=np.float64)
+    norm = float(np.linalg.norm(up))
+    if center.shape != (3,) or up.shape != (3,) or norm == 0.0:
+        raise ValueError("Object center and up must be finite three-vectors")
+    up = up / norm
+    relative = np.asarray(world_points, dtype=np.float64) - center
+    height = relative @ up
+    radial = relative - height[..., None] * up
+    mask = np.ones(height.shape, dtype=bool)
+    if min_height_m is not None:
+        mask &= height >= min_height_m
+    if max_height_m is not None:
+        mask &= height <= max_height_m
+    if max_radius_m is not None:
+        mask &= np.linalg.norm(radial, axis=-1) <= max_radius_m
+    return mask
+
+
 def apply_depth_filters(
     depth: np.ndarray,
     meta: dict,
@@ -194,7 +270,14 @@ def apply_depth_filters(
 
     world_crop_requested = any(
         value is not None
-        for value in (args.min_world_z, args.max_world_z, args.max_world_radius_m)
+        for value in (
+            args.min_world_z,
+            args.max_world_z,
+            args.max_world_radius_m,
+            getattr(args, "min_object_height_m", None),
+            getattr(args, "max_object_height_m", None),
+            getattr(args, "max_object_radius_m", None),
+        )
     )
     if world_crop_requested:
         camera_points = camera_points_from_depth(filtered, meta)
@@ -218,6 +301,18 @@ def apply_depth_filters(
             )
             valid &= distance_from_center <= args.max_world_radius_m
 
+        object_center = getattr(args, "object_center_m", None)
+        object_up = getattr(args, "object_up", None)
+        if object_center is not None and object_up is not None:
+            valid &= object_crop_mask(
+                world_points,
+                center=np.asarray(object_center),
+                up=np.asarray(object_up),
+                min_height_m=getattr(args, "min_object_height_m", None),
+                max_height_m=getattr(args, "max_object_height_m", None),
+                max_radius_m=getattr(args, "max_object_radius_m", None),
+            )
+
     filtered[~valid] = 0.0
     return filtered.astype(np.float32)
 
@@ -236,16 +331,52 @@ def make_rgbd(color: np.ndarray, depth: np.ndarray, depth_trunc_m: float) -> o3d
 def capture_pose(meta: dict, args: argparse.Namespace) -> tuple[float, np.ndarray]:
     """Return the calibrated scanner radius and camera-to-world transform."""
     radius_m = scanner_radius(meta, args.override_radius_m)
+    if getattr(args, "pose_source", "orbit") == "vslam":
+        if "camera_to_vslam_world" not in meta:
+            raise RuntimeError("VSLAM pose source requested but capture metadata has no pose")
+        camera_to_world = np.asarray(meta["camera_to_vslam_world"], dtype=np.float64)
+        if camera_to_world.shape != (4, 4) or not np.all(np.isfinite(camera_to_world)):
+            raise RuntimeError("Invalid camera_to_vslam_world matrix in capture metadata")
+        return radius_m, camera_to_world
     camera_to_world = camera_to_world_matrix(
         angle_deg=float(meta["angle_deg"]),
         radius_m=radius_m,
         height_m=scanner_height(meta, args.override_height_m),
         invert_angles=args.invert_angles,
         angle_offset_deg=args.angle_offset_deg,
+        camera_yaw_deg=getattr(args, "camera_yaw_deg", 0.0),
         center_offset_x_m=args.center_offset_x_m,
         center_offset_y_m=args.center_offset_y_m,
     )
     return radius_m, camera_to_world
+
+
+def configure_object_frame(args: argparse.Namespace) -> None:
+    """Resolve the object frame from CLI values or the VSLAM session manifest."""
+    center = args.object_center_m
+    up = args.object_up
+    session_path = args.capture_dir / "scan_session.json"
+    if (center is None or up is None) and session_path.exists():
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        if center is None:
+            center = session.get("object_center_vslam_world_m")
+        if up is None:
+            up = session.get("object_up_vslam_world")
+    object_crop_requested = any(
+        value is not None
+        for value in (
+            args.min_object_height_m,
+            args.max_object_height_m,
+            args.max_object_radius_m,
+        )
+    )
+    if object_crop_requested and (center is None or up is None):
+        raise RuntimeError(
+            "Object-relative crop requested without --object-center-m/--object-up "
+            "or a scan_session.json"
+        )
+    args.object_center_m = None if center is None else np.asarray(center, dtype=np.float64)
+    args.object_up = None if up is None else np.asarray(up, dtype=np.float64)
 
 
 def integrate_capture(
@@ -255,6 +386,15 @@ def integrate_capture(
 ) -> int:
     """Load, filter, and integrate one capture; return its valid pixel count."""
     meta, depth, color = load_capture(meta_path)
+    confidence = load_confidence_image(meta_path, depth.shape)
+    if confidence is None:
+        if args.max_depth_confidence < 100:
+            raise RuntimeError(
+                f"{meta_path}: --max-depth-confidence requires confidence_image"
+            )
+    else:
+        depth = depth.copy()
+        depth[~depth_confidence_mask(confidence, args.max_depth_confidence)] = 0.0
     radius_m, camera_to_world = capture_pose(meta, args)
     depth = apply_depth_filters(depth, meta, radius_m, camera_to_world, args)
 
@@ -294,6 +434,9 @@ def save_outputs(
 def main() -> None:
     """Integrate all captures into a scalable TSDF volume and save the result."""
     args = parse_args()
+    configure_object_frame(args)
+    if not 0 <= args.max_depth_confidence <= 100:
+        raise ValueError("--max-depth-confidence must be between 0 and 100")
     meta_paths = sorted(args.capture_dir.glob("angle_*.json"))
     if not meta_paths:
         raise RuntimeError(f"No angle_*.json captures found in {args.capture_dir}")
