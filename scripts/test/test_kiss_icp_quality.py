@@ -8,7 +8,7 @@ import numpy as np
 SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from kiss_icp_quality import (  # noqa: E402
+from scripts.kiss_ICP.kiss_icp_quality import (  # noqa: E402
     GlobalVoxelAccumulator,
     deterministic_voxel_sample,
     evaluate_frame_quality,
