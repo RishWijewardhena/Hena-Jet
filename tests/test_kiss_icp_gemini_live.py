@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -11,12 +12,57 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts" / "kiss_ICP"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from run_kiss_icp_export_map import (  # noqa: E402
+    configure_point_cloud_scale,
+    parse_args,
     point_cloud_from_depth_frame,
     prepare_points_meters,
 )
 
 
 class PreparePointsMetersTests(unittest.TestCase):
+    def test_default_normalizes_gemini_tenth_millimetres_to_metres(self) -> None:
+        with patch.object(sys, "argv", ["run_kiss_icp_export_map.py"]):
+            args = parse_args()
+
+        raw_points = np.array([[0.0, 0.0, 700.0]], dtype=np.float32)
+
+        class FakeDepthFrame:
+            def get_depth_scale(self) -> float:
+                return 0.1
+
+        class FakePointsFrame:
+            def __init__(self, points: np.ndarray) -> None:
+                self.points = points
+
+            def get_data(self) -> bytes:
+                return self.points.tobytes()
+
+        class FakePointCloudFrame:
+            def __init__(self, points: np.ndarray) -> None:
+                self.points = points
+
+            def as_points_frame(self) -> FakePointsFrame:
+                return FakePointsFrame(self.points)
+
+        class FakePointCloudFilter:
+            def set_position_data_scaled(self, scale: float) -> None:
+                self.position_scale = scale
+
+            def process(self, depth_frame: object) -> FakePointCloudFrame:
+                return FakePointCloudFrame(raw_points * self.position_scale)
+
+        depth_frame = FakeDepthFrame()
+        point_cloud_filter = FakePointCloudFilter()
+        depth_scale_mm = configure_point_cloud_scale(point_cloud_filter, depth_frame)
+        points = point_cloud_from_depth_frame(
+            point_cloud_filter,
+            depth_frame,
+            point_unit_m=args.point_unit_m,
+        )
+
+        self.assertEqual(depth_scale_mm, 0.1)
+        np.testing.assert_allclose(points, [[0.0, 0.0, 0.07]])
+
     def test_converts_orbbec_millimetres_and_removes_invalid_points(self) -> None:
         raw_points = np.array(
             [

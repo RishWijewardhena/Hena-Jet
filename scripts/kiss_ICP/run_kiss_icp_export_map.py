@@ -39,9 +39,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.001,
         help=(
-            "Metres represented by one PointCloudFilter XYZ unit. The Gemini 305 "
-            "SDK returns millimetres, so the default is 0.001. Use 0.01 only if "
-            "your XYZ values are confirmed to be millimetres divided by ten."
+            "Metres represented by one SDK-normalized PointCloudFilter XYZ unit. "
+            "The stream is normalized to millimetres, so the default is 0.001."
         ),
     )
     parser.add_argument("--min-range", type=float, default=0.04)
@@ -127,6 +126,18 @@ def point_cloud_from_depth_frame(
     if data.size % 3 != 0:
         raise RuntimeError("Orbbec point-cloud buffer size is not a multiple of three")
     return prepare_points_meters(data.reshape((-1, 3)), point_unit_m)
+
+
+def configure_point_cloud_scale(
+    point_cloud_filter: PointCloudFilter,
+    depth_frame: DepthFrame,
+) -> float:
+    """Normalize device-specific XYZ units to millimetres."""
+    depth_scale_mm = float(depth_frame.get_depth_scale())
+    if not math.isfinite(depth_scale_mm) or depth_scale_mm <= 0:
+        raise RuntimeError(f"Invalid Gemini depth scale: {depth_scale_mm}")
+    point_cloud_filter.set_position_data_scaled(depth_scale_mm)
+    return depth_scale_mm
 
 
 def write_xyz_ply(path: Path, points: np.ndarray) -> None:
@@ -216,7 +227,6 @@ def main() -> None:
         f"voxel={kiss_config.mapping.voxel_size}m, "
         f"threshold={kiss_config.adaptive_threshold.initial_threshold}m"
     )
-    print(f"Point-cloud conversion: XYZ * {args.point_unit_m:g} = metres")
     print("Press Ctrl+C to stop and save the map.")
 
     poses: list[np.ndarray] = []
@@ -231,7 +241,9 @@ def main() -> None:
         pipeline_started = True
 
         first_depth_frame = None
-        for _ in range(args.warmup_frames):
+        warmup_frames_received = 0
+        required_warmup_frames = max(args.warmup_frames, 1)
+        while warmup_frames_received < required_warmup_frames:
             first_depth_frame = wait_for_depth_frame(pipeline, args.frame_timeout_ms)
             if first_depth_frame is None:
                 consecutive_timeouts += 1
@@ -239,12 +251,19 @@ def main() -> None:
                     raise RuntimeError("Timed out while warming up the Gemini depth stream")
             else:
                 consecutive_timeouts = 0
+                warmup_frames_received += 1
 
-        if first_depth_frame is not None:
-            print(
-                "Raw depth-image scale: "
-                f"{first_depth_frame.get_depth_scale():.6g} mm per depth unit"
-            )
+        if first_depth_frame is None:
+            raise RuntimeError("Gemini warmup completed without a depth frame")
+        depth_scale_mm = configure_point_cloud_scale(
+            point_cloud_filter,
+            first_depth_frame,
+        )
+        print(f"Raw depth-image scale: {depth_scale_mm:.6g} mm per depth unit")
+        print(
+            "Point-cloud conversion: SDK-normalized millimetres, then "
+            f"XYZ * {args.point_unit_m:g} = metres"
+        )
 
         while args.n_scans < 0 or registered_scans < args.n_scans:
             depth_frame = wait_for_depth_frame(pipeline, args.frame_timeout_ms)
