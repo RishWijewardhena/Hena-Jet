@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run KISS-ICP from a live Gemini 305 stream and export its local map."""
+"""Run KISS-ICP from live Gemini 305 RGB-D and export a colored voxel map."""
 
 from __future__ import annotations
 
@@ -11,20 +11,98 @@ import numpy as np
 from kiss_icp.config import KISSConfig
 from kiss_icp.kiss_icp import KissICP
 from pyorbbecsdk import (
+    AlignFilter,
     Config,
     Context,
     DepthFrame,
+    FrameSet,
     OBFormat,
     OBSensorType,
+    OBStreamType,
     Pipeline,
     PointCloudFilter,
     VideoStreamProfile,
 )
 
 
+class ColoredVoxelMap:
+    """Incremental voxel averages for world-space XYZ and RGB samples."""
+
+    def __init__(self, voxel_size_m: float) -> None:
+        if voxel_size_m <= 0:
+            raise ValueError("voxel_size_m must be positive")
+        self.voxel_size_m = voxel_size_m
+        self._keys = np.empty((0, 3), dtype=np.int64)
+        self._position_sums = np.empty((0, 3), dtype=np.float64)
+        self._color_sums = np.empty((0, 3), dtype=np.float64)
+        self._counts = np.empty((0,), dtype=np.int64)
+
+    def __len__(self) -> int:
+        return int(self._keys.shape[0])
+
+    def update(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray,
+        pose: np.ndarray,
+    ) -> None:
+        points = np.asarray(points, dtype=np.float64)
+        colors = np.asarray(colors, dtype=np.float64)
+        pose = np.asarray(pose, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError("points must have shape (N, 3)")
+        if colors.shape != points.shape:
+            raise ValueError("colors must have the same (N, 3) shape as points")
+        if pose.shape != (4, 4):
+            raise ValueError("pose must have shape (4, 4)")
+        if points.shape[0] == 0:
+            return
+        if not np.isfinite(points).all() or not np.isfinite(pose).all():
+            raise ValueError("points and pose must be finite")
+
+        world_points = points @ pose[:3, :3].T + pose[:3, 3]
+        sample_keys = np.floor(world_points / self.voxel_size_m).astype(np.int64)
+        all_keys = np.concatenate((self._keys, sample_keys), axis=0)
+        all_position_sums = np.concatenate(
+            (self._position_sums, world_points),
+            axis=0,
+        )
+        all_color_sums = np.concatenate((self._color_sums, colors), axis=0)
+        all_counts = np.concatenate(
+            (self._counts, np.ones(points.shape[0], dtype=np.int64)),
+        )
+
+        unique_keys, inverse = np.unique(all_keys, axis=0, return_inverse=True)
+        position_sums = np.zeros((unique_keys.shape[0], 3), dtype=np.float64)
+        color_sums = np.zeros((unique_keys.shape[0], 3), dtype=np.float64)
+        counts = np.zeros(unique_keys.shape[0], dtype=np.int64)
+        np.add.at(position_sums, inverse, all_position_sums)
+        np.add.at(color_sums, inverse, all_color_sums)
+        np.add.at(counts, inverse, all_counts)
+
+        self._keys = unique_keys
+        self._position_sums = position_sums
+        self._color_sums = color_sums
+        self._counts = counts
+
+    def point_cloud(self) -> tuple[np.ndarray, np.ndarray]:
+        if not len(self):
+            return (
+                np.empty((0, 3), dtype=np.float64),
+                np.empty((0, 3), dtype=np.uint8),
+            )
+        points = self._position_sums / self._counts[:, None]
+        colors = np.clip(
+            np.rint(self._color_sums / self._counts[:, None]),
+            0,
+            255,
+        ).astype(np.uint8)
+        return points, colors
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run KISS-ICP on a live Gemini 305 depth stream and save its local map."
+        description="Run KISS-ICP on live Gemini 305 RGB-D and save a colored map."
     )
     parser.add_argument("--out", type=Path, default=Path("outputs/kiss_icp_local_map.ply"))
     parser.add_argument("--poses-out", type=Path, default=Path("outputs/kiss_icp_local_map_poses.npy"))
@@ -98,36 +176,6 @@ def pose_step(previous: np.ndarray | None, current: np.ndarray) -> tuple[float, 
     return translation_m, rotation_deg
 
 
-def prepare_points_meters(points: np.ndarray, point_unit_m: float) -> np.ndarray:
-    """Convert SDK XYZ coordinates to metres and discard invalid points."""
-    points = np.asarray(points)
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError("points must have shape (N, 3)")
-    if point_unit_m <= 0:
-        raise ValueError("point_unit_m must be positive")
-
-    valid = np.isfinite(points).all(axis=1) & np.any(points != 0, axis=1)
-    return points[valid].astype(np.float64, copy=True) * point_unit_m
-
-
-def point_cloud_from_depth_frame(
-    point_cloud_filter: PointCloudFilter,
-    depth_frame: DepthFrame,
-    point_unit_m: float,
-) -> np.ndarray:
-    """Generate an XYZ cloud from one Orbbec depth frame in metres."""
-    # Official SDK pattern:
-    # https://github.com/orbbec/pyorbbecsdk/blob/v2-main/examples/beginner/05_point_cloud.py
-    point_cloud_frame = point_cloud_filter.process(depth_frame)
-    if point_cloud_frame is None:
-        raise RuntimeError("Orbbec PointCloudFilter returned no point-cloud frame")
-
-    data = np.frombuffer(point_cloud_frame.as_points_frame().get_data(), dtype=np.float32)
-    if data.size % 3 != 0:
-        raise RuntimeError("Orbbec point-cloud buffer size is not a multiple of three")
-    return prepare_points_meters(data.reshape((-1, 3)), point_unit_m)
-
-
 def colored_point_cloud_from_frame(
     point_cloud_filter: PointCloudFilter,
     frame: object,
@@ -163,20 +211,6 @@ def configure_point_cloud_scale(
     return depth_scale_mm
 
 
-def write_xyz_ply(path: Path, points: np.ndarray) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as file:
-        file.write("ply\n")
-        file.write("format ascii 1.0\n")
-        file.write(f"element vertex {points.shape[0]}\n")
-        file.write("property float x\n")
-        file.write("property float y\n")
-        file.write("property float z\n")
-        file.write("end_header\n")
-        for point in points:
-            file.write(f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f}\n")
-
-
 def write_xyzrgb_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
     """Write corresponding XYZ and RGB arrays as an ASCII PLY."""
     points = np.asarray(points)
@@ -205,11 +239,13 @@ def write_xyzrgb_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None
             )
 
 
-def wait_for_depth_frame(pipeline: Pipeline, timeout_ms: int) -> DepthFrame | None:
+def wait_for_rgbd_frames(pipeline: Pipeline, timeout_ms: int) -> FrameSet | None:
     frames = pipeline.wait_for_frames(timeout_ms)
     if frames is None:
         return None
-    return frames.get_depth_frame()
+    if frames.get_depth_frame() is None or frames.get_color_frame() is None:
+        return None
+    return frames
 
 
 def select_depth_profile(
@@ -233,16 +269,41 @@ def select_depth_profile(
         ) from error
 
 
-def save_results(args: argparse.Namespace, kiss: KissICP, poses: list[np.ndarray]) -> None:
-    local_map = kiss.local_map.point_cloud()
-    if local_map.size == 0 or not poses:
-        raise RuntimeError("KISS-ICP local map is empty; no output was written.")
+def select_color_profile(
+    pipeline: Pipeline,
+    args: argparse.Namespace,
+) -> VideoStreamProfile:
+    profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+    if profiles is None:
+        raise RuntimeError("The connected Orbbec device has no color profiles")
+    try:
+        return profiles.get_video_stream_profile(
+            args.width,
+            args.height,
+            OBFormat.RGB,
+            args.fps,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "Gemini color profile not available: "
+            f"{args.width}x{args.height} @ {args.fps} fps, RGB"
+        ) from error
 
-    write_xyz_ply(args.out, local_map)
+
+def save_results(
+    args: argparse.Namespace,
+    colored_map: ColoredVoxelMap,
+    poses: list[np.ndarray],
+) -> None:
+    points, colors = colored_map.point_cloud()
+    if points.size == 0 or not poses:
+        raise RuntimeError("The colored KISS-ICP map is empty; no output was written.")
+
+    write_xyzrgb_ply(args.out, points, colors)
     args.poses_out.parent.mkdir(parents=True, exist_ok=True)
     np.save(args.poses_out, np.stack(poses, axis=0))
 
-    print(f"Saved local map: {args.out} ({local_map.shape[0]} points)")
+    print(f"Saved colored map: {args.out} ({points.shape[0]} points)")
     print(f"Saved poses: {args.poses_out}")
 
 
@@ -258,12 +319,16 @@ def main() -> None:
     pipeline = Pipeline(device)
     sdk_config = Config()
     depth_profile = select_depth_profile(pipeline, args)
+    color_profile = select_color_profile(pipeline, args)
     sdk_config.enable_stream(depth_profile)
+    sdk_config.enable_stream(color_profile)
 
     kiss_config = make_config(args)
     kiss = KissICP(kiss_config)
+    colored_map = ColoredVoxelMap(args.voxel_size)
+    align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
     point_cloud_filter = PointCloudFilter()
-    point_cloud_filter.set_create_point_format(OBFormat.POINT)
+    point_cloud_filter.set_create_point_format(OBFormat.RGB_POINT)
 
     print(
         f"Camera: {device_info.get_name()} | serial={device_info.get_serial_number()} | "
@@ -272,6 +337,7 @@ def main() -> None:
     if "Gemini 305" not in device_info.get_name():
         print("WARNING: The first connected Orbbec device is not identified as Gemini 305.")
     print(f"Depth stream: {args.width}x{args.height} @ {args.fps} fps, Y16")
+    print(f"Color stream: {args.width}x{args.height} @ {args.fps} fps, RGB")
     print(
         "KISS config: "
         f"range=[{kiss_config.data.min_range}, {kiss_config.data.max_range}]m, "
@@ -288,24 +354,26 @@ def main() -> None:
     empty_timestamps = np.array([], dtype=np.float64)
 
     try:
+        pipeline.enable_frame_sync()
         pipeline.start(sdk_config)
         pipeline_started = True
 
-        first_depth_frame = None
+        first_frames = None
         warmup_frames_received = 0
         required_warmup_frames = max(args.warmup_frames, 1)
         while warmup_frames_received < required_warmup_frames:
-            first_depth_frame = wait_for_depth_frame(pipeline, args.frame_timeout_ms)
-            if first_depth_frame is None:
+            first_frames = wait_for_rgbd_frames(pipeline, args.frame_timeout_ms)
+            if first_frames is None:
                 consecutive_timeouts += 1
                 if consecutive_timeouts >= args.max_consecutive_timeouts:
-                    raise RuntimeError("Timed out while warming up the Gemini depth stream")
+                    raise RuntimeError("Timed out while warming up Gemini RGB-D streams")
             else:
                 consecutive_timeouts = 0
                 warmup_frames_received += 1
 
-        if first_depth_frame is None:
-            raise RuntimeError("Gemini warmup completed without a depth frame")
+        if first_frames is None:
+            raise RuntimeError("Gemini warmup completed without an RGB-D frame set")
+        first_depth_frame = first_frames.get_depth_frame()
         depth_scale_mm = configure_point_cloud_scale(
             point_cloud_filter,
             first_depth_frame,
@@ -317,25 +385,31 @@ def main() -> None:
         )
 
         while args.n_scans < 0 or registered_scans < args.n_scans:
-            depth_frame = wait_for_depth_frame(pipeline, args.frame_timeout_ms)
-            if depth_frame is None:
+            frames = wait_for_rgbd_frames(pipeline, args.frame_timeout_ms)
+            if frames is None:
                 consecutive_timeouts += 1
                 print(
-                    f"Waiting for depth frame "
+                    f"Waiting for synchronized RGB-D frames "
                     f"({consecutive_timeouts}/{args.max_consecutive_timeouts})..."
                 )
                 if consecutive_timeouts >= args.max_consecutive_timeouts:
-                    raise RuntimeError("Gemini depth stream stopped producing frames")
+                    raise RuntimeError("Gemini RGB-D streams stopped producing frames")
                 continue
             consecutive_timeouts = 0
 
-            points = point_cloud_from_depth_frame(
+            aligned_frames = align_filter.process(frames)
+            if aligned_frames is None:
+                print("Skipping frame: Orbbec depth-to-color alignment failed")
+                continue
+            points, colors = colored_point_cloud_from_frame(
                 point_cloud_filter,
-                depth_frame,
+                aligned_frames,
                 point_unit_m=args.point_unit_m,
             )
             ranges = np.linalg.norm(points, axis=1)
-            usable = points[(ranges >= args.min_range) & (ranges <= args.max_range)]
+            usable_mask = (ranges >= args.min_range) & (ranges <= args.max_range)
+            usable = points[usable_mask]
+            usable_colors = colors[usable_mask]
             if usable.shape[0] < 3:
                 median_z = float(np.median(points[:, 2])) if points.size else math.nan
                 print(
@@ -348,6 +422,7 @@ def main() -> None:
             pose = kiss.last_pose.copy()
             poses.append(pose)
             registered_scans += 1
+            colored_map.update(usable, usable_colors, pose)
 
             step_m, step_deg = pose_step(previous_pose, pose)
             previous_pose = pose
@@ -356,7 +431,8 @@ def main() -> None:
             print(
                 f"{registered_scans:04d}/{scan_total}: "
                 f"valid={points.shape[0]} usable={usable.shape[0]} "
-                f"map={map_points.shape[0]} step={step_m:.4f}m rot={step_deg:.2f}deg"
+                f"map={map_points.shape[0]} color_voxels={len(colored_map)} "
+                f"step={step_m:.4f}m rot={step_deg:.2f}deg"
             )
     except KeyboardInterrupt:
         print("\nStopping capture and saving results...")
@@ -364,7 +440,7 @@ def main() -> None:
         if pipeline_started:
             pipeline.stop()
 
-    save_results(args, kiss, poses)
+    save_results(args, colored_map, poses)
 
 
 if __name__ == "__main__":
