@@ -128,6 +128,29 @@ def point_cloud_from_depth_frame(
     return prepare_points_meters(data.reshape((-1, 3)), point_unit_m)
 
 
+def colored_point_cloud_from_frame(
+    point_cloud_filter: PointCloudFilter,
+    frame: object,
+    point_unit_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate corresponding XYZ metre and RGB uint8 arrays."""
+    # RGB_POINT layout is documented by the official Orbbec point-cloud example:
+    # https://github.com/orbbec/pyorbbecsdk/blob/v2-main/examples/beginner/05_point_cloud.py
+    point_cloud_frame = point_cloud_filter.process(frame)
+    if point_cloud_frame is None:
+        raise RuntimeError("Orbbec PointCloudFilter returned no colored point cloud")
+
+    data = np.frombuffer(point_cloud_frame.as_points_frame().get_data(), dtype=np.float32)
+    if data.size % 6 != 0:
+        raise RuntimeError("Orbbec RGB point-cloud buffer size is not a multiple of six")
+    records = data.reshape((-1, 6))
+    xyz = records[:, :3]
+    valid = np.isfinite(xyz).all(axis=1) & np.any(xyz != 0, axis=1)
+    points = xyz[valid].astype(np.float64, copy=True) * point_unit_m
+    colors = np.clip(np.rint(records[valid, 3:6]), 0, 255).astype(np.uint8)
+    return points, colors
+
+
 def configure_point_cloud_scale(
     point_cloud_filter: PointCloudFilter,
     depth_frame: DepthFrame,
@@ -152,6 +175,34 @@ def write_xyz_ply(path: Path, points: np.ndarray) -> None:
         file.write("end_header\n")
         for point in points:
             file.write(f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f}\n")
+
+
+def write_xyzrgb_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
+    """Write corresponding XYZ and RGB arrays as an ASCII PLY."""
+    points = np.asarray(points)
+    colors = np.asarray(colors)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    if colors.shape != points.shape:
+        raise ValueError("colors must have the same (N, 3) shape as points")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as file:
+        file.write("ply\n")
+        file.write("format ascii 1.0\n")
+        file.write(f"element vertex {points.shape[0]}\n")
+        file.write("property float x\n")
+        file.write("property float y\n")
+        file.write("property float z\n")
+        file.write("property uchar red\n")
+        file.write("property uchar green\n")
+        file.write("property uchar blue\n")
+        file.write("end_header\n")
+        for point, color in zip(points, colors, strict=True):
+            file.write(
+                f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f} "
+                f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+            )
 
 
 def wait_for_depth_frame(pipeline: Pipeline, timeout_ms: int) -> DepthFrame | None:

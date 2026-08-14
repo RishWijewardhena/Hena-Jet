@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,10 +13,12 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts" / "kiss_ICP"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from run_kiss_icp_export_map import (  # noqa: E402
+    colored_point_cloud_from_frame,
     configure_point_cloud_scale,
     parse_args,
     point_cloud_from_depth_frame,
     prepare_points_meters,
+    write_xyzrgb_ply,
 )
 
 
@@ -144,6 +147,53 @@ class PointCloudFromDepthFrameTests(unittest.TestCase):
                 object(),
                 point_unit_m=0.001,
             )
+
+
+class ColoredPointCloudTests(unittest.TestCase):
+    def test_extracts_corresponding_xyz_and_rgb_values(self) -> None:
+        raw = np.array(
+            [
+                [0.0, 0.0, 0.0, 255.0, 255.0, 255.0],
+                [10.0, -20.0, 70.0, 12.0, 128.0, 254.0],
+            ],
+            dtype=np.float32,
+        )
+
+        class FakePointsFrame:
+            def get_data(self) -> bytes:
+                return raw.tobytes()
+
+        class FakePointCloudFrame:
+            def as_points_frame(self) -> FakePointsFrame:
+                return FakePointsFrame()
+
+        class FakePointCloudFilter:
+            def process(self, frame: object) -> FakePointCloudFrame:
+                return FakePointCloudFrame()
+
+        points, colors = colored_point_cloud_from_frame(
+            FakePointCloudFilter(),
+            object(),
+            point_unit_m=0.001,
+        )
+
+        np.testing.assert_allclose(points, [[0.01, -0.02, 0.07]])
+        np.testing.assert_array_equal(colors, [[12, 128, 254]])
+        self.assertEqual(colors.dtype, np.uint8)
+
+    def test_writes_rgb_properties_and_values_to_ply(self) -> None:
+        points = np.array([[0.01, -0.02, 0.07]], dtype=np.float64)
+        colors = np.array([[12, 128, 254]], dtype=np.uint8)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "colored.ply"
+            write_xyzrgb_ply(output, points, colors)
+            contents = output.read_text(encoding="utf-8")
+
+        self.assertIn("property uchar red\n", contents)
+        self.assertIn("property uchar green\n", contents)
+        self.assertIn("property uchar blue\n", contents)
+        self.assertTrue(contents.endswith("0.010000 -0.020000 0.070000 12 128 254\n"))
 
 
 if __name__ == "__main__":
