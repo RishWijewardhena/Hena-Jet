@@ -55,6 +55,18 @@ def pose_step(previous: np.ndarray | None, current: np.ndarray) -> tuple[float, 
     return translation_m, rotation_deg
 
 
+def prepare_points_meters(points: np.ndarray, point_unit_m: float) -> np.ndarray:
+    """Convert SDK XYZ coordinates to metres and discard invalid points."""
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    if point_unit_m <= 0:
+        raise ValueError("point_unit_m must be positive")
+
+    valid = np.isfinite(points).all(axis=1) & np.any(points != 0, axis=1)
+    return points[valid].astype(np.float64, copy=True) * point_unit_m
+
+
 def write_xyz_ply(path: Path, points: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
