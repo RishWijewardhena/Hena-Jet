@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -14,11 +15,97 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from run_kiss_icp_export_map import (  # noqa: E402
     ColoredVoxelMap,
+    apply_depth_filter_chain,
+    create_depth_filter_chain,
     colored_point_cloud_from_frame,
     configure_point_cloud_scale,
+    make_rgbd_frame_set,
     parse_args,
     write_xyzrgb_ply,
 )
+
+
+class GeminiDepthFilterTests(unittest.TestCase):
+    def test_builds_only_edge_noise_then_device_hole_filling_filters(self) -> None:
+        class FakeFilter:
+            def __init__(self, name: str, *, hole: bool = False) -> None:
+                self.name = name
+                self.hole = hole
+                self.enabled = False
+
+            def is_hole_filling_filter(self) -> bool:
+                return self.hole
+
+            def enable(self, enabled: bool) -> None:
+                self.enabled = enabled
+
+        class FakeEdgeFilter(FakeFilter):
+            def __init__(self) -> None:
+                super().__init__("EdgeNoiseRemovalFilter")
+                self.params = SimpleNamespace(width=1280, height=800)
+
+            def get_filter_params(self) -> SimpleNamespace:
+                return self.params
+
+            def set_filter_params(self, params: SimpleNamespace) -> None:
+                self.params = params
+
+        hole = FakeFilter("HoleFillingFilter", hole=True)
+        decimation = FakeFilter("DecimationFilter")
+        sensor = SimpleNamespace(
+            get_recommended_filters=lambda: [decimation, hole],
+        )
+        device = SimpleNamespace(get_sensor=lambda sensor_type: sensor)
+        edge = FakeEdgeFilter()
+
+        with patch(
+            "run_kiss_icp_export_map.EdgeNoiseRemovalFilter",
+            return_value=edge,
+        ):
+            filters = create_depth_filter_chain(device, width=848, height=530)
+
+        self.assertEqual(filters, (edge, hole))
+        self.assertEqual((edge.params.width, edge.params.height), (848, 530))
+        self.assertTrue(edge.enabled)
+        self.assertTrue(hole.enabled)
+        self.assertFalse(decimation.enabled)
+
+    def test_applies_edge_noise_before_hole_filling(self) -> None:
+        class RecordingFilter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def process(self, values: tuple[str, ...]) -> tuple[str, ...]:
+                return (*values, self.name)
+
+        filtered = apply_depth_filter_chain(
+            ("raw",),
+            (
+                RecordingFilter("edge-noise"),
+                RecordingFilter("hole-filling"),
+            ),
+        )
+
+        self.assertEqual(filtered, ("raw", "edge-noise", "hole-filling"))
+
+    def test_rebuilds_rgbd_frameset_for_d2c_with_filtered_depth(self) -> None:
+        class FakeFrameSet:
+            def __init__(self) -> None:
+                self.frames: list[object] = []
+
+            def push_frame(self, frame: object) -> None:
+                self.frames.append(frame)
+
+        filtered_depth = object()
+        synchronized_color = object()
+        frame_set = FakeFrameSet()
+        frame_factory = SimpleNamespace(create_frame_set=lambda: frame_set)
+
+        with patch("run_kiss_icp_export_map.Frame", frame_factory):
+            result = make_rgbd_frame_set(filtered_depth, synchronized_color)
+
+        self.assertIs(result, frame_set)
+        self.assertEqual(frame_set.frames, [filtered_depth, synchronized_color])
 
 
 class GeminiScaleTests(unittest.TestCase):

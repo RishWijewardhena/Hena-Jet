@@ -15,6 +15,10 @@ from pyorbbecsdk import (
     Config,
     Context,
     DepthFrame,
+    Device,
+    EdgeNoiseRemovalFilter,
+    Filter,
+    Frame,
     FrameSet,
     OBFormat,
     OBSensorType,
@@ -211,6 +215,60 @@ def configure_point_cloud_scale(
     return depth_scale_mm
 
 
+def create_depth_filter_chain(
+    device: Device,
+    width: int,
+    height: int,
+) -> tuple[Filter, Filter]:
+    """Create the edge-noise then hole-filling SDK filter chain."""
+    sensor = device.get_sensor(OBSensorType.DEPTH_SENSOR)
+    recommended_filters = sensor.get_recommended_filters()
+    hole_filling_filter = next(
+        (
+            depth_filter
+            for depth_filter in recommended_filters
+            if depth_filter.is_hole_filling_filter()
+        ),
+        None,
+    )
+    if hole_filling_filter is None:
+        raise RuntimeError("Gemini SDK did not provide a HoleFillingFilter")
+
+    edge_noise_filter = EdgeNoiseRemovalFilter()
+    edge_params = edge_noise_filter.get_filter_params()
+    edge_params.width = width
+    edge_params.height = height
+    edge_noise_filter.set_filter_params(edge_params)
+
+    edge_noise_filter.enable(True)
+    hole_filling_filter.enable(True)
+    return edge_noise_filter, hole_filling_filter
+
+
+def apply_depth_filter_chain(
+    depth_frame: Frame,
+    depth_filters: tuple[Filter, ...],
+) -> Frame:
+    """Apply SDK depth filters in their declared order."""
+    filtered_frame = depth_frame
+    for depth_filter in depth_filters:
+        output_frame = depth_filter.process(filtered_frame)
+        if output_frame is None:
+            raise RuntimeError(
+                f"Orbbec {depth_filter.get_name()} returned no depth frame"
+            )
+        filtered_frame = output_frame
+    return filtered_frame
+
+
+def make_rgbd_frame_set(depth_frame: Frame, color_frame: Frame) -> FrameSet:
+    """Pair filtered depth with its synchronized color frame for D2C."""
+    frames = Frame.create_frame_set()
+    frames.push_frame(depth_frame)
+    frames.push_frame(color_frame)
+    return frames
+
+
 def write_xyzrgb_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
     """Write corresponding XYZ and RGB arrays as an ASCII PLY."""
     points = np.asarray(points)
@@ -326,6 +384,11 @@ def main() -> None:
     kiss_config = make_config(args)
     kiss = KissICP(kiss_config)
     colored_map = ColoredVoxelMap(args.voxel_size)
+    depth_filters = create_depth_filter_chain(
+        device,
+        width=args.width,
+        height=args.height,
+    )
     align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
     point_cloud_filter = PointCloudFilter()
     point_cloud_filter.set_create_point_format(OBFormat.RGB_POINT)
@@ -338,6 +401,11 @@ def main() -> None:
         print("WARNING: The first connected Orbbec device is not identified as Gemini 305.")
     print(f"Depth stream: {args.width}x{args.height} @ {args.fps} fps, Y16")
     print(f"Color stream: {args.width}x{args.height} @ {args.fps} fps, RGB")
+    print(
+        "SDK depth filters before D2C: "
+        "EdgeNoiseRemovalFilter -> HoleFillingFilter (no decimation)"
+    )
+    print("D2C alignment: filtered depth -> color camera")
     print(
         "KISS config: "
         f"range=[{kiss_config.data.min_range}, {kiss_config.data.max_range}]m, "
@@ -397,7 +465,15 @@ def main() -> None:
                 continue
             consecutive_timeouts = 0
 
-            aligned_frames = align_filter.process(frames)
+            filtered_depth = apply_depth_filter_chain(
+                frames.get_depth_frame(),
+                depth_filters,
+            )
+            filtered_frames = make_rgbd_frame_set(
+                filtered_depth,
+                frames.get_color_frame(),
+            )
+            aligned_frames = align_filter.process(filtered_frames)
             if aligned_frames is None:
                 print("Skipping frame: Orbbec depth-to-color alignment failed")
                 continue
