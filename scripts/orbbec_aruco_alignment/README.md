@@ -1,39 +1,42 @@
-# ZED-M ArUco Table-Board Alignment
+# Orbbec ArUco Table-Board Alignment & TSDF Scanning
 
-This folder contains an ArUco-marker based alignment workflow for ZED-M RGB-D
-scanning. The goal is to solve the hardest part of multi-view scanning:
-knowing the camera pose for every RGB-D frame so that different depth frames
-land in the same 3D world coordinate system.
+This directory provides an ArUco-marker based alignment and 3D reconstruction workflow for **Orbbec RGB-D cameras** (e.g. Gemini 305 / Gemini 335 / Femto Bolt series) using `pyorbbecsdk` and Open3D.
 
-Instead of estimating motion from the object surface, this method uses a printed
-table-top ArUco board. The table board is fixed, flat, and known in metric
-coordinates. Every time the camera captures an RGB image, the script detects the
-visible marker corners and computes the camera pose from those known points.
+Instead of estimating camera motion from the object surface or relying on mechanical motor angles, this method uses a printed tabletop ArUco board. The table board is fixed, flat, and known in metric coordinates. Every time the camera captures an RGB-D frame, the visible marker corners are detected to calculate the 6-DoF camera pose in the table coordinate frame. Aligned depth frames are then fused into a global Open3D TSDF volume.
+
+---
+
+## Environment Setup
+
+Run all scripts inside the `hena_jet` conda environment:
+
+```bash
+source /home/rishmika/miniconda3/etc/profile.d/conda.sh
+conda activate hena_jet
+```
+
+Verify camera and library dependencies:
+
+```bash
+python -c "import pyorbbecsdk, open3d, cv2; print('All dependencies ready!')"
+```
+
+---
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `generate_aruco_table_board.py` | Generates the printable ArUco board PDF/PNG, individual marker images, and the JSON file containing marker positions. |
-| `zed_aruco_pose_debug.py` | Opens the ZED-M, detects markers, solves pose, and saves debug overlays without doing TSDF fusion. Use this first. |
-| `zed_aruco_tsdf_scan.py` | Captures ZED-M RGB-D frames, solves camera pose from markers, and integrates frames into an Open3D TSDF mesh/cloud. |
-| `aruco_common.py` | Shared marker detection, pose solving, depth cleanup, and Open3D helper functions. |
+| `generate_aruco_table_board.py` | Generates printable ArUco board PDF/PNG, individual marker images, and the board JSON geometry file. |
+| `orbbec_aruco_pose_debug.py` | Streams Orbbec RGB, detects markers, solves 6-DoF pose with factory intrinsics/distortion, and outputs debug overlays without TSDF fusion. |
+| `orbbec_aruco_tsdf_scan.py` | Streams synchronized Orbbec Color + Depth, aligns depth to color (SW AlignFilter or HW D2C), solves marker pose, and integrates frames into an Open3D TSDF mesh/cloud. |
+| `aruco_common.py` | Shared marker detection, pose solving, Orbbec camera parameter parsing, depth cleanup, and Open3D helpers. |
 
-Generated files default to:
+---
 
-```text
-outputs/aruco_table_board/aruco_table_board.pdf
-outputs/aruco_table_board/aruco_table_board.png
-outputs/aruco_table_board/aruco_table_board.json
-outputs/aruco_table_board/markers/marker_00.png ... marker_11.png
-```
+## Board Geometry (`aruco_table_board.json`)
 
-## Board JSON
-
-`aruco_table_board.json` is the source of truth for the printed board geometry.
-It tells the scanner where each marker is on the table.
-
-Current generated defaults:
+The board JSON file defines the metric ground truth for all marker corners on the table plane:
 
 ```json
 {
@@ -45,486 +48,92 @@ Current generated defaults:
 }
 ```
 
-Important fields:
+The board defines the world coordinate frame:
+- **Origin**: Center of the printed scan area on the table.
+- **+X**: Right along the printed sheet.
+- **+Y**: Up along the printed sheet.
+- **+Z**: Out of the table plane towards the camera.
+- **Units**: Meters.
 
-| Field | Meaning |
-|---|---|
-| `dictionary` | The OpenCV ArUco dictionary used to generate and detect markers. Current default is `DICT_5X5_100`. |
-| `marker_size_m` | Physical marker side length in meters. `0.025` means `25 mm`. |
-| `marker_count` | Number of generated markers. Current board uses 12 markers with IDs `0-11`. |
-| `world_frame` | Defines the table/world coordinate frame used by pose estimation and reconstruction. |
-| `markers` | List of marker IDs, centers, and 3D marker corner coordinates. |
+---
 
-The board world frame is:
+## Workflow Guide
 
-```text
-origin: center of the printed scan area
-+X: right on printed board
-+Y: up on printed board
-+Z: out of table plane toward the camera
-units: meters
-```
-
-All markers lie on the table plane, so every marker corner has `Z = 0`.
-
-Example marker:
-
-```json
-{
-  "id": 0,
-  "center_m": [-0.06, 0.11, 0.0],
-  "corners_m": [
-    [-0.0725, 0.1225, 0.0],
-    [-0.0475, 0.1225, 0.0],
-    [-0.0475, 0.0975, 0.0],
-    [-0.0725, 0.0975, 0.0]
-  ]
-}
-```
-
-This means marker `0` is centered 60 mm left and 110 mm up from the board
-origin. Because the marker is 25 mm wide, each corner is 12.5 mm from the
-center. The corner order matches OpenCV's detected marker corner order:
-
-```text
-top-left, top-right, bottom-right, bottom-left
-```
-
-## Why This Solves Alignment
-
-Every RGB-D frame starts in the camera coordinate system. To merge many frames,
-the scanner must know how each camera coordinate system sits relative to one
-shared world coordinate system.
-
-With this method:
-
-1. The printed table board defines the world coordinate system.
-2. The JSON gives exact 3D coordinates for marker corners on that board.
-3. The ZED RGB image gives 2D pixel coordinates for the same marker corners.
-4. `cv2.solvePnP()` computes the transform from world/table coordinates to the
-   camera coordinates.
-5. Open3D TSDF integration uses that transform as the frame extrinsic.
-
-So each captured depth frame is placed into the same table/world coordinate
-system. This is why point clouds from different viewpoints can overlap.
-
-## Pose Calculation
-
-For every accepted capture, the script builds two matched arrays.
-
-The first array is 3D points from the JSON:
-
-```text
-object_points = [
-  [marker_0_corner_0_x, marker_0_corner_0_y, 0],
-  [marker_0_corner_1_x, marker_0_corner_1_y, 0],
-  ...
-]
-```
-
-The second array is 2D pixels detected in the ZED RGB image:
-
-```text
-image_points = [
-  [marker_0_corner_0_u, marker_0_corner_0_v],
-  [marker_0_corner_1_u, marker_0_corner_1_v],
-  ...
-]
-```
-
-The ZED left-camera intrinsics are read from the ZED SDK:
-
-```text
-fx, fy, cx, cy, width, height
-```
-
-Those values form the camera matrix:
-
-```text
-[ fx   0  cx ]
-[  0  fy  cy ]
-[  0   0   1 ]
-```
-
-Then the script calls:
-
-```python
-ok, rvec, tvec = cv2.solvePnP(
-    object_points,
-    image_points,
-    camera_matrix,
-    dist_coeffs,
-    flags=cv2.SOLVEPNP_ITERATIVE,
-)
-```
-
-`rvec` and `tvec` describe the transform:
-
-```text
-world/table -> camera
-```
-
-The script converts `rvec` to a rotation matrix using `cv2.Rodrigues()` and
-builds a 4x4 matrix:
-
-```text
-world_to_camera =
-[ R00 R01 R02 tx ]
-[ R10 R11 R12 ty ]
-[ R20 R21 R22 tz ]
-[  0   0   0  1 ]
-```
-
-The reprojection error is also computed. It projects the known 3D marker
-corners back into the image and compares them to the detected 2D corners. Lower
-error is better. A low error means the marker layout, print scale, and camera
-intrinsics are agreeing.
-
-## RGB, Depth, and Coordinate Frames
-
-The ZED-M scripts use:
-
-```python
-sl.COORDINATE_SYSTEM.IMAGE
-```
-
-That convention is:
-
-```text
-+X: image right
-+Y: image down
-+Z: camera forward
-```
-
-This matches the OpenCV/Open3D pinhole image convention used in this workflow.
-
-For every capture, the script gets RGB and depth from the same ZED grab cycle:
-
-```python
-zed.grab(runtime)
-zed.retrieve_image(color_mat, sl.VIEW.LEFT)
-zed.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
-```
-
-That matters. ArUco pose comes from the RGB image, and geometry comes from the
-depth image. If RGB and depth are not from the same frame, alignment can be
-wrong.
-
-## TSDF Alignment
-
-Open3D TSDF integration needs:
-
-1. RGB-D image.
-2. Camera intrinsics.
-3. Extrinsic transform from world to camera.
-
-The script already has all three:
-
-```python
-rgbd = make_rgbd(color_for_integration, depth, args.max_depth_m)
-volume.integrate(rgbd, open3d_intrinsic, world_to_camera)
-```
-
-Because `world_to_camera` comes from ArUco markers, every depth frame is fused
-into the same table/world coordinate system.
-
-This is different from the earlier mechanical-circle method:
-
-```text
-old method: angle + radius + height -> approximate pose
-new method: marker corners in RGB image -> measured camera pose
-```
-
-Mechanical angle is not required for alignment in this method.
-
-## Marker Masking and ROI
-
-Default ROI is the whole image:
+### Step 1: Generate & Print the ArUco Board
 
 ```bash
---roi 0 0 1 1
+python scripts/orbbec_aruco_alignment/generate_aruco_table_board.py \
+  --out-dir outputs/aruco_table_board
 ```
 
-Marker detection always uses the full RGB image. The ROI applies to
-reconstruction/depth integration.
+Print `outputs/aruco_table_board/aruco_table_board.pdf` at **100% scale (no page scaling / fit to page off)**. Measure a marker side with a ruler to confirm it is exactly **25 mm**.
 
-Markers are useful for pose, but they should not become part of the final scan.
-So `zed_aruco_tsdf_scan.py` masks the depth pixels under detected marker
-polygons before TSDF integration:
+### Step 2: Debug ArUco Pose Estimation
 
-```text
-detect marker -> use it for pose -> set marker depth pixels to 0 -> integrate object/table depth
-```
-
-This behavior is enabled by default. Disable it only for debugging:
+Check that the Orbbec color camera detects markers and computes a stable pose:
 
 ```bash
---no-mask-markers
+python scripts/orbbec_aruco_alignment/orbbec_aruco_pose_debug.py \
+  --board-json outputs/aruco_table_board/aruco_table_board.json \
+  --out-dir outputs/orbbec_aruco_debug \
+  --width 1280 --height 800 --fps 30 \
+  --frames 5
 ```
 
-You can expand the marker mask:
+Review the outputs in `outputs/orbbec_aruco_debug/pose_debug_0000.png` and `pose_debug.json`. Ensure 3D coordinate axes are firmly anchored to the board origin and reprojection error is low (< 1.5 px).
+
+### Step 3: Run Interactive or Automated TSDF Scan
+
+#### Interactive Capture (Press Enter per view, `q` when done):
 
 ```bash
---marker-mask-padding-px 12
-```
-
-## How To Use
-
-Generate the board:
-
-```bash
-python3 scripts/zed_aruco_alignment/generate_aruco_table_board.py
-```
-
-Print:
-
-```text
-outputs/aruco_table_board/aruco_table_board.pdf
-```
-
-Printer settings:
-
-```text
-scale: 100%
-fit to page: off
-```
-
-After printing, measure one marker side. It must be 25 mm. If it is not 25 mm,
-the pose scale will be wrong.
-
-Run pose debug first:
-
-```bash
-python3 scripts/zed_aruco_alignment/zed_aruco_pose_debug.py
-```
-
-Check:
-
-```text
-outputs/zed_aruco_debug/pose_debug_0000.png
-outputs/zed_aruco_debug/pose_debug.json
-```
-
-The debug image should show marker outlines, marker IDs, and a drawn pose axis.
-
-Run TSDF scan:
-
-```bash
-python3 scripts/zed_aruco_alignment/zed_aruco_tsdf_scan.py
-```
-
-The default depth mode is `NEURAL_PLUS` when the installed ZED SDK exposes it.
-You can choose another mode explicitly:
-
-```bash
-python3 scripts/zed_aruco_alignment/zed_aruco_tsdf_scan.py --depth-mode NEURAL_LIGHT
-```
-
-The scanner will prompt:
-
-```text
-Press Enter to capture, or q to finish:
-```
-
-Move the camera to a view, press Enter, move to another view, press Enter, and
-repeat. Type `q` to finish and save outputs.
-
-For automatic capture, use `--auto-capture`. The script will keep attempting
-captures at the requested interval until `--max-frames` accepted frames are
-reached, or until you press `Ctrl+C`. If the ZED SDK is currently grabbing or
-retrieving a frame, the script finishes that step first, then stops and saves
-the current reconstruction.
-
-```bash
-python3 scripts/zed_aruco_alignment/zed_aruco_tsdf_scan.py \
-  --auto-capture \
-  --auto-capture-interval-s 0.8 \
-  --max-frames 60
-```
-
-`--max-frames 0` means unlimited. The frame count is based on accepted frames,
-not raw attempts. A capture attempt can still be skipped if marker pose fails or
-there are not enough valid depth pixels.
-
-Default outputs:
-
-```text
-outputs/zed_aruco_tsdf_mesh.ply
-outputs/zed_aruco_tsdf_cloud.ply
-outputs/zed_aruco_poses.npy
-outputs/zed_aruco_scan.json
-outputs/zed_aruco_debug/scan_0000.png ...
-```
-
-## Mesh and Point Cloud Tuning
-
-The current script fuses valid ZED depth into an Open3D TSDF volume. It does not
-yet isolate only the hand/object, so depth range, ROI, marker visibility, and
-TSDF settings matter.
-
-Main tuning parameters:
-
-| Parameter | Default | Effect |
-|---|---:|---|
-| `--min-depth-m` | `0.10` | Removes depth too close to the camera. |
-| `--max-depth-m` | `0.18` | Removes depth farther than the scan target. Lower values reduce table/background noise but can cut off the object. |
-| `--roi X0 Y0 X1 Y1` | `0 0 1 1` | Crops reconstruction depth in image space. Marker detection still uses the full RGB image. |
-| `--voxel-length-m` | `0.002` | TSDF voxel size. Smaller is denser but preserves more depth noise. |
-| `--sdf-trunc-m` | `0.012` | TSDF blending distance. Usually keep it around 4x to 8x the voxel size. |
-| `--hole-fill-size-m` | `0.003` | Fills small mesh holes up to 3 mm after TSDF extraction. Use `--no-fill-holes` to disable. |
-| `--cleanup-outlier-neighbors` | `20` | Neighbor count for statistical outlier removal on the final point cloud. Use `--no-cleanup` to disable. |
-| `--cleanup-outlier-std-ratio` | `2.0` | Higher keeps more points; lower removes more noise and can delete thin details. |
-| `--cleanup-min-cluster-fraction` | `0.02` | Removes small disconnected mesh fragments below 2% of the largest triangle cluster. |
-| `--min-markers` | `2` | Minimum visible board markers required for pose. Higher values reject weaker poses. |
-| `--min-valid-depth-px` | `5000` | Minimum valid depth pixels required before a frame is fused. |
-| `--marker-mask-padding-px` | `8` | Expands the marker depth mask so detected markers are less likely to enter the mesh. |
-
-For cleaner hand scans, start with a balanced setup instead of the smallest
-possible voxel size:
-
-```bash
-python3 scripts/zed_aruco_alignment/zed_aruco_tsdf_scan.py \
-  --resolution HD720 \
-  --depth-mode NEURAL_PLUS \
-  --auto-capture \
-  --auto-capture-interval-s 0.8 \
-  --max-frames 60 \
+python scripts/orbbec_aruco_alignment/orbbec_aruco_tsdf_scan.py \
+  --board-json outputs/aruco_table_board/aruco_table_board.json \
+  --width 1280 --height 800 --fps 30 \
   --min-depth-m 0.10 \
-  --max-depth-m 0.18 \
+  --max-depth-m 0.50 \
+  --voxel-length-m 0.0015 \
+  --sdf-trunc-m 0.008
+```
+
+#### Automated Capture:
+
+```bash
+python scripts/orbbec_aruco_alignment/orbbec_aruco_tsdf_scan.py \
+  --auto-capture \
+  --auto-capture-interval-s 0.5 \
+  --max-frames 60 \
+  --min-markers 3 \
+  --min-valid-depth-px 10000 \
   --voxel-length-m 0.0015 \
   --sdf-trunc-m 0.008 \
-  --hole-fill-size-m 0.003 \
-  --cleanup-outlier-neighbors 20 \
-  --cleanup-outlier-std-ratio 2.0 \
-  --cleanup-min-cluster-fraction 0.02 \
-  --min-markers 3 \
-  --min-valid-depth-px 12000 \
-  --marker-mask-padding-px 35 \
-  --mesh-out outputs/aruco_scans/hand_mesh.ply \
-  --cloud-out outputs/aruco_scans/hand_cloud.ply \
-  --poses-out outputs/aruco_scans/hand.npy
+  --mesh-out outputs/aruco_scans/orbbec_aruco_tsdf_mesh.ply \
+  --cloud-out outputs/aruco_scans/orbbec_aruco_tsdf_cloud.ply \
+  --poses-out outputs/aruco_scans/orbbec_aruco_poses.npy \
+  --scan-json outputs/aruco_scans/orbbec_aruco_scan.json
 ```
 
-Use smaller voxels only after the pose and depth are clean:
+---
 
-```text
-balanced:      --voxel-length-m 0.0015 --sdf-trunc-m 0.008
-more detail:   --voxel-length-m 0.0012 --sdf-trunc-m 0.007
-high detail:   --voxel-length-m 0.0010 --sdf-trunc-m 0.006
-noise-prone:   --voxel-length-m 0.0008 --sdf-trunc-m 0.005
-```
+## Key Tuning Parameters
 
-If the mesh becomes rougher when voxel size gets smaller, the scan is limited by
-depth noise or pose error, not TSDF resolution. In that case, increase voxel
-size, require more markers, reduce max depth, and capture fewer stable frames.
+| Parameter | Default | Description |
+|---|---:|---|
+| `--width` / `--height` | `1280` / `800` | Stream resolution (16:10 full sensor FOV for Gemini series). Can also use `1280x720`, `848x530`, or `1920x1080`. |
+| `--hw-d2c` | `False` | Enables hardware Depth-to-Color alignment (uses software `AlignFilter` by default). |
+| `--min-depth-m` / `--max-depth-m` | `0.10` / `1.00` | Valid depth range in meters for TSDF integration. |
+| `--roi X0 Y0 X1 Y1` | `0 0 1 1` | Image-space crop for depth integration. Marker detection still uses full image. |
+| `--voxel-length-m` | `0.002` (2 mm) | TSDF voxel size in meters. |
+| `--sdf-trunc-m` | `0.012` (12 mm) | TSDF truncation distance. |
+| `--hole-fill-size-m` | `0.003` (3 mm) | Maximum mesh hole size to fill automatically. |
+| `--cleanup-outlier-neighbors` | `20` | Outlier neighbor count for statistical point cloud filtering. |
+| `--cleanup-min-cluster-fraction` | `0.02` | Removes disconnected mesh fragments smaller than 2% of the main cluster. |
+| `--marker-mask-padding-px` | `8` | Expands detected marker depth masks to keep markers out of the final mesh. |
 
-## Quality Checks
+---
 
-A good capture should show:
+## Coordinate Systems & Fusion
 
-```text
-KF 000  markers=[...]  valid_px=...  reproj=...
-```
-
-Use these checks:
-
-| Signal | What It Means |
-|---|---|
-| `markers` has 2 or more IDs | Enough marker observations for pose. More is better. |
-| `reproj` is low | Marker pose agrees with the image. Lower is better. |
-| Debug overlay axes look attached to the board | Pose direction is plausible. |
-| Camera position in JSON is stable | Board scale and intrinsics are likely correct. |
-
-If the script says pose failed, the RGB image did not contain enough valid
-markers from the board.
-
-## Troubleshooting
-
-### Markers are detected but reconstruction is shifted or scaled wrong
-
-Most likely the PDF was printed at the wrong scale. Reprint at 100% and measure
-that a marker side is exactly 25 mm.
-
-### Pose works from some views but fails from others
-
-The camera cannot see enough markers from those views. Add more visible markers
-around the table, reduce occlusion, or move the object away from the marker
-border.
-
-### Final point cloud includes table/markers
-
-Use tighter reconstruction ROI or increase marker mask padding:
-
-```bash
---marker-mask-padding-px 16
-```
-
-Marker masking only removes detected marker rectangles. It does not remove the
-paper sheet, table plane, cardboard, tools, or background. If those surfaces are
-inside the valid depth range, they can still be fused into the TSDF mesh.
-
-Reduce table/background noise with:
-
-```bash
---max-depth-m 0.18
---roi 0.15 0.10 0.85 0.95
---min-markers 3
---min-valid-depth-px 12000
-```
-
-Later, add world-space crop, table-plane removal, and outlier filtering around
-the hand/object if table points remain.
-
-### Mesh is dense but noisy
-
-Very small voxels make the extracted point cloud denser, but they also preserve
-ZED depth noise and pose jitter. If the mesh has spikes, doubled surfaces, or
-rough edges, avoid starting with `--voxel-length-m 0.0008`.
-
-Use this first:
-
-```bash
---voxel-length-m 0.0015 --sdf-trunc-m 0.008
-```
-
-Then step down to `0.0012` or `0.0010` only if the result is already stable.
-
-### Reprojection error is high
-
-Possible causes:
-
-- Print scale is wrong.
-- Board is not flat.
-- Marker JSON does not match the printed board.
-- The ZED image used for detection is distorted differently than expected.
-- Markers are too blurry or viewed at a steep angle.
-
-### Mechanical angle
-
-Mechanical angle is not needed for this workflow. ArUco pose is the alignment
-source. Mechanical angle can still be useful as a human sanity check, but the
-current scripts do not require it.
-
-## Current Limitations
-
-- Distortion coefficients are currently treated as zeros because the ZED left
-  image is used as the working image. If pose bias appears, add explicit ZED
-  distortion coefficients and test whether they improve reprojection error.
-- The board is one A4 sheet. For a larger scanner bed, a larger board or
-  multiple measured marker sheets will be better.
-- The script integrates RGB-D frames into TSDF but does not yet do final
-  world-space object cropping.
-- The script does not yet remove the table plane, run statistical/radius
-  outlier removal, or smooth/clean connected mesh components after TSDF
-  extraction.
-- Marker detection requires visible markers in the RGB image. If the hand or
-  robot blocks too many markers, that frame is skipped.
-
-## Implementation References
-
-- OpenCV ArUco generation and detection:
-  `cv2.aruco.generateImageMarker`, `cv2.aruco.ArucoDetector`
-- OpenCV pose estimation:
-  `cv2.solvePnP`, `cv2.Rodrigues`, `cv2.projectPoints`
-- Open3D TSDF integration:
-  `o3d.pipelines.integration.ScalableTSDFVolume.integrate`
+- **Camera Convention**: Open3D / OpenCV standard (`+X` right, `+Y` down, `+Z` optical forward).
+- **Depth Scale**: Automatically extracted via `depth_frame.get_depth_scale()` from the Orbbec SDK.
+- **Pose Integration**: `ScalableTSDFVolume.integrate(rgbd, open3d_intrinsic, world_to_camera)` fuses each view directly into table world space.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared helpers for ZED-M ArUco table-board pose alignment."""
+"""Shared helpers for Orbbec ArUco table-board pose alignment and TSDF reconstruction."""
 
 from __future__ import annotations
 
@@ -76,13 +76,45 @@ def apply_roi_mask(
     return result
 
 
-def color_image_to_rgb(image: np.ndarray) -> np.ndarray:
+def color_frame_to_rgb(color_frame: Any) -> np.ndarray:
+    """Convert an Orbbec color frame or numpy array to an RGB uint8 numpy array."""
+    if hasattr(color_frame, "get_data") and hasattr(color_frame, "get_width"):
+        width = int(color_frame.get_width())
+        height = int(color_frame.get_height())
+        raw_data = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
+        format_type = None
+        if hasattr(color_frame, "get_format"):
+            try:
+                format_type = color_frame.get_format()
+            except Exception:
+                pass
+        
+        if format_type is not None and str(format_type).endswith("MJPG"):
+            bgr = cv2.imdecode(raw_data, cv2.IMREAD_COLOR)
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        if raw_data.size == width * height * 3:
+            return raw_data.reshape(height, width, 3).copy()
+        if raw_data.size == width * height * 4:
+            bgra = raw_data.reshape(height, width, 4)
+            return cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGB)
+        bgr = cv2.imdecode(raw_data, cv2.IMREAD_COLOR)
+        if bgr is not None:
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        raise RuntimeError(f"Unable to convert color frame buffer of size {raw_data.size}")
+
+    image = np.asarray(color_frame)
     if image.ndim == 2:
         return np.repeat(image[:, :, None], 3, axis=2).astype(np.uint8)
-    if image.shape[2] >= 3:
-        # ZED returns BGRA. Take BGR and reverse to RGB.
-        return image[:, :, :3][:, :, ::-1].astype(np.uint8)
+    if image.shape[2] == 3:
+        return np.ascontiguousarray(image, dtype=np.uint8)
+    if image.shape[2] == 4:
+        return np.ascontiguousarray(image[:, :, :3], dtype=np.uint8)
     raise ValueError(f"Unsupported color image shape: {image.shape}")
+
+
+def color_image_to_rgb(image: np.ndarray) -> np.ndarray:
+    """Alias for backwards-compatibility."""
+    return color_frame_to_rgb(image)
 
 
 def clean_depth_image(
@@ -100,6 +132,15 @@ def clean_depth_image(
     return apply_roi_mask(cleaned, roi, fill_value=0)
 
 
+def depth_frame_to_meters(depth_frame: Any) -> np.ndarray:
+    """Convert an Orbbec Y16 depth frame to a float32 depth map in meters."""
+    width = int(depth_frame.get_width())
+    height = int(depth_frame.get_height())
+    scale_mm = float(depth_frame.get_depth_scale())
+    raw = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape(height, width)
+    return (raw.astype(np.float32) * scale_mm) * 0.001
+
+
 def camera_matrix_from_intrinsics(intrinsics: dict[str, float]) -> np.ndarray:
     return np.array(
         [
@@ -109,6 +150,32 @@ def camera_matrix_from_intrinsics(intrinsics: dict[str, float]) -> np.ndarray:
         ],
         dtype=np.float64,
     )
+
+
+def camera_params_from_orbbec(camera_param: Any) -> tuple[dict[str, float], np.ndarray]:
+    """Extract RGB intrinsics dict and distortion coefficients from Orbbec OBCameraParam."""
+    rgb_intrinsic = camera_param.rgb_intrinsic
+    rgb_distortion = camera_param.rgb_distortion
+    intrinsics = {
+        "fx": float(rgb_intrinsic.fx),
+        "fy": float(rgb_intrinsic.fy),
+        "cx": float(rgb_intrinsic.cx),
+        "cy": float(rgb_intrinsic.cy),
+        "width": int(rgb_intrinsic.width),
+        "height": int(rgb_intrinsic.height),
+    }
+    dist = [
+        float(rgb_distortion.k1),
+        float(rgb_distortion.k2),
+        float(rgb_distortion.p1),
+        float(rgb_distortion.p2),
+        float(rgb_distortion.k3),
+        float(rgb_distortion.k4),
+        float(rgb_distortion.k5),
+        float(rgb_distortion.k6),
+    ]
+    dist_coeffs = np.array(dist, dtype=np.float64).reshape(-1, 1)
+    return intrinsics, dist_coeffs
 
 
 def open3d_intrinsic_from_dict(intrinsics: dict[str, float]) -> o3d.camera.PinholeCameraIntrinsic:

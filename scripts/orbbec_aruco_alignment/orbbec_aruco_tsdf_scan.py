@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ZED-M RGB-D TSDF scan aligned by a printed ArUco table board."""
+"""Orbbec RGB-D TSDF scan aligned by a printed ArUco table board."""
 
 from __future__ import annotations
 
@@ -12,13 +12,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 import open3d as o3d
-import pyzed.sl as sl
 
 from aruco_common import (
     apply_roi_mask,
     camera_matrix_from_intrinsics,
+    camera_params_from_orbbec,
     clean_depth_image,
-    color_image_to_rgb,
+    color_frame_to_rgb,
+    depth_frame_to_meters,
     detect_markers,
     draw_pose_overlay,
     extrinsic_from_rvec_tvec,
@@ -33,18 +34,6 @@ from aruco_common import (
     write_json,
 )
 
-
-RESOLUTIONS = {
-    "HD2K": sl.RESOLUTION.HD2K,
-    "HD1080": sl.RESOLUTION.HD1080,
-    "HD720": sl.RESOLUTION.HD720,
-    "VGA": sl.RESOLUTION.VGA,
-}
-DEPTH_MODES = {
-    name: getattr(sl.DEPTH_MODE, name)
-    for name in ("PERFORMANCE", "QUALITY", "ULTRA", "NEURAL", "NEURAL_LIGHT", "NEURAL_PLUS")
-    if hasattr(sl.DEPTH_MODE, name)
-}
 STOP_COMMANDS = {"q", "quit", "exit", "done"}
 
 
@@ -61,20 +50,23 @@ class AcceptedFrame:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="ZED-M ArUco table-board TSDF scanner.")
+    parser = argparse.ArgumentParser(description="Orbbec ArUco table-board TSDF scanner.")
     parser.add_argument(
         "--board-json",
         type=Path,
         default=Path("outputs/aruco_table_board/aruco_table_board.json"),
+        help="Path to generated ArUco board JSON specification.",
     )
-    parser.add_argument("--resolution", choices=sorted(RESOLUTIONS), default="HD720")
+    parser.add_argument("--width", type=int, default=1280, help="Stream width.")
+    parser.add_argument("--height", type=int, default=800, help="Stream height.")
+    parser.add_argument("--fps", type=int, default=30, help="Stream framerate.")
     parser.add_argument(
-        "--depth-mode",
-        choices=sorted(DEPTH_MODES),
-        default="NEURAL" if "NEURAL" in DEPTH_MODES else "NEURAL_LIGHT",
+        "--hw-d2c",
+        action="store_true",
+        help="Use hardware Depth-to-Color alignment instead of software AlignFilter.",
     )
     parser.add_argument("--min-depth-m", type=float, default=0.10)
-    parser.add_argument("--max-depth-m", type=float, default=0.18)
+    parser.add_argument("--max-depth-m", type=float, default=1.00)
     parser.add_argument(
         "--roi",
         type=float,
@@ -122,12 +114,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--marker-mask-padding-px", type=int, default=8)
     parser.add_argument("--no-mask-markers", action="store_true")
     parser.add_argument("--save-overlays", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--debug-dir", type=Path, default=Path("outputs/aruco_scans/zed_aruco_debug"))
-    parser.add_argument("--mesh-out", type=Path, default=Path("outputs/aruco_scans/zed_aruco_tsdf_mesh.ply"))
-    parser.add_argument("--cloud-out", type=Path, default=Path("outputs/aruco_scans/zed_aruco_tsdf_cloud.ply"))
-    parser.add_argument("--poses-out", type=Path, default=Path("outputs/aruco_scans/zed_aruco_poses.npy"))
-    parser.add_argument("--scan-json", type=Path, default=Path("outputs/aruco_scans/zed_aruco_scan.json"))
-    parser.add_argument("--auto-capture", action="store_true", help="Automatically capture frames without user input.")
+    parser.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=Path("outputs/aruco_scans/orbbec_aruco_debug"),
+    )
+    parser.add_argument(
+        "--mesh-out",
+        type=Path,
+        default=Path("outputs/aruco_scans/orbbec_aruco_tsdf_mesh.ply"),
+    )
+    parser.add_argument(
+        "--cloud-out",
+        type=Path,
+        default=Path("outputs/aruco_scans/orbbec_aruco_tsdf_cloud.ply"),
+    )
+    parser.add_argument(
+        "--poses-out",
+        type=Path,
+        default=Path("outputs/aruco_scans/orbbec_aruco_poses.npy"),
+    )
+    parser.add_argument(
+        "--scan-json",
+        type=Path,
+        default=Path("outputs/aruco_scans/orbbec_aruco_scan.json"),
+    )
+    parser.add_argument(
+        "--auto-capture",
+        action="store_true",
+        help="Automatically capture frames without user input.",
+    )
     parser.add_argument(
         "--auto-capture-interval-s",
         type=float,
@@ -139,6 +155,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Stop after this many accepted frames. Use 0 for unlimited.",
+    )
+    parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=1000,
+        help="Frame wait timeout in milliseconds.",
     )
     return parser.parse_args()
 
@@ -173,33 +195,95 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-frames must be zero or positive")
 
 
-def camera_intrinsics_from_zed(zed: sl.Camera, image_shape: tuple[int, int]) -> dict[str, float]:
-    camera_info = zed.get_camera_information()
-    calibration = camera_info.camera_configuration.calibration_parameters
-    left = calibration.left_cam
-    height, width = image_shape
-    return {
-        "fx": float(left.fx),
-        "fy": float(left.fy),
-        "cx": float(left.cx),
-        "cy": float(left.cy),
-        "width": int(width),
-        "height": int(height),
-    }
+def open_orbbec_pipeline(args: argparse.Namespace):
+    try:
+        from pyorbbecsdk import (  # type: ignore
+            AlignFilter,
+            Config,
+            Context,
+            OBAlignMode,
+            OBFormat,
+            OBFrameAggregateOutputMode,
+            OBSensorType,
+            OBStreamType,
+            Pipeline,
+        )
+    except ImportError as exc:
+        raise SystemExit(
+            "pyorbbecsdk is required; run this script in the hena_jet conda environment."
+        ) from exc
 
+    ctx = Context()
+    devices = ctx.query_devices()
+    if devices.get_count() == 0:
+        raise SystemExit("No Orbbec camera detected.")
 
-def open_zed(args: argparse.Namespace) -> sl.Camera:
-    init = sl.InitParameters()
-    init.camera_resolution = RESOLUTIONS[args.resolution]
-    init.depth_mode = DEPTH_MODES[args.depth_mode]
-    init.coordinate_units = sl.UNIT.METER
-    init.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
-    init.depth_minimum_distance = args.min_depth_m
-    init.depth_maximum_distance = args.max_depth_m
-    zed = sl.Camera()
-    if zed.open(init) != sl.ERROR_CODE.SUCCESS:
-        raise RuntimeError("Could not open ZED camera")
-    return zed
+    pipeline = Pipeline()
+    config = Config()
+
+    color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+    color_profile = None
+    for fmt in (OBFormat.RGB, OBFormat.MJPG, OBFormat.BGR):
+        try:
+            color_profile = color_profiles.get_video_stream_profile(
+                args.width, args.height, fmt, args.fps
+            )
+            if color_profile is not None:
+                break
+        except Exception:
+            continue
+
+    if color_profile is None:
+        try:
+            color_profile = color_profiles.get_default_video_stream_profile()
+        except Exception as exc:
+            raise SystemExit(f"Failed to get color stream profile: {exc}") from exc
+
+    align_filter = None
+    if args.hw_d2c:
+        try:
+            hw_depth_profiles = pipeline.get_d2c_depth_profile_list(
+                color_profile, OBAlignMode.HW_MODE
+            )
+            if len(hw_depth_profiles) > 0:
+                config.enable_stream(hw_depth_profiles[0])
+                config.enable_stream(color_profile)
+                config.set_align_mode(OBAlignMode.HW_MODE)
+                print("Hardware Depth-to-Color alignment enabled.")
+            else:
+                raise RuntimeError("No matching hardware D2C depth profiles found.")
+        except Exception as exc:
+            print(f"HW D2C setup failed ({exc}); falling back to software AlignFilter.")
+            args.hw_d2c = False
+
+    if not args.hw_d2c:
+        depth_profiles = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+        depth_profile = None
+        try:
+            depth_profile = depth_profiles.get_video_stream_profile(
+                args.width, args.height, OBFormat.Y16, args.fps
+            )
+        except Exception:
+            try:
+                depth_profile = depth_profiles.get_default_video_stream_profile()
+            except Exception as exc:
+                raise SystemExit(f"Failed to get depth stream profile: {exc}") from exc
+
+        config.enable_stream(color_profile)
+        config.enable_stream(depth_profile)
+        config.set_frame_aggregate_output_mode(
+            OBFrameAggregateOutputMode.FULL_FRAME_REQUIRE
+        )
+        align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
+        print("Software Depth-to-Color alignment (AlignFilter) enabled.")
+
+    try:
+        pipeline.enable_frame_sync()
+    except Exception as exc:
+        print(f"Hardware frame synchronization warning: {exc}")
+
+    pipeline.start(config)
+    return pipeline, align_filter
 
 
 def make_tsdf_volume(args: argparse.Namespace) -> o3d.pipelines.integration.ScalableTSDFVolume:
@@ -292,7 +376,10 @@ def save_outputs(
     o3d.io.write_point_cloud(str(args.cloud_out), cloud)
     print(f"Cloud: {args.cloud_out}  ({len(cloud.points)} pts)")
 
-    poses = np.stack([frame.world_to_camera for frame in accepted])
+    if len(accepted) > 0:
+        poses = np.stack([frame.world_to_camera for frame in accepted])
+    else:
+        poses = np.empty((0, 4, 4), dtype=np.float64)
     args.poses_out.parent.mkdir(parents=True, exist_ok=True)
     np.save(args.poses_out, poses)
     print(f"Poses: {args.poses_out}  ({len(poses)} poses)")
@@ -302,7 +389,7 @@ def save_outputs(
         {
             "board_json": str(board_json),
             "camera_intrinsics": intrinsics,
-            "coordinate_system": "ZED/Open3D image coordinates: +X right, +Y down, +Z forward",
+            "coordinate_system": "Orbbec/Open3D image coordinates: +X right, +Y down, +Z forward",
             "min_depth_m": args.min_depth_m,
             "max_depth_m": args.max_depth_m,
             "roi": list(args.roi),
@@ -339,26 +426,22 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
     board = load_board(args.board_json)
-    dist_coeffs = np.zeros((5, 1), dtype=np.float64)
 
-    zed = open_zed(args)
-    runtime = sl.RuntimeParameters()
-    color_mat = sl.Mat()
-    depth_mat = sl.Mat()
+    pipeline, align_filter = open_orbbec_pipeline(args)
     volume = make_tsdf_volume(args)
     accepted: list[AcceptedFrame] = []
     intrinsics = None
     open3d_intrinsic = None
-    started_at = time.perf_counter()
+    dist_coeffs = None
+    camera_matrix = None
     stop_requested = False
 
     def request_stop(signum: int, frame: object) -> None:
         nonlocal stop_requested
         if not stop_requested:
-            print("\nCtrl+C received; finishing current ZED step, then saving.")
+            print("\nCtrl+C received; saving current reconstruction...")
         stop_requested = True
 
-    previous_sigint_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, request_stop)
 
     if args.save_overlays:
@@ -367,18 +450,27 @@ def main() -> None:
     try:
         print(f"Warming up ({args.warmup} frames)...")
         for _ in range(args.warmup):
-            zed.grab(runtime)
+            frames = pipeline.wait_for_frames(args.timeout_ms)
+            if frames is None:
+                raise RuntimeError("Timeout while waiting for camera frames during warmup")
 
-        print("ZED ArUco TSDF scanner ready.")
-        print("ArUco pose is the alignment source; mechanical angle is not required.")
+        camera_param = pipeline.get_camera_param()
+        intrinsics, dist_coeffs = camera_params_from_orbbec(camera_param)
+        camera_matrix = camera_matrix_from_intrinsics(intrinsics)
+        open3d_intrinsic = open3d_intrinsic_from_dict(intrinsics)
+
+        print("\nOrbbec ArUco TSDF scanner ready.")
+        print(f"Stream: {intrinsics['width']}x{intrinsics['height']}, fx={intrinsics['fx']:.1f}, fy={intrinsics['fy']:.1f}")
+        print("ArUco table board provides the global 3D world coordinate frame.")
         if args.auto_capture:
             print(
-                "Auto-capture enabled. "
-                f"Attempting one capture every {args.auto_capture_interval_s:.2f}s."
+                f"Auto-capture enabled. Interval: {args.auto_capture_interval_s:.2f}s."
             )
-            print("Press Ctrl+C to stop after the current ZED step and save.")
+            print("Press Ctrl+C to stop and save.")
             if args.max_frames:
                 print(f"Stopping after {args.max_frames} accepted frames.")
+
+        frame_attempt = 0
         while True:
             try:
                 if stop_requested:
@@ -387,36 +479,38 @@ def main() -> None:
                     if args.max_frames and len(accepted) >= args.max_frames:
                         print(f"Reached --max-frames={args.max_frames}; saving reconstruction.")
                         break
-                    print(f"Auto-capture attempt; accepted_frames={len(accepted)}")
                     time.sleep(args.auto_capture_interval_s)
                 elif not prompt_for_capture():
                     break
             except KeyboardInterrupt:
                 print("\nInterrupted; saving current reconstruction.")
-                stop_requested = True
                 break
 
             if stop_requested:
                 break
-            if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
-                print("Grab failed; skipping.")
+
+            frames = pipeline.wait_for_frames(args.timeout_ms)
+            if frames is None:
+                print(f"Attempt {frame_attempt}: timeout waiting for frames")
+                frame_attempt += 1
                 continue
-            if stop_requested:
-                break
 
-            zed.retrieve_image(color_mat, sl.VIEW.LEFT)
-            zed.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
-            if stop_requested:
-                break
-            color_rgb = color_image_to_rgb(color_mat.get_data())
-            raw_depth = depth_mat.get_data()
+            if align_filter is not None:
+                aligned_frames = align_filter.process(frames)
+                if aligned_frames is not None:
+                    frames = aligned_frames
 
-            if intrinsics is None:
-                intrinsics = camera_intrinsics_from_zed(zed, color_rgb.shape[:2])
-                open3d_intrinsic = open3d_intrinsic_from_dict(intrinsics)
-            camera_matrix = camera_matrix_from_intrinsics(intrinsics)
+            color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame()
+            if color_frame is None or depth_frame is None:
+                print(f"Attempt {frame_attempt}: incomplete frame pair (color/depth missing)")
+                frame_attempt += 1
+                continue
 
-            corners, ids, rejected = detect_markers(color_rgb, board)
+            color_rgb = color_frame_to_rgb(color_frame)
+            depth_m = depth_frame_to_meters(depth_frame)
+
+            corners, ids, _ = detect_markers(color_rgb, board)
             object_points, image_points, used_ids = match_board_corners(board, corners, ids)
             ok, rvec, tvec = solve_board_pose(
                 object_points,
@@ -426,26 +520,17 @@ def main() -> None:
                 args.min_markers,
                 used_ids,
             )
+
+            detected_flat = ids.reshape(-1).tolist() if ids is not None else []
             if not ok:
-                print(f"Pose failed; detected ids={ids.reshape(-1).astype(int).tolist()}")
-                continue
-
-            depth = clean_depth_image(raw_depth, args.min_depth_m, args.max_depth_m, args.roi)
-            if not args.no_mask_markers:
-                depth = mask_marker_depth(depth, corners, args.marker_mask_padding_px)
-            valid_depth_px = int(np.count_nonzero(depth))
-            if valid_depth_px < args.min_valid_depth_px:
                 print(
-                    f"Skipping frame: valid_depth_px={valid_depth_px} "
-                    f"< {args.min_valid_depth_px}"
+                    f"Attempt {frame_attempt}: rejected (insufficient marker matches: "
+                    f"detected={detected_flat}, required>={args.min_markers})"
                 )
+                frame_attempt += 1
                 continue
 
-            color_for_integration = apply_roi_mask(color_rgb, args.roi, fill_value=0)
             world_to_camera = extrinsic_from_rvec_tvec(rvec, tvec)
-            rgbd = make_rgbd(color_for_integration, depth, args.max_depth_m)
-            volume.integrate(rgbd, open3d_intrinsic, world_to_camera)
-
             error_px = reprojection_error_px(
                 object_points,
                 image_points,
@@ -454,6 +539,36 @@ def main() -> None:
                 camera_matrix,
                 dist_coeffs,
             )
+
+            # Process depth
+            proc_depth = depth_m.copy()
+            if not args.no_mask_markers and len(corners) > 0:
+                proc_depth = mask_marker_depth(
+                    proc_depth,
+                    corners,
+                    args.marker_mask_padding_px,
+                )
+
+            cleaned_depth = clean_depth_image(
+                proc_depth,
+                args.min_depth_m,
+                args.max_depth_m,
+                args.roi,
+            )
+
+            valid_px = int(np.count_nonzero(cleaned_depth > 0))
+            if valid_px < args.min_valid_depth_px:
+                print(
+                    f"Attempt {frame_attempt}: rejected (valid depth px {valid_px} "
+                    f"< threshold {args.min_valid_depth_px})"
+                )
+                frame_attempt += 1
+                continue
+
+            rgbd = make_rgbd(color_rgb, cleaned_depth, depth_trunc_m=args.max_depth_m)
+            # ScalableTSDFVolume integrate expects world_to_camera extrinsic
+            volume.integrate(rgbd, open3d_intrinsic, world_to_camera)
+
             overlay_path = None
             if args.save_overlays:
                 overlay = draw_pose_overlay(
@@ -466,33 +581,35 @@ def main() -> None:
                     tvec,
                     args.axis_length_m,
                 )
-                overlay_path = str(args.debug_dir / f"scan_{len(accepted):04d}.png")
-                cv2.imwrite(overlay_path, overlay)
+                overlay_file = args.debug_dir / f"frame_{len(accepted):04d}.png"
+                cv2.imwrite(str(overlay_file), overlay)
+                overlay_path = str(overlay_file)
 
-            frame = AcceptedFrame(
+            accepted_frame = AcceptedFrame(
                 index=len(accepted),
-                captured_at_s=time.perf_counter() - started_at,
+                captured_at_s=time.time(),
                 used_ids=used_ids,
-                detected_ids=ids.reshape(-1).astype(int).tolist(),
-                valid_depth_px=valid_depth_px,
+                detected_ids=detected_flat,
+                valid_depth_px=valid_px,
                 mean_reprojection_error_px=error_px,
                 world_to_camera=world_to_camera,
                 overlay_path=overlay_path,
             )
-            accepted.append(frame)
+            accepted.append(accepted_frame)
             print(
-                f"KF {frame.index:03d}  markers={used_ids}  "
-                f"valid_px={valid_depth_px}  reproj={error_px:.2f}px"
+                f"Accepted frame {accepted_frame.index:03d} | "
+                f"markers={used_ids} | valid_depth={valid_px}px | "
+                f"reproj={error_px:.2f}px | total_accepted={len(accepted)}"
             )
+            frame_attempt += 1
+
+        if intrinsics is not None:
+            print("\nSaving reconstruction outputs...")
+            save_outputs(volume, accepted, intrinsics, args.board_json, args)
+        else:
+            print("No frames captured; exiting without saving.")
     finally:
-        signal.signal(signal.SIGINT, previous_sigint_handler)
-        zed.close()
-
-    if intrinsics is None or open3d_intrinsic is None or not accepted:
-        print("No accepted frames; no TSDF outputs written.")
-        return
-
-    save_outputs(volume, accepted, intrinsics, args.board_json, args)
+        pipeline.stop()
 
 
 if __name__ == "__main__":
