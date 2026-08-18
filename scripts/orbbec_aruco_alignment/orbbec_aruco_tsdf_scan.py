@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import signal
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,10 +35,10 @@ from aruco_common import (
     write_json,
 )
 
-STOP_COMMANDS = {"q", "quit", "exit", "done"}
+STOP_COMMANDS = {"q", "quit", "exit", "done"} # python set
 
 
-@dataclass
+@dataclass 
 class AcceptedFrame:
     index: int
     captured_at_s: float
@@ -78,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--min-markers", type=int, default=2)
     parser.add_argument("--min-valid-depth-px", type=int, default=5000)
-    parser.add_argument("--voxel-length-m", type=float, default=0.002)
+    parser.add_argument("--voxel-length-m", type=float, default=0.001 )
     parser.add_argument("--sdf-trunc-m", type=float, default=0.012)
     parser.add_argument(
         "--hole-fill-size-m",
@@ -161,6 +162,28 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1000,
         help="Frame wait timeout in milliseconds.",
+    )
+    parser.add_argument(
+        "--lingbot",
+        action="store_true",
+        help="Refine depth with LingBot-Depth before TSDF integration (pose uses raw depth).",
+    )
+    parser.add_argument(
+        "--lingbot-model",
+        type=str,
+        default="robbyant/lingbot-depth-pretrain-vitl-14-v0.5",
+        help="LingBot HuggingFace model ID or local checkpoint path.",
+    )
+    parser.add_argument(
+        "--lingbot-device",
+        choices=["auto", "cuda", "cpu"],
+        default="auto",
+        help="Device for LingBot inference (default: auto).",
+    )
+    parser.add_argument(
+        "--lingbot-debug",
+        action="store_true",
+        help="Save LingBot enhanced depth maps and raw-vs-enhanced comparisons to --debug-dir.",
     )
     return parser.parse_args()
 
@@ -294,6 +317,104 @@ def make_tsdf_volume(args: argparse.Namespace) -> o3d.pipelines.integration.Scal
     )
 
 
+def load_lingbot_model(args: argparse.Namespace, intrinsics: dict[str, float]):
+    """Load the LingBot-Depth model and prepare normalised intrinsics tensors.
+
+    Returns (model, device, k_tensor) or (None, None, None) when --lingbot is
+    not enabled.
+    """
+    if not args.lingbot:
+        return None, None, None
+
+    import torch
+
+    lingbot_dir = Path(__file__).resolve().parents[1] / "lingbot-depth"
+    if str(lingbot_dir) not in sys.path:
+        sys.path.insert(0, str(lingbot_dir))
+    from mdm.model.v2 import MDMModel
+
+    if args.lingbot_device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.lingbot_device)
+
+    print(f"\nLoading LingBot-Depth model: {args.lingbot_model} on {device}...")
+    t0 = time.perf_counter()
+    model = MDMModel.from_pretrained(args.lingbot_model).to(device).eval()
+    print(f"LingBot model loaded in {time.perf_counter() - t0:.2f}s")
+
+    w = int(intrinsics["width"])
+    h = int(intrinsics["height"])
+    k_norm = np.array([
+        [float(intrinsics["fx"]) / w, 0.0, float(intrinsics["cx"]) / w],
+        [0.0, float(intrinsics["fy"]) / h, float(intrinsics["cy"]) / h],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+    k_tensor = torch.tensor(k_norm, dtype=torch.float32, device=device).unsqueeze(0)
+
+    return model, device, k_tensor
+
+
+def refine_depth_lingbot(
+    color_rgb: np.ndarray,
+    depth_m: np.ndarray,
+    model,
+    device,
+    k_tensor,
+) -> np.ndarray:
+    """Run LingBot-Depth on a single frame, return refined depth in meters."""
+    import gc
+
+    import torch
+
+    rgb_tensor = (
+        torch.tensor(color_rgb / 255.0, dtype=torch.float32, device=device)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+    )
+    depth_tensor = torch.tensor(depth_m, dtype=torch.float32, device=device)
+
+    with torch.inference_mode():
+        output = model.infer(
+            rgb_tensor,
+            depth_in=depth_tensor,
+            apply_mask=True,
+            intrinsics=k_tensor,
+            resolution_level=0,
+            use_fp16=True,
+        )
+
+    # Extract numpy result before freeing GPU memory
+    result = output["depth"].squeeze().float().cpu().numpy().copy()
+
+    # Aggressively free all tensors to prevent RAM/VRAM buildup
+    del rgb_tensor, depth_tensor, output
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
+
+    return result
+
+
+def colorize_depth(
+    depth_m: np.ndarray,
+    min_m: float = 0.1,
+    max_m: float = 1.5,
+) -> np.ndarray:
+    """Convert float32 depth in meters to a colorized 8-bit BGR image for visual debugging."""
+    valid = np.isfinite(depth_m) & (depth_m > 0)
+    if not valid.any():
+        return np.zeros((*depth_m.shape, 3), dtype=np.uint8)
+    normalized = np.clip(
+        (depth_m - min_m) / max(max_m - min_m, 1e-6) * 255.0,
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    colored = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+    colored[~valid] = 0
+    return colored
+
+
 def prompt_for_capture() -> bool:
     raw_value = input("Press Enter to capture, or q to finish: ").strip().lower()
     return raw_value not in STOP_COMMANDS
@@ -395,6 +516,11 @@ def save_outputs(
             "roi": list(args.roi),
             "voxel_length_m": args.voxel_length_m,
             "sdf_trunc_m": args.sdf_trunc_m,
+            "lingbot": {
+                "enabled": args.lingbot,
+                "model": args.lingbot_model if args.lingbot else None,
+                "device": args.lingbot_device if args.lingbot else None,
+            },
             "hole_fill_size_m": None if args.no_fill_holes else args.hole_fill_size_m,
             "cleanup": None
             if args.no_cleanup
@@ -444,7 +570,7 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, request_stop)
 
-    if args.save_overlays:
+    if args.save_overlays or args.lingbot_debug:
         args.debug_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -459,8 +585,12 @@ def main() -> None:
         camera_matrix = camera_matrix_from_intrinsics(intrinsics)
         open3d_intrinsic = open3d_intrinsic_from_dict(intrinsics)
 
+        lingbot_model, lingbot_device, lingbot_k = load_lingbot_model(args, intrinsics)
+
         print("\nOrbbec ArUco TSDF scanner ready.")
         print(f"Stream: {intrinsics['width']}x{intrinsics['height']}, fx={intrinsics['fx']:.1f}, fy={intrinsics['fy']:.1f}")
+        if lingbot_model is not None:
+            print("LingBot-Depth: ENABLED (depth refined before TSDF, pose uses raw depth)")
         print("ArUco table board provides the global 3D world coordinate frame.")
         if args.auto_capture:
             print(
@@ -540,8 +670,14 @@ def main() -> None:
                 dist_coeffs,
             )
 
-            # Process depth
-            proc_depth = depth_m.copy()
+            # Process depth — use LingBot-refined depth for TSDF if enabled,
+            # but ArUco pose above always used the raw sensor depth_m.
+            if lingbot_model is not None:
+                proc_depth = refine_depth_lingbot(
+                    color_rgb, depth_m, lingbot_model, lingbot_device, lingbot_k,
+                )
+            else:
+                proc_depth = depth_m.copy()
             if not args.no_mask_markers and len(corners) > 0:
                 proc_depth = mask_marker_depth(
                     proc_depth,
@@ -584,6 +720,21 @@ def main() -> None:
                 overlay_file = args.debug_dir / f"frame_{len(accepted):04d}.png"
                 cv2.imwrite(str(overlay_file), overlay)
                 overlay_path = str(overlay_file)
+
+            if lingbot_model is not None and args.lingbot_debug:
+                raw_depth_vis = colorize_depth(depth_m, args.min_depth_m, args.max_depth_m)
+                enhanced_vis = colorize_depth(proc_depth, args.min_depth_m, args.max_depth_m)
+                comparison = np.hstack([raw_depth_vis, enhanced_vis])
+                comp_file = args.debug_dir / f"lingbot_compare_{len(accepted):04d}.png"
+                cv2.imwrite(str(comp_file), comparison)
+
+                enhanced_file = args.debug_dir / f"enhanced_depth_{len(accepted):04d}.png"
+                cv2.imwrite(str(enhanced_file), enhanced_vis)
+
+                # Save 16-bit raw millimeter depth PNG for precise inspection
+                mm_depth = (np.clip(proc_depth, 0.0, 65.535) * 1000.0).astype(np.uint16)
+                depth_raw_file = args.debug_dir / f"enhanced_depth_raw_{len(accepted):04d}.png"
+                cv2.imwrite(str(depth_raw_file), mm_depth)
 
             accepted_frame = AcceptedFrame(
                 index=len(accepted),
