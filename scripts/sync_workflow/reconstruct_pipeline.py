@@ -16,6 +16,7 @@ Stages:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import math
@@ -40,9 +41,10 @@ CLOUDCOMPARE_COMMAND = [
 ]
 
 # ---------------------------------------------------------------------------
-# Default registration settings (proven in transform_clouds_pipeline.py)
+# Default registration settings
 # ---------------------------------------------------------------------------
-REGISTRATION_VOXEL_M = 0.002
+REGISTRATION_VOXEL_M = 0.004        # coarse registration cloud (4mm, fast)
+REGISTRATION_FINE_VOXEL_M = 0.001   # fine ICP cloud (1mm, accurate)
 REGISTRATION_NORMAL_RADIUS_M = 0.006
 ICP_COARSE_DISTANCE_M = 0.008
 ICP_FINE_DISTANCE_M = 0.003
@@ -52,18 +54,19 @@ ICP_MAX_RMSE_M = 0.005
 ICP_MAX_CORRECTION_M = 0.040
 ICP_MAX_CORRECTION_DEG = 10.0
 ICP_MIN_POINTS = 100
-ORBIT_PRIOR_WEIGHT = 50.0
+ORBIT_PRIOR_WEIGHT_ACCEPTED = 50.0   # trust ICP result
+ORBIT_PRIOR_WEIGHT_FALLBACK = 200.0  # trust motor angle more when ICP failed
 POSE_GRAPH_EDGE_PRUNE_THRESHOLD = 0.25
 
-# Per-scan cleanup (lower neighbors = faster)
+# Per-scan cleanup (SOR only used when --skip-per-scan-sor is NOT set)
 PRE_ICP_SOR_NEIGHBORS = 10
 PRE_ICP_SOR_SIGMA = 2.0
 
 # Final merged-cloud cleanup
-FINAL_SOR_NEIGHBORS = 30
+FINAL_SOR_NEIGHBORS = 20
 FINAL_SOR_SIGMA = 1.5
 REMOVE_DUPLICATES_DISTANCE_M = 0.00010
-SPATIAL_SUBSAMPLE_M = 0.00075
+SPATIAL_SUBSAMPLE_M = 0.001
 NORMAL_RADIUS_M = 0.0040
 NORMAL_MST_NEIGHBORS = 12
 
@@ -233,7 +236,39 @@ def find_ply_files(input_dir: Path) -> list[Path]:
     return sorted(files, key=lambda p: read_angle_from_filename(p.name))
 
 
+def calculate_auto_radius(o3d, ply_files: list[Path]) -> float:
+    """Read frame_0.0.ply (or first frame), find the hand, and return its Z depth."""
+    target = next((p for p in ply_files if "frame_0.0.ply" in p.name), ply_files[0])
+    cloud = o3d.io.read_point_cloud(str(target))
+    if cloud.is_empty():
+        raise RuntimeError(f"Could not read points for auto-radius from {target}")
+    
+    pts = np.asarray(cloud.points, dtype=float)
+    finite = pts[np.all(np.isfinite(pts), axis=1) & (pts[:, 2] > 0.01)]
+    if len(finite) < 100:
+        raise RuntimeError("Not enough points to calculate auto-radius.")
+
+    # Find center 10%
+    cx = (finite[:, 0].max() + finite[:, 0].min()) / 2
+    cy = (finite[:, 1].max() + finite[:, 1].min()) / 2
+    x_range = finite[:, 0].max() - finite[:, 0].min()
+    y_range = finite[:, 1].max() - finite[:, 1].min()
+    
+    mask = (
+        (np.abs(finite[:, 0] - cx) < x_range * 0.10) &
+        (np.abs(finite[:, 1] - cy) < y_range * 0.10)
+    )
+    center_pts = finite[mask]
+    if len(center_pts) == 0:
+        center_pts = finite # fallback if crop is empty
+        
+    radius = float(np.median(center_pts[:, 2]))
+    logger.info("Auto-calculated orbit radius from %s: %.3fm", target.name, radius)
+    return radius
+
+
 # ===================================================================
+
 # Orbit pose builder
 # ===================================================================
 
@@ -259,8 +294,10 @@ def build_orbit_poses(
 # Registration
 # ===================================================================
 
-def prepare_registration_cloud(o3d, cloud, initial_pose, crop_bounds=None):
-    """Build a cropped, downsampled object cloud for registration."""
+def prepare_registration_cloud(o3d, cloud, initial_pose, voxel_size=None, crop_bounds=None):
+    """Build a downsampled (and optionally cropped) cloud for registration."""
+    if voxel_size is None:
+        voxel_size = REGISTRATION_VOXEL_M
     points = np.asarray(cloud.points, dtype=float)
     if points.size == 0:
         return o3d.geometry.PointCloud()
@@ -275,7 +312,7 @@ def prepare_registration_cloud(o3d, cloud, initial_pose, crop_bounds=None):
 
     selected_indices = np.flatnonzero(keep)
     selected = cloud.select_by_index(selected_indices.tolist())
-    selected = selected.voxel_down_sample(REGISTRATION_VOXEL_M)
+    selected = selected.voxel_down_sample(voxel_size)
     if len(selected.points) >= 3:
         selected.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(
@@ -320,7 +357,7 @@ def information_matrix(o3d, source, target, transform):
 
 
 def register_pair(o3d, source_id, target_id, kind, frames):
-    """Guarded coarse-to-fine ICP between two frames."""
+    """Guarded coarse (PointToPoint) → fine (PointToPlane) ICP between two frames."""
     source = frames[source_id].cloud
     target = frames[target_id].cloud
     prior = relative_camera_transform(
@@ -351,16 +388,19 @@ def register_pair(o3d, source_id, target_id, kind, frames):
         and prior_rmse_m <= ICP_MAX_RMSE_M
     )
 
-    estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane()
     criteria = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=ICP_ITERATIONS)
 
-    # Coarse pass
+    # Coarse pass: PointToPoint (no normals needed at 8mm)
     coarse = o3d.pipelines.registration.registration_icp(
-        source, target, ICP_COARSE_DISTANCE_M, prior, estimation, criteria,
+        source, target, ICP_COARSE_DISTANCE_M, prior,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        criteria,
     )
-    # Fine pass
+    # Fine pass: PointToPlane (uses normals for sub-mm accuracy)
     fine = o3d.pipelines.registration.registration_icp(
-        source, target, ICP_FINE_DISTANCE_M, coarse.transformation, estimation, criteria,
+        source, target, ICP_FINE_DISTANCE_M, coarse.transformation,
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        criteria,
     )
 
     candidate = np.asarray(fine.transformation, dtype=float)
@@ -387,7 +427,7 @@ def register_pair(o3d, source_id, target_id, kind, frames):
 
 
 def registration_pairs(frame_count, include_loop_closure=True):
-    """Return sequential and loop-closure pairs."""
+    """Return sequential pairs and an optional loop-closure pair."""
     pairs = [(i, i + 1, "sequential") for i in range(frame_count - 1)]
     if include_loop_closure and frame_count > 2:
         pairs.append((0, frame_count - 1, "loop"))
@@ -395,17 +435,39 @@ def registration_pairs(frame_count, include_loop_closure=True):
 
 
 def build_pose_graph(o3d, frames):
-    """Build and optimize a pose graph with orbit prior + ICP edges."""
+    """Build and optimize a pose graph with adaptive orbit priors + parallel ICP."""
     graph = o3d.pipelines.registration.PoseGraph()
     for frame in frames:
         graph.nodes.append(
             o3d.pipelines.registration.PoseGraphNode(frame.prior_pose.copy())
         )
 
+    all_pairs = registration_pairs(len(frames))
+
+    # Run all sequential pairs in parallel (ICP releases the GIL)
+    sequential_pairs = [(s, t, k) for s, t, k in all_pairs if k == "sequential"]
+    loop_pairs = [(s, t, k) for s, t, k in all_pairs if k != "sequential"]
+
     edges = []
-    for source_id, target_id, kind in registration_pairs(len(frames)):
-        edge = register_pair(o3d, source_id, target_id, kind, frames)
-        edges.append(edge)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {
+            executor.submit(register_pair, o3d, s, t, k, frames): (s, t, k)
+            for s, t, k in sequential_pairs
+        }
+        seq_edges = {}
+        for future in concurrent.futures.as_completed(futures):
+            edge = future.result()
+            seq_edges[(edge.source_id, edge.target_id)] = edge
+
+    # Keep sequential edges in order
+    for s, t, _ in sequential_pairs:
+        edges.append(seq_edges[(s, t)])
+
+    # Loop closure runs after (single pair, no parallelism needed)
+    for s, t, k in loop_pairs:
+        edges.append(register_pair(o3d, s, t, k, frames))
+
+    for edge in edges:
         logger.info(
             "%s %d->%d %s: fitness=%.3f, rmse=%.4f m, "
             "correction=%.4f m/%.2f deg (%s)",
@@ -415,25 +477,30 @@ def build_pose_graph(o3d, frames):
             edge.correction_m, edge.correction_deg, edge.reason,
         )
 
-        # Add orbit prior edge for sequential pairs (strong constraint)
-        if kind == "sequential":
+        # Add orbit prior edge for sequential pairs
+        # Adaptive weight: higher when ICP fell back (trust motor angle more)
+        if edge.kind == "sequential":
             prior = relative_camera_transform(
-                frames[source_id].prior_pose,
-                frames[target_id].prior_pose,
+                frames[edge.source_id].prior_pose,
+                frames[edge.target_id].prior_pose,
+            )
+            prior_weight = (
+                ORBIT_PRIOR_WEIGHT_ACCEPTED if edge.accepted
+                else ORBIT_PRIOR_WEIGHT_FALLBACK
             )
             prior_info = information_matrix(
-                o3d, frames[source_id].cloud, frames[target_id].cloud, prior,
-            ) * ORBIT_PRIOR_WEIGHT
+                o3d, frames[edge.source_id].cloud, frames[edge.target_id].cloud, prior,
+            ) * prior_weight
             graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
-                    source_id, target_id, prior, prior_info, uncertain=False,
+                    edge.source_id, edge.target_id, prior, prior_info, uncertain=False,
                 )
             )
         # Add ICP edge if accepted
         if edge.accepted:
             graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
-                    source_id, target_id, edge.transform, edge.information, uncertain=True,
+                    edge.source_id, edge.target_id, edge.transform, edge.information, uncertain=True,
                 )
             )
 
@@ -458,52 +525,75 @@ def optimize_pose_graph(o3d, graph):
 # CloudCompare stages
 # ===================================================================
 
+def _transform_single_frame(
+    frame: RegistrationFrame,
+    optimized_pose: np.ndarray,
+    matrix_dir: Path,
+    transformed_dir: Path,
+    skip_per_scan_sor: bool,
+    crop_bounds: Optional[tuple] = None,
+) -> Path:
+    """Transform a single frame via CloudCompare (used by parallel executor)."""
+    matrix_path = matrix_dir / f"{frame.path.stem}_optimized_matrix.txt"
+    output_path = transformed_dir / f"{frame.path.stem}_transformed.ply"
+    np.savetxt(matrix_path, optimized_pose, fmt="%.10f")
+
+    command = [
+        *CLOUDCOMPARE_COMMAND,
+        "-VERBOSITY", "2", "-SILENT", "-AUTO_SAVE", "OFF",
+        "-O", str(frame.path),
+        "-APPLY_TRANS", str(matrix_path),
+    ]
+    if crop_bounds is not None:
+        command.extend(["-CROP", cc_crop_argument(crop_bounds)])
+    if not skip_per_scan_sor:
+        command.extend(["-SOR", str(PRE_ICP_SOR_NEIGHBORS), str(PRE_ICP_SOR_SIGMA)])
+    command.extend([
+        "-C_EXPORT_FMT", "PLY",
+        "-SAVE_CLOUDS", "FILE", cc_file_argument(output_path),
+    ])
+
+    logger.info("Transforming %s (angle=%.2f deg)", frame.path.name, frame.angle_deg)
+    run_cc_command(command)
+    return output_path
+
+
+# Max parallel CC processes (flatpak + Qt overhead is ~750ms each;
+# running 4-6 in parallel hides the cold-start latency)
+CC_MAX_WORKERS = 4
+
+
 def cc_transform_and_clean(
     frames: list[RegistrationFrame],
     optimized_poses: list[np.ndarray],
     output_dir: Path,
     matrix_dir: Path,
-    crop_bounds: Optional[tuple] = None,
     skip_per_scan_sor: bool = False,
+    crop_bounds: Optional[tuple] = None,
 ) -> list[Path]:
-    """Stage 3: Apply optimized poses via CloudCompare, crop, optional SOR."""
+    """Stage 3: Apply optimized poses via parallel CloudCompare calls."""
     transformed_dir = output_dir / "01_transformed"
     transformed_dir.mkdir(parents=True, exist_ok=True)
     matrix_dir.mkdir(parents=True, exist_ok=True)
 
-    transformed_paths = []
-    for frame, optimized_pose in zip(frames, optimized_poses):
-        ply_path = frame.path
-        matrix_path = matrix_dir / f"{ply_path.stem}_optimized_matrix.txt"
-        output_path = transformed_dir / f"{ply_path.stem}_transformed.ply"
+    logger.info("Transforming %d clouds (%d parallel CC workers)...",
+                len(frames), CC_MAX_WORKERS)
 
-        np.savetxt(matrix_path, optimized_pose, fmt="%.10f")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CC_MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _transform_single_frame, frame, pose,
+                matrix_dir, transformed_dir, skip_per_scan_sor, crop_bounds
+            ): i
+            for i, (frame, pose) in enumerate(zip(frames, optimized_poses))
+        }
+        results = {}
+        for future in concurrent.futures.as_completed(futures):
+            idx = futures[future]
+            results[idx] = future.result()
 
-        command = [
-            *CLOUDCOMPARE_COMMAND,
-            "-VERBOSITY", "2", "-SILENT", "-AUTO_SAVE", "OFF",
-            "-O", str(ply_path),
-            "-APPLY_TRANS", str(matrix_path),
-        ]
-
-        if crop_bounds is not None:
-            command.extend(["-CROP", cc_crop_argument(crop_bounds)])
-
-        if not skip_per_scan_sor:
-            command.extend([
-                "-SOR", str(PRE_ICP_SOR_NEIGHBORS), str(PRE_ICP_SOR_SIGMA),
-            ])
-
-        command.extend([
-            "-C_EXPORT_FMT", "PLY",
-            "-SAVE_CLOUDS", "FILE", cc_file_argument(output_path),
-        ])
-
-        logger.info("Transforming %s (angle=%.2f deg)", ply_path.name, frame.angle_deg)
-        run_cc_command(command)
-        transformed_paths.append(output_path)
-
-    return transformed_paths
+    # Return paths in original frame order
+    return [results[i] for i in range(len(frames))]
 
 
 def cc_merge_clouds(
@@ -524,9 +614,13 @@ def cc_merge_clouds(
         command.extend(["-O", str(incoming_path), "-MERGE_CLOUDS"])
 
     command.extend([
-        "-SOR", str(FINAL_SOR_NEIGHBORS), str(FINAL_SOR_SIGMA),
-        "-RDP", str(REMOVE_DUPLICATES_DISTANCE_M),
+        # Subsample FIRST to reduce point count from millions to thousands
         "-SS", "SPATIAL", str(SPATIAL_SUBSAMPLE_M),
+        # Remove duplicates
+        "-RDP", str(REMOVE_DUPLICATES_DISTANCE_M),
+        # Run SOR on the much smaller, subsampled cloud
+        "-SOR", str(FINAL_SOR_NEIGHBORS), str(FINAL_SOR_SIGMA),
+        # Finally, estimate and orient normals
         "-OCTREE_NORMALS", str(NORMAL_RADIUS_M),
         "-ORIENT", "PLUS_BARYCENTER",
         "-ORIENT_NORMS_MST", str(NORMAL_MST_NEIGHBORS),
@@ -639,22 +733,25 @@ def parse_args(argv=None):
                         help="Directory containing frame_*.ply files (e.g. outputs/debug)")
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="Reconstruction output directory (default: <input-dir>/reconstruction)")
+    parser.add_argument("--auto-radius", action="store_true",
+                        help="Automatically calculate orbit-radius from the center of the first frame")
     parser.add_argument("--orbit-radius-m", type=float, default=0.12,
-                        help="Camera orbit radius in metres")
+                        help="Camera orbit radius in metres (ignored if --auto-radius is used)")
     parser.add_argument("--orbit-axis", type=float, nargs=3, default=[0.0, 1.0, 0.0],
                         help="Orbit axis as X Y Z (default: 0 1 0 = Y-axis)")
     parser.add_argument("--pivot", type=float, nargs=3, default=None,
-                        help="Pivot point as X Y Z (default: [0, 0, radius])")
+                        help="Pivot point in camera coords as X Y Z metres "
+                             "(default: [0, 0, orbit-radius-m] = object centre in front of camera)")
     parser.add_argument("--reference-angle-deg", type=float, default=0.0,
                         help="Angle of the reference frame (default: 0)")
     parser.add_argument("--angle-sign", type=float, default=1.0,
                         help="Sign convention for angle direction (1.0 or -1.0)")
-    parser.add_argument("--crop-bounds", type=float, nargs=6, default=None,
-                        help="Crop bounds as Xmin Ymin Zmin Xmax Ymax Zmax (metres)")
+    parser.add_argument("--crop-radius-m", type=float, default=0.3,
+                        help="Keep only points within this radius of the pivot (default: 0.3m = 30cm)")
     parser.add_argument("--no-mesh", action="store_true",
                         help="Skip Poisson mesh reconstruction")
     parser.add_argument("--skip-per-scan-sor", action="store_true",
-                        help="Skip per-scan SOR filtering (much faster, relies on final SOR only)")
+                        help="Skip per-scan SOR (much faster; final SOR still runs)")
     return parser.parse_args(argv)
 
 
@@ -669,8 +766,27 @@ def main(argv=None):
     matrix_dir = output_dir / "matrices"
     matrix_dir.mkdir(parents=True, exist_ok=True)
 
+    import open3d as o3d
+    
+    ply_files = find_ply_files(input_dir)
+    logger.info("Found %d PLY files in %s", len(ply_files), input_dir)
+
     orbit_axis = normalized_vector(np.array(args.orbit_axis), name="orbit-axis")
-    pivot = np.array(args.pivot) if args.pivot else np.array([0.0, 0.0, args.orbit_radius_m])
+    
+    if args.auto_radius:
+        orbit_radius_m = calculate_auto_radius(o3d, ply_files)
+    else:
+        orbit_radius_m = args.orbit_radius_m
+
+    # Pivot = where the hand/object sits in camera space at angle=0.
+    # Camera is on the ring, Z+ axis points inward at the object.
+    # Object is at [0, 0, orbit_radius_m] in camera coordinates.
+    pivot = np.array(args.pivot) if args.pivot else np.array([0.0, 0.0, orbit_radius_m])
+
+    r = args.crop_radius_m
+    crop_bounds = (pivot[0] - r, pivot[1] - r, pivot[2] - r,
+                   pivot[0] + r, pivot[1] + r, pivot[2] + r) if r > 0 else None
+
 
     merged_cloud_path = output_dir / "merged_cloud.ply"
     mesh_path = output_dir / "poisson_mesh.ply"
@@ -680,7 +796,7 @@ def main(argv=None):
     logger.info("Stage 1/5: Discovering PLY files and building orbit poses...")
     ply_files = find_ply_files(input_dir)
     logger.info("Found %d point clouds.", len(ply_files))
-    logger.info("Orbit radius: %.4f m, axis: %s, pivot: %s", args.orbit_radius_m, orbit_axis, pivot)
+    logger.info("Orbit radius: %.4f m, axis: %s, pivot: %s", orbit_radius_m, orbit_axis, pivot)
 
     priors = build_orbit_poses(
         ply_files, orbit_axis, pivot,
@@ -697,9 +813,9 @@ def main(argv=None):
         cloud = o3d.io.read_point_cloud(str(path))
         if cloud.is_empty():
             raise RuntimeError(f"Open3D could not read points from {path}")
+        # Coarse cloud (4mm) used for ICP, cropped to ignore the room
         reg_cloud = prepare_registration_cloud(
-            o3d, cloud, prior,
-            crop_bounds=tuple(args.crop_bounds) if args.crop_bounds else None,
+            o3d, cloud, prior, voxel_size=REGISTRATION_VOXEL_M, crop_bounds=crop_bounds
         )
         frames.append(RegistrationFrame(
             path=path,
@@ -720,12 +836,11 @@ def main(argv=None):
 
     save_diagnostics(output_dir, frames, orbit_axis, optimized_poses, edges)
 
-    # Stage 3: CloudCompare transform + cleanup
-    logger.info("Stage 3/5: CloudCompare transform + per-scan cleanup...")
+    # Stage 3: CloudCompare transform (batched single call)
+    logger.info("Stage 3/5: CloudCompare batched transform...")
     transformed_paths = cc_transform_and_clean(
         frames, optimized_poses, output_dir, matrix_dir,
-        crop_bounds=tuple(args.crop_bounds) if args.crop_bounds else None,
-        skip_per_scan_sor=args.skip_per_scan_sor,
+        skip_per_scan_sor=args.skip_per_scan_sor, crop_bounds=crop_bounds
     )
 
     # Stage 4: CloudCompare merge
