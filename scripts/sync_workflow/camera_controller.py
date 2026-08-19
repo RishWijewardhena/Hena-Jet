@@ -140,9 +140,20 @@ class CameraController:
         if not self.pipeline:
             raise RuntimeError("Pipeline is not started.")
 
+        # Flush stale frames from the buffer
+        flushed_count = 0
+        while True:
+            # Use a tiny timeout to quickly pull frames until the queue is empty
+            old_frames = self.pipeline.wait_for_frames(10)
+            if old_frames is None:
+                break
+            flushed_count += 1
+            
+        logger.debug(f"Flushed {flushed_count} stale frames from camera queue.")
+
         frames = self.pipeline.wait_for_frames(timeout_ms)
         if frames is None:
-            logger.warning("Timeout waiting for frames.")
+            logger.warning("Timeout waiting for fresh frames.")
             return None, None
 
         color_frame = frames.get_color_frame()
