@@ -631,43 +631,6 @@ def cc_merge_clouds(
     run_cc_command(command)
 
 
-def create_poisson_mesh(merged_cloud_path: Path, mesh_path: Path) -> None:
-    """Stage 5: Poisson surface reconstruction via Open3D."""
-    import open3d as o3d
-
-    cloud = o3d.io.read_point_cloud(str(merged_cloud_path))
-    if cloud.is_empty():
-        raise RuntimeError(f"Open3D could not read points from {merged_cloud_path}")
-
-    cloud.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=NORMAL_RADIUS_M, max_nn=50,
-        )
-    )
-    cloud.orient_normals_consistent_tangent_plane(NORMAL_MST_NEIGHBORS)
-
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        cloud, depth=POISSON_DEPTH, scale=POISSON_SCALE, linear_fit=False,
-    )
-
-    densities_array = np.asarray(densities)
-    if densities_array.size > 0 and POISSON_DENSITY_TRIM_QUANTILE > 0.0:
-        threshold = np.quantile(densities_array, POISSON_DENSITY_TRIM_QUANTILE)
-        mesh.remove_vertices_by_mask(densities_array < threshold)
-
-    mesh = mesh.crop(cloud.get_axis_aligned_bounding_box())
-    mesh.remove_degenerate_triangles()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_duplicated_vertices()
-    mesh.remove_non_manifold_edges()
-    mesh.compute_vertex_normals()
-
-    if not o3d.io.write_triangle_mesh(str(mesh_path), mesh,
-                                       write_ascii=False, compressed=False,
-                                       write_vertex_normals=True,
-                                       write_vertex_colors=True):
-        raise RuntimeError(f"Failed to save mesh to {mesh_path}")
-    logger.info("Saved Poisson mesh to %s (%d vertices)", mesh_path, len(mesh.vertices))
 
 
 # ===================================================================
@@ -748,8 +711,7 @@ def parse_args(argv=None):
                         help="Sign convention for angle direction (1.0 or -1.0)")
     parser.add_argument("--crop-radius-m", type=float, default=0.3,
                         help="Keep only points within this radius of the pivot (default: 0.3m = 30cm)")
-    parser.add_argument("--no-mesh", action="store_true",
-                        help="Skip Poisson mesh reconstruction")
+
     parser.add_argument("--skip-per-scan-sor", action="store_true",
                         help="Skip per-scan SOR (much faster; final SOR still runs)")
     return parser.parse_args(argv)
@@ -847,17 +809,8 @@ def main(argv=None):
     logger.info("Stage 4/5: CloudCompare merge + final cleanup...")
     cc_merge_clouds(transformed_paths, merged_cloud_path, log_path)
 
-    # Stage 5: Poisson mesh
-    if not args.no_mesh:
-        logger.info("Stage 5/5: Poisson surface reconstruction...")
-        create_poisson_mesh(merged_cloud_path, mesh_path)
-    else:
-        logger.info("Stage 5/5: Skipped (--no-mesh).")
-
     logger.info("Finished!")
     logger.info("Merged cloud: %s", merged_cloud_path)
-    if not args.no_mesh:
-        logger.info("Poisson mesh: %s", mesh_path)
     logger.info("Diagnostics: %s", output_dir / "registration_diagnostics.json")
 
 
