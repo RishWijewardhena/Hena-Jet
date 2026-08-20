@@ -737,8 +737,8 @@ def parse_args(argv=None):
                         help="Automatically calculate orbit-radius from the center of the first frame")
     parser.add_argument("--orbit-radius-m", type=float, default=0.14587,
                         help="Camera orbit radius in metres (ignored if --auto-radius is used)")
-    parser.add_argument("--orbit-axis", type=float, nargs=3, default=[0.0, 1.0, 0.0],
-                        help="Orbit axis as X Y Z (default: 0 1 0 = Y-axis)")
+    parser.add_argument("--orbit-axis", type=float, nargs=3, default=[1.0, 0.0, 0.0],
+                        help="Orbit axis as X Y Z (default: 1 0 0 = X-axis)")
     parser.add_argument("--pivot", type=float, nargs=3, default=None,
                         help="Pivot point in camera coords as X Y Z metres "
                              "(default: [0, 0, orbit-radius-m] = object centre in front of camera)")
