@@ -29,6 +29,11 @@ except ImportError:
     # Provide dummy classes for type hinting / offline development
     Pipeline = type('Pipeline', (), {})
     AlignFilter = type('AlignFilter', (), {})
+    OBPropertyID = type(
+        'OBPropertyID',
+        (),
+        {'OB_PROP_DISP_SEARCH_RANGE_MODE_INT': object()},
+    )
 
 
 def configure_disparity_search_range(device, requested_disparity: str | int) -> int:

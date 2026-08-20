@@ -14,7 +14,10 @@ Drives the motor and camera to collect per-angle point clouds:
 2. **`camera_controller.py`** — Orbbec SDK pipeline (SW D2C alignment, configurable disparity).
 3. **`main_scan.py`** — Orchestrates homing → motor stepping → frame capture → PLY export.
 
-**Outputs:** A folder of `frame_<angle>.ply` files + `intrinsics.json`.
+At every angle the workflow median-combines several fresh depth frames, rejects
+depth outside the configured close-range window, and reports valid coverage.
+
+**Outputs:** `frame_<angle>.ply`, `intrinsics.json`, and `scan_metadata.json`.
 
 ### Phase 2: Reconstruction (`reconstruct_pipeline.py`)
 
@@ -23,12 +26,13 @@ Operates offline on the saved PLY files. Adapted from the proven [`transform_clo
 | Stage | Tool | What it does |
 |-------|------|-------------|
 | 1 | Python | Build orbit pose priors from motor angles using Rodrigues rotation |
-| 2 | Open3D | Guarded coarse-to-fine ICP (8mm → 3mm) + pose-graph optimization with orbit prior edges (weight=50) |
+| 2 | Python / Open3D | Use deterministic motor poses (default), or tightly guarded residual ICP with motor fallback |
 | 3 | CloudCompare | Apply optimized 4×4 transforms, crop (optional), SOR per scan |
 | 4 | CloudCompare | Merge all scans, dedup, spatial subsample, compute + orient normals |
-| 5 | Open3D | Poisson surface reconstruction with density trimming |
 
-**Outputs:** `merged_cloud.ply`, `poisson_mesh.ply`, `registration_diagnostics.json`.
+**Outputs:** `merged_cloud.ply`, pose matrices, `cloudcompare.log`, and
+`registration_diagnostics.json`. Diagnostics record the effective radius,
+pivot, axis, mode, thresholds, prior scores, and final pose corrections.
 
 ---
 
@@ -37,38 +41,48 @@ Operates offline on the saved PLY files. Adapted from the proven [`transform_clo
 ### Capture only (recommended first run)
 
 ```bash
-python scripts/sync_workflow/main_scan.py \
+conda run -n hena_jet python scripts/sync_workflow/main_scan.py \
   --step-deg 10.0 \
-  --disparity 128 \
-  --width 1280 --height 800 \
-  --radius-m 0.12 \
+  --disparity 256 \
+  --frames-per-angle 5 \
+  --depth-min-m 0.02 --depth-max-m 0.35 \
+  --radius-m 0.1175 \
   --output-dir outputs/scan_01
 ```
 
 ### Capture + auto-reconstruct
 
 ```bash
-python scripts/sync_workflow/main_scan.py \
+conda run -n hena_jet python scripts/sync_workflow/main_scan.py \
   --step-deg 10.0 \
-  --disparity 128 \
-  --width 1280 --height 800 \
-  --radius-m 0.12 \
+  --disparity 256 \
+  --frames-per-angle 5 \
+  --depth-min-m 0.02 --depth-max-m 0.35 \
+  --radius-m 0.1175 \
   --output-dir outputs/scan_01 \
+  --registration-mode motor \
   --reconstruct
 ```
 
 ### Reconstruct from existing captures
 
 ```bash
-python scripts/sync_workflow/reconstruct_pipeline.py \
+conda run -n hena_jet python scripts/sync_workflow/reconstruct_pipeline.py \
   --input-dir outputs/scan_01 \
-  --orbit-radius-m 0.12
+  --registration-mode motor
 ```
+
+The radius and orbit axis are read from `scan_metadata.json`. An explicit
+`--orbit-radius-m` overrides the recorded radius.
+
+Use `--registration-mode guarded-icp` only when the motor-only baseline is
+correct. ICP is accepted only when it stays within 5 mm / 2 degrees and
+improves the motor prior; otherwise that edge falls back to the motor pose.
 
 ### Dry run (no hardware)
 
 ```bash
-python scripts/sync_workflow/main_scan.py --dry-run
+conda run -n hena_jet python scripts/sync_workflow/main_scan.py --dry-run
 ```
 
 ---
@@ -95,8 +109,28 @@ Every `G1` move is followed by `M400` to guarantee the motor has physically stop
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--step-deg` | 10.0 | Degrees per capture step |
-| `--radius-m` | 0.12 | Distance from camera lens to rotation center |
+| `--radius-m` | None | Optical-center to rotation-center distance; required for auto-reconstruction |
 | `--disparity` | 256 | Depth disparity search range (128 or 256) |
 | `--width` / `--height` | 848×530 | Camera resolution |
-| `--orbit-axis` | 0 1 0 | Rotation axis (Y-axis default) |
-| `--crop-bounds` | None | Optional 6-value crop box for reconstruction |
+| `--frames-per-angle` | 5 | Fresh frames median-combined at each angle |
+| `--depth-min-m` / `--depth-max-m` | 0.02 / 0.35 | Capture-time valid depth window |
+| `--orbit-axis` | 1 0 0 | Rotation axis in camera coordinates (the motor axis is still named Y) |
+| `--crop-radius-m` | 0.15 | Half-extent of the reconstruction crop cube |
+| `--registration-mode` | motor | `motor` or `guarded-icp` |
+
+## Orbit-radius calibration capture
+
+`test_radius.py` now captures a rigid asymmetric target from multiple angles:
+
+```bash
+conda run -n hena_jet python scripts/sync_workflow/test_radius.py \
+  --output-dir outputs/radius_calibration \
+  --frames-per-angle 5
+```
+
+Keep the target fixed at the mechanical orbit center. The script writes a
+`calibration_capture.json` manifest and multi-angle PLY/image pairs suitable
+for fitting camera poses and a circle. Do not use the nearest visible hand
+surface depth as the orbit radius: it measures the surface, not the rotation
+center. Until a pose-fitting target is integrated, use the mechanically
+measured optical-center radius and verify it with the motor-only reconstruction.
