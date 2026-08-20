@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument("--width", type=int, default=848, help="Camera width resolution")
     parser.add_argument("--height", type=int, default=530, help="Camera height resolution")
     parser.add_argument("--fps", type=int, default=30, help="Camera framerate")
-    parser.add_argument("--radius-m", type=float, default=0.12, help="Radius from camera to object center")
+    parser.add_argument("--radius-m", type=float, default=0.14587, help="Radius from camera to object center")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/scan"), help="Output directory for PLY files")
     parser.add_argument("--dry-run", action="store_true", help="Print sequence without moving or capturing")
     parser.add_argument("--no-home", action="store_true", help="Skip the homing sequence (use only if already homed)")
