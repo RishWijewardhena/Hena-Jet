@@ -2,7 +2,7 @@
 """Main orchestrator for 360-degree motor-controlled scanning.
 
 Captures aligned RGB-D frames at each motor angle, saves per-angle PLY files,
-and optionally invokes reconstruct_pipeline.py for CloudCompare-based
+and optionally invokes reconstruct_pipeline.py for Open3D/Trimesh-based
 registration and merging.
 """
 

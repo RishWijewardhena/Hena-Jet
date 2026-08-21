@@ -3,7 +3,7 @@
 This workflow captures RGB-D point clouds while the camera moves around a stationary object, then reconstructs the captures in one coordinate system. It assumes a circular camera path where the camera keeps looking toward the mechanical rotation center.
 
 - `main_scan.py` controls the motor and Orbbec camera, creates one colored point cloud per motor angle, and records the scan geometry.
-- `reconstruct_pipeline.py` converts motor angles into camera poses, optionally refines them with guarded ICP, applies them with CloudCompare, and produces a cleaned merged point cloud.
+- `reconstruct_pipeline.py` converts motor angles into camera poses, optionally refines them with guarded ICP, and uses Open3D and Trimesh to produce a cleaned merged point cloud.
 
 ## End-to-end flow
 
@@ -22,7 +22,7 @@ reconstruct_pipeline.py
         +-- resolve radius, orbit axis, and crop settings
         +-- calculate a motor pose prior for every angle
         +-- use priors directly or cautiously refine them with ICP
-        +-- transform and crop full-resolution scans in CloudCompare
+        +-- transform and crop full-resolution scans in Open3D
         +-- merge, subsample, remove noise, and estimate normals
         v
 merged_cloud.ply + pose matrices + registration_diagnostics.json
@@ -70,7 +70,7 @@ Activate the project environment first:
 conda activate hena_jet
 ```
 
-Capture requires the Orbbec SDK, Open3D, and motor serial-port access. Reconstruction also requires CloudCompare; the current pipeline invokes its Flatpak command-line application.
+Capture requires the Orbbec SDK, Open3D, and motor serial-port access. Reconstruction requires Open3D and Trimesh from the `hena_jet` environment; it has no CloudCompare or Flatpak dependency.
 
 ## Capture flow: `main_scan.py`
 
@@ -260,7 +260,7 @@ The pose graph produces `optimized_poses.npy` and per-frame `*_optimized.txt` ma
 
 ### Stage 3: transform full-resolution scans
 
-Registration uses reduced copies, but CloudCompare applies final matrices to the original PLYs. Each scan is transformed, cropped, optionally filtered, and written to `01_transformed/`.
+Registration uses reduced copies, but Open3D applies final matrices to the original PLYs. Four bounded workers transform, crop, optionally filter, and write the scans to `01_transformed/` in stable frame order.
 
 Despite its historical name, `--crop-radius-m` is the half-extent of an axis-aligned cube centered at the orbit pivot, not a spherical radius. A value of 0.15 keeps the interval from `pivot - 0.15` to `pivot + 0.15` m on each axis. A value at or below zero disables cropping.
 
@@ -271,10 +271,11 @@ Per-scan SOR uses 10 neighbors and sigma 2.0 unless `--skip-per-scan-sor` is set
 The transformed scans are merged, then processed with:
 
 - 1 mm spatial subsampling;
-- 0.1 mm close-point/duplicate removal where supported;
+- Trimesh quantized duplicate grouping at 0.1 mm;
 - final SOR with 20 neighbors and sigma 1.5;
 - normal estimation in a 4 mm neighborhood;
-- graph/MST-based consistent normal orientation.
+- graph/MST-based consistent normal orientation, followed by a global outward-direction check against the orbit pivot;
+- final PLY validation by reopening it independently with Open3D and Trimesh.
 
 The result is `merged_cloud.ply`. This pipeline currently produces a cleaned point cloud; it does not run Poisson mesh reconstruction.
 
@@ -290,16 +291,16 @@ reconstruction/
 |   `-- frame_0.0_transformed.ply
 |-- optimized_poses.npy
 |-- registration_diagnostics.json
-|-- cloudcompare.log
+|-- processing.log
 `-- merged_cloud.ply
 ```
 
 - `*_prior.txt`: pose from motor angle, axis, pivot, and radius only.
 - `*_optimized.txt`: selected final pose; identical to the prior in motor mode.
-- `*_optimized_matrix.txt`: CloudCompare transform copy generated while processing the full-resolution scan.
+- `*_optimized_matrix.txt`: transform copy used while processing the full-resolution scan.
 - `optimized_poses.npy`: all final poses for programmatic inspection.
 - `registration_diagnostics.json`: effective settings, radius source, metrics, decisions, rejection reasons, and corrections.
-- `cloudcompare.log`: CloudCompare merge and final-cleanup log.
+- `processing.log`: per-stage Python processing progress, point counts, timing, and failures.
 - `merged_cloud.ply`: final cleaned, normal-estimated point cloud.
 
 ## Reading diagnostics
@@ -416,9 +417,9 @@ Return to `--registration-mode motor`. Smooth, symmetric, or repetitive surfaces
 
 Pass `--orbit-radius-m` or record calibrated `orbit_radius_m` metadata. Use `--auto-radius` only for rough investigation.
 
-### CloudCompare fails
+### Open3D/Trimesh processing fails
 
-Inspect `cloudcompare.log`, confirm the Flatpak application is installed, and verify read/write access to input and output directories.
+Inspect `processing.log`, confirm that Open3D and Trimesh import inside `hena_jet`, and verify read/write access to input and output directories. Empty clouds, missing RGB attributes, non-finite coordinates, incomplete normals, or a failed Trimesh round trip are reported as explicit errors.
 
 ## Verification
 
