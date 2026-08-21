@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CloudCompare-based point-cloud reconstruction pipeline for sync_workflow.
+"""Open3D/Trimesh point-cloud reconstruction pipeline for sync_workflow.
 
 Adapted from scripts/transform_clouds_pipeline.py.  Operates on per-angle
 PLY files saved by main_scan.py and produces a merged, cleaned point cloud
@@ -8,8 +8,8 @@ plus registration diagnostics.
 Stages:
   1. Build orbit pose priors from motor angles
   2. Use motor poses, or optional guarded ICP + pose-graph optimization
-  3. CloudCompare: apply optimized transforms, crop, SOR per scan
-  4. CloudCompare: merge all scans, dedup, subsample, orient normals
+  3. Open3D: apply optimized transforms, crop, SOR per scan
+  4. Open3D/Trimesh: merge, dedup, subsample, orient normals, validate
 """
 
 from __future__ import annotations
@@ -20,23 +20,18 @@ import json
 import logging
 import math
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from pointcloud_processing import (
+    merge_and_finalize_clouds,
+    transform_and_clean_clouds,
+)
 
-# ---------------------------------------------------------------------------
-# CloudCompare invocation (flatpak)
-# ---------------------------------------------------------------------------
-CLOUDCOMPARE_COMMAND = [
-    "/usr/bin/flatpak",
-    "run",
-    "org.cloudcompare.CloudCompare",
-]
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Default registration settings
@@ -72,7 +67,9 @@ FINAL_SOR_SIGMA = 1.5
 REMOVE_DUPLICATES_DISTANCE_M = 0.00010
 SPATIAL_SUBSAMPLE_M = 0.001
 NORMAL_RADIUS_M = 0.0040
+NORMAL_MAX_NEIGHBORS = 50
 NORMAL_MST_NEIGHBORS = 12
+PROCESSING_MAX_WORKERS = 4
 
 # ===================================================================
 # Data classes
@@ -192,26 +189,6 @@ def points_inside_bounds(
         & (points[:, 1] >= y_min) & (points[:, 1] <= y_max)
         & (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
     )
-
-
-# ===================================================================
-# CloudCompare helpers
-# ===================================================================
-
-def cc_file_argument(path: Path) -> str:
-    """Literal-quote a path for CloudCompare SAVE_CLOUDS FILE."""
-    return f'"{path}"'
-
-
-def cc_crop_argument(
-    bounds: tuple[float, float, float, float, float, float],
-) -> str:
-    return ":".join(f"{v:.10g}" for v in bounds)
-
-
-def run_cc_command(command: list[str]) -> None:
-    logger.info("$ %s", " ".join(command))
-    subprocess.run(command, check=True)
 
 
 # ===================================================================
@@ -570,118 +547,6 @@ def optimize_pose_graph(o3d, graph):
 
 
 # ===================================================================
-# CloudCompare stages
-# ===================================================================
-
-def _transform_single_frame(
-    frame: RegistrationFrame,
-    optimized_pose: np.ndarray,
-    matrix_dir: Path,
-    transformed_dir: Path,
-    skip_per_scan_sor: bool,
-    crop_bounds: Optional[tuple] = None,
-) -> Path:
-    """Transform a single frame via CloudCompare (used by parallel executor)."""
-    matrix_path = matrix_dir / f"{frame.path.stem}_optimized_matrix.txt"
-    output_path = transformed_dir / f"{frame.path.stem}_transformed.ply"
-    np.savetxt(matrix_path, optimized_pose, fmt="%.10f")
-
-    command = [
-        *CLOUDCOMPARE_COMMAND,
-        "-VERBOSITY", "2", "-SILENT", "-AUTO_SAVE", "OFF",
-        "-O", str(frame.path),
-        "-APPLY_TRANS", str(matrix_path),
-    ]
-    if crop_bounds is not None:
-        command.extend(["-CROP", cc_crop_argument(crop_bounds)])
-    if not skip_per_scan_sor:
-        command.extend(["-SOR", str(PER_SCAN_SOR_NEIGHBORS), str(PER_SCAN_SOR_SIGMA)])
-    command.extend([
-        "-C_EXPORT_FMT", "PLY",
-        "-SAVE_CLOUDS", "FILE", cc_file_argument(output_path),
-    ])
-
-    logger.info("Transforming %s (angle=%.2f deg)", frame.path.name, frame.angle_deg)
-    run_cc_command(command)
-    return output_path
-
-
-# Max parallel CC processes (flatpak + Qt overhead is ~750ms each;
-# running 4-6 in parallel hides the cold-start latency)
-CC_MAX_WORKERS = 4
-
-
-def cc_transform_and_clean(
-    frames: list[RegistrationFrame],
-    optimized_poses: list[np.ndarray],
-    output_dir: Path,
-    matrix_dir: Path,
-    skip_per_scan_sor: bool = False,
-    crop_bounds: Optional[tuple] = None,
-) -> list[Path]:
-    """Stage 3: Apply optimized poses via parallel CloudCompare calls."""
-    transformed_dir = output_dir / "01_transformed"
-    transformed_dir.mkdir(parents=True, exist_ok=True)
-    matrix_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Transforming %d clouds (%d parallel CC workers)...",
-                len(frames), CC_MAX_WORKERS)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CC_MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                _transform_single_frame, frame, pose,
-                matrix_dir, transformed_dir, skip_per_scan_sor, crop_bounds
-            ): i
-            for i, (frame, pose) in enumerate(zip(frames, optimized_poses))
-        }
-        results = {}
-        for future in concurrent.futures.as_completed(futures):
-            idx = futures[future]
-            results[idx] = future.result()
-
-    # Return paths in original frame order
-    return [results[i] for i in range(len(frames))]
-
-
-def cc_merge_clouds(
-    transformed_paths: list[Path],
-    merged_cloud_path: Path,
-    log_path: Path,
-) -> None:
-    """Stage 4: Merge all transformed scans, dedup, subsample, orient normals."""
-    command = [
-        *CLOUDCOMPARE_COMMAND,
-        "-VERBOSITY", "2", "-SILENT", "-AUTO_SAVE", "OFF",
-        "-LOG_FILE", str(log_path),
-        "-C_EXPORT_FMT", "PLY",
-        "-O", str(transformed_paths[0]),
-    ]
-
-    for incoming_path in transformed_paths[1:]:
-        command.extend(["-O", str(incoming_path), "-MERGE_CLOUDS"])
-
-    command.extend([
-        # Subsample FIRST to reduce point count from millions to thousands
-        "-SS", "SPATIAL", str(SPATIAL_SUBSAMPLE_M),
-        # Remove duplicates
-        "-RDP", str(REMOVE_DUPLICATES_DISTANCE_M),
-        # Run SOR on the much smaller, subsampled cloud
-        "-SOR", str(FINAL_SOR_NEIGHBORS), str(FINAL_SOR_SIGMA),
-        # Finally, estimate and orient normals
-        "-OCTREE_NORMALS", str(NORMAL_RADIUS_M),
-        "-ORIENT", "PLUS_BARYCENTER",
-        "-ORIENT_NORMS_MST", str(NORMAL_MST_NEIGHBORS),
-        "-SAVE_CLOUDS", "FILE", cc_file_argument(merged_cloud_path),
-    ])
-
-    logger.info("Merging %d clouds...", len(transformed_paths))
-    run_cc_command(command)
-
-
-
-
-# ===================================================================
 # Diagnostics
 # ===================================================================
 
@@ -803,6 +668,12 @@ def main(argv=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     matrix_dir = output_dir / "matrices"
     matrix_dir.mkdir(parents=True, exist_ok=True)
+    processing_log_path = output_dir / "processing.log"
+    file_handler = logging.FileHandler(processing_log_path, mode="w", encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    logging.getLogger().addHandler(file_handler)
 
     ply_files = find_ply_files(input_dir)
     logger.info("Found %d PLY files in %s", len(ply_files), input_dir)
@@ -838,7 +709,6 @@ def main(argv=None):
 
 
     merged_cloud_path = output_dir / "merged_cloud.ply"
-    log_path = output_dir / "cloudcompare.log"
 
     # Stage 1: Discover files and build orbit poses
     logger.info("Stage 1/4: Discovering PLY files and building orbit poses...")
@@ -897,6 +767,7 @@ def main(argv=None):
         np.savetxt(matrix_dir / f"{frame.path.stem}_optimized.txt", opt_pose, fmt="%.10f")
 
     settings = {
+        "processing_backend": "open3d+trimesh",
         "registration_mode": args.registration_mode,
         "orbit_radius_m": orbit_radius_m,
         "orbit_radius_source": "auto" if args.auto_radius else (
@@ -936,25 +807,51 @@ def main(argv=None):
             "remove_duplicates_distance_m": REMOVE_DUPLICATES_DISTANCE_M,
             "spatial_subsample_m": SPATIAL_SUBSAMPLE_M,
             "normal_radius_m": NORMAL_RADIUS_M,
+            "normal_max_neighbors": NORMAL_MAX_NEIGHBORS,
             "normal_mst_neighbors": NORMAL_MST_NEIGHBORS,
         },
     }
     save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
 
-    # Stage 3: CloudCompare transform (batched single call)
-    logger.info("Stage 3/4: CloudCompare batched transform...")
-    transformed_paths = cc_transform_and_clean(
-        frames, optimized_poses, output_dir, matrix_dir,
-        skip_per_scan_sor=args.skip_per_scan_sor, crop_bounds=crop_bounds
+    logger.info("Stage 3/4: Open3D full-resolution transform and cleanup...")
+    transformed_paths, transform_stats = transform_and_clean_clouds(
+        [frame.path for frame in frames],
+        optimized_poses,
+        output_dir / "01_transformed",
+        matrix_dir,
+        crop_bounds=crop_bounds,
+        skip_sor=args.skip_per_scan_sor,
+        sor_neighbors=PER_SCAN_SOR_NEIGHBORS,
+        sor_sigma=PER_SCAN_SOR_SIGMA,
+        max_workers=PROCESSING_MAX_WORKERS,
     )
 
-    # Stage 4: CloudCompare merge
-    logger.info("Stage 4/4: CloudCompare merge + final cleanup...")
-    cc_merge_clouds(transformed_paths, merged_cloud_path, log_path)
+    logger.info("Stage 4/4: Open3D/Trimesh merge and final cleanup...")
+    merge_stats = merge_and_finalize_clouds(
+        transformed_paths,
+        merged_cloud_path,
+        pivot=pivot,
+        spatial_subsample_m=SPATIAL_SUBSAMPLE_M,
+        duplicate_distance_m=REMOVE_DUPLICATES_DISTANCE_M,
+        sor_neighbors=FINAL_SOR_NEIGHBORS,
+        sor_sigma=FINAL_SOR_SIGMA,
+        normal_radius_m=NORMAL_RADIUS_M,
+        normal_max_neighbors=NORMAL_MAX_NEIGHBORS,
+        normal_mst_neighbors=NORMAL_MST_NEIGHBORS,
+    )
+    settings["processing"] = {
+        "transformed_frames": transform_stats,
+        "merge": merge_stats,
+    }
+    save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
 
     logger.info("Finished!")
     logger.info("Merged cloud: %s", merged_cloud_path)
     logger.info("Diagnostics: %s", output_dir / "registration_diagnostics.json")
+    logger.info("Processing log: %s", processing_log_path)
+    file_handler.flush()
+    logging.getLogger().removeHandler(file_handler)
+    file_handler.close()
 
 
 if __name__ == "__main__":
