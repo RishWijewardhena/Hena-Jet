@@ -183,6 +183,47 @@ def quantized_unique_indices(points: np.ndarray, *, tolerance_m: float) -> np.nd
     return np.sort(np.asarray(unique, dtype=int))
 
 
+def minimum_distance_sample_indices(
+    points: np.ndarray,
+    *,
+    radius_m: float,
+) -> np.ndarray:
+    """Return a maximal subset separated by at least *radius_m*."""
+    _, trimesh = _geometry_libraries()
+    from scipy.spatial import cKDTree
+
+    points = np.asarray(points, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    if not np.isfinite(points).all():
+        raise ValueError("points must be finite")
+    if radius_m <= 0.0:
+        raise ValueError("radius_m must be positive")
+
+    _, selected_mask = trimesh.points.remove_close(points, radius_m)
+    selected_mask = np.asarray(selected_mask, dtype=bool)
+
+    # Trimesh guarantees separation but intentionally over-culls dense graphs.
+    # Refill with points that are not close to anything already selected until
+    # the set is maximal, preserving the distance guarantee and more detail.
+    while True:
+        remaining = np.flatnonzero(~selected_mask)
+        if len(remaining) == 0:
+            break
+        selected = np.flatnonzero(selected_mask)
+        distances, _ = cKDTree(points[selected]).query(
+            points[remaining],
+            workers=-1,
+        )
+        eligible = remaining[distances >= radius_m]
+        if len(eligible) == 0:
+            break
+        _, refill_mask = trimesh.points.remove_close(points[eligible], radius_m)
+        selected_mask[eligible[np.asarray(refill_mask, dtype=bool)]] = True
+
+    return np.flatnonzero(selected_mask)
+
+
 def _validate_final_artifact(o3d, trimesh, output_path: Path) -> dict:
     cloud = _read_colored_cloud(o3d, output_path)
     points = np.asarray(cloud.points)
@@ -242,6 +283,12 @@ def merge_and_finalize_clouds(
 
     merged = merged.voxel_down_sample(spatial_subsample_m)
     voxel_points = len(merged.points)
+    spatial_indices = minimum_distance_sample_indices(
+        np.asarray(merged.points),
+        radius_m=spatial_subsample_m,
+    )
+    merged = merged.select_by_index(spatial_indices.tolist())
+    spatially_separated_points = len(merged.points)
     unique_indices = quantized_unique_indices(
         np.asarray(merged.points),
         tolerance_m=duplicate_distance_m,
@@ -286,6 +333,7 @@ def merge_and_finalize_clouds(
         "input_clouds": len(transformed_paths),
         "input_points": input_points,
         "voxel_points": voxel_points,
+        "spatially_separated_points": spatially_separated_points,
         "deduplicated_points": deduplicated_points,
         "filtered_points": filtered_points,
         "elapsed_seconds": time.perf_counter() - started,

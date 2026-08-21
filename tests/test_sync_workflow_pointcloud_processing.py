@@ -76,6 +76,24 @@ class TransformAndCleanTests(unittest.TestCase):
 
 
 class MergeAndFinalizeTests(unittest.TestCase):
+    def test_minimum_distance_selection_removes_cross_voxel_neighbors(self):
+        points = np.array([
+            [0.0000, 0.0, 0.0],
+            [0.0008, 0.0, 0.0],
+            [0.0020, 0.0, 0.0],
+        ])
+
+        indices = pointcloud_processing.minimum_distance_sample_indices(
+            points,
+            radius_m=0.001,
+        )
+
+        selected = points[indices]
+        distances = np.linalg.norm(selected[:, None, :] - selected[None, :, :], axis=2)
+        distances[np.diag_indices_from(distances)] = np.inf
+        self.assertEqual(len(selected), 2)
+        self.assertGreaterEqual(distances.min(), 0.001)
+
     def test_quantized_duplicate_selection_keeps_matching_attributes(self):
         points = np.array([
             [0.00001, 0.0, 0.0],
