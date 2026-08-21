@@ -3,6 +3,14 @@ from typing import Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
+DISPARITY_MODE_BY_PIXELS = {
+    128: 1,
+    256: 2,
+}
+DISPARITY_PIXELS_BY_MODE = {
+    mode: pixels for pixels, mode in DISPARITY_MODE_BY_PIXELS.items()
+}
+
 try:
     from pyorbbecsdk import (
         AlignFilter,
@@ -21,6 +29,69 @@ except ImportError:
     # Provide dummy classes for type hinting / offline development
     Pipeline = type('Pipeline', (), {})
     AlignFilter = type('AlignFilter', (), {})
+    OBPropertyID = type(
+        'OBPropertyID',
+        (),
+        {'OB_PROP_DISP_SEARCH_RANGE_MODE_INT': object()},
+    )
+
+
+def configure_disparity_search_range(device, requested_disparity: str | int) -> int:
+    """Configure and verify the SDK disparity search-range mode."""
+    try:
+        requested_pixels = int(requested_disparity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Unsupported disparity search range: {requested_disparity!r}"
+        ) from exc
+
+    if requested_pixels not in DISPARITY_MODE_BY_PIXELS:
+        supported = ", ".join(str(value) for value in DISPARITY_MODE_BY_PIXELS)
+        raise ValueError(
+            f"Unsupported disparity search range: {requested_pixels}. "
+            f"Expected one of: {supported}."
+        )
+
+    property_id = getattr(
+        OBPropertyID,
+        "OB_PROP_DISP_SEARCH_RANGE_MODE_INT",
+        None,
+    )
+    if property_id is None:
+        raise RuntimeError(
+            "The installed Orbbec SDK does not expose "
+            "OB_PROP_DISP_SEARCH_RANGE_MODE_INT."
+        )
+
+    requested_mode = DISPARITY_MODE_BY_PIXELS[requested_pixels]
+    try:
+        current_mode = int(device.get_int_property(property_id))
+        if current_mode != requested_mode:
+            device.set_int_property(property_id, requested_mode)
+        active_mode = int(device.get_int_property(property_id))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not configure the Orbbec disparity search range to "
+            f"{requested_pixels} pixels."
+        ) from exc
+
+    if active_mode != requested_mode:
+        active_description = DISPARITY_PIXELS_BY_MODE.get(
+            active_mode,
+            f"unknown SDK mode {active_mode}",
+        )
+        raise RuntimeError(
+            f"Disparity search-range verification failed: requested "
+            f"{requested_pixels} pixels but the camera reported "
+            f"{active_description}."
+        )
+
+    logger.info(
+        "Verified disparity search range: %d pixels (SDK mode %d)",
+        requested_pixels,
+        active_mode,
+    )
+    return requested_pixels
 
 
 class CameraController:
@@ -37,6 +108,7 @@ class CameraController:
         self.camera_param = None
         self.intrinsics = None
         self.dist_coeffs = None
+        self.active_disparity = None
 
     def __enter__(self):
         self.start()
@@ -55,22 +127,11 @@ class CameraController:
         self.pipeline = Pipeline()
         config = Config()
 
-        # Optional: Attempt to set disparity range if it exists in property ID
         device = self.pipeline.get_device()
-        
-        # Disparity range typically needs the 848x530 resolution for 256 mode.
-        # Check if the device has a property for it
-        try:
-            # We attempt to set disparity if it's available in the SDK
-            # This is a generic approach since the exact property name varies by SDK version.
-            prop_name = "OB_PROP_DISPARITY_SEARCH_RANGE_INT"
-            if hasattr(OBPropertyID, prop_name):
-                prop_id = getattr(OBPropertyID, prop_name)
-                val = 256 if str(self.disparity) == "256" else 128
-                device.set_int_property(prop_id, val)
-                logger.info(f"Set disparity search range to {val}")
-        except Exception as e:
-            logger.warning(f"Could not set disparity property directly: {e}")
+        self.active_disparity = configure_disparity_search_range(
+            device,
+            self.disparity,
+        )
 
         # Setup Color Stream
         color_profiles = self.pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
@@ -140,9 +201,20 @@ class CameraController:
         if not self.pipeline:
             raise RuntimeError("Pipeline is not started.")
 
+        # Flush stale frames from the buffer
+        flushed_count = 0
+        while True:
+            # Use a tiny timeout to quickly pull frames until the queue is empty
+            old_frames = self.pipeline.wait_for_frames(10)
+            if old_frames is None:
+                break
+            flushed_count += 1
+            
+        logger.debug(f"Flushed {flushed_count} stale frames from camera queue.")
+
         frames = self.pipeline.wait_for_frames(timeout_ms)
         if frames is None:
-            logger.warning("Timeout waiting for frames.")
+            logger.warning("Timeout waiting for fresh frames.")
             return None, None
 
         color_frame = frames.get_color_frame()

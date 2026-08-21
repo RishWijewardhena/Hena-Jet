@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""CloudCompare-based point-cloud reconstruction pipeline for sync_workflow.
+"""Open3D/Trimesh point-cloud reconstruction pipeline for sync_workflow.
 
 Adapted from scripts/transform_clouds_pipeline.py.  Operates on per-angle
 PLY files saved by main_scan.py and produces a merged, cleaned point cloud
-and an optional Poisson mesh.
+plus registration diagnostics.
 
 Stages:
   1. Build orbit pose priors from motor angles
-  2. Guarded coarse-to-fine ICP + pose-graph optimization
-  3. CloudCompare: apply optimized transforms, crop, SOR per scan
-  4. CloudCompare: merge all scans, dedup, subsample, orient normals
-  5. Open3D: Poisson surface reconstruction
+  2. Use motor poses, or optional guarded ICP + pose-graph optimization
+  3. Open3D: apply optimized transforms, crop, SOR per scan
+  4. Open3D/Trimesh: merge, dedup, subsample, orient normals, validate
 """
 
 from __future__ import annotations
@@ -20,47 +19,47 @@ import concurrent.futures
 import json
 import logging
 import math
-import os
 import re
-import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from pointcloud_processing import (
+    merge_and_finalize_clouds,
+    transform_and_clean_clouds,
+)
 
-# ---------------------------------------------------------------------------
-# CloudCompare invocation (flatpak)
-# ---------------------------------------------------------------------------
-CLOUDCOMPARE_COMMAND = [
-    "/usr/bin/flatpak",
-    "run",
-    "org.cloudcompare.CloudCompare",
-]
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Default registration settings
 # ---------------------------------------------------------------------------
-REGISTRATION_VOXEL_M = 0.004        # coarse registration cloud (4mm, fast)
-REGISTRATION_FINE_VOXEL_M = 0.001   # fine ICP cloud (1mm, accurate)
+REGISTRATION_VOXEL_M = 0.003        # registration cloud (3mm)
 REGISTRATION_NORMAL_RADIUS_M = 0.006
-ICP_COARSE_DISTANCE_M = 0.008
-ICP_FINE_DISTANCE_M = 0.003
-ICP_ITERATIONS = 60
-ICP_MIN_FITNESS = 0.15
-ICP_MAX_RMSE_M = 0.005
-ICP_MAX_CORRECTION_M = 0.040
-ICP_MAX_CORRECTION_DEG = 10.0
+ICP_COARSE_DISTANCE_M = 0.004
+ICP_FINE_DISTANCE_M = 0.002
+ICP_ITERATIONS = 100
+ICP_MIN_FITNESS = 0.30
+ICP_MAX_RMSE_M = 0.0015
+ICP_MAX_CORRECTION_M = 0.005
+ICP_MAX_CORRECTION_DEG = 2.0
+ICP_MAX_FITNESS_DROP = 0.02
+ICP_MIN_FITNESS_GAIN = 0.01
+ICP_RMSE_IMPROVEMENT_RATIO = 0.98
 ICP_MIN_POINTS = 100
-ORBIT_PRIOR_WEIGHT_ACCEPTED = 50.0   # trust ICP result
-ORBIT_PRIOR_WEIGHT_FALLBACK = 200.0  # trust motor angle more when ICP failed
+ORBIT_PRIOR_WEIGHT_ACCEPTED = 50.0   # retain a strong motor prior beside accepted ICP
+ORBIT_PRIOR_WEIGHT_FALLBACK = 200.0  # strengthen the motor prior when ICP fails
 POSE_GRAPH_EDGE_PRUNE_THRESHOLD = 0.25
 
-# Per-scan cleanup (SOR only used when --skip-per-scan-sor is NOT set)
-PRE_ICP_SOR_NEIGHBORS = 10
-PRE_ICP_SOR_SIGMA = 2.0
+# Registration cleanup
+PRE_ICP_SOR_NEIGHBORS = 20
+PRE_ICP_SOR_SIGMA = 1.5
+
+# Full-resolution per-scan cleanup after pose estimation
+PER_SCAN_SOR_NEIGHBORS = 10
+PER_SCAN_SOR_SIGMA = 2.0
 
 # Final merged-cloud cleanup
 FINAL_SOR_NEIGHBORS = 20
@@ -68,13 +67,9 @@ FINAL_SOR_SIGMA = 1.5
 REMOVE_DUPLICATES_DISTANCE_M = 0.00010
 SPATIAL_SUBSAMPLE_M = 0.001
 NORMAL_RADIUS_M = 0.0040
+NORMAL_MAX_NEIGHBORS = 50
 NORMAL_MST_NEIGHBORS = 12
-
-# Poisson mesh
-POISSON_DEPTH = 8
-POISSON_DENSITY_TRIM_QUANTILE = 0.04
-POISSON_SCALE = 1.1
-
+PROCESSING_MAX_WORKERS = 4
 
 # ===================================================================
 # Data classes
@@ -197,26 +192,6 @@ def points_inside_bounds(
 
 
 # ===================================================================
-# CloudCompare helpers
-# ===================================================================
-
-def cc_file_argument(path: Path) -> str:
-    """Literal-quote a path for CloudCompare SAVE_CLOUDS FILE."""
-    return f'"{path}"'
-
-
-def cc_crop_argument(
-    bounds: tuple[float, float, float, float, float, float],
-) -> str:
-    return ":".join(f"{v:.10g}" for v in bounds)
-
-
-def run_cc_command(command: list[str]) -> None:
-    logger.info("$ %s", " ".join(command))
-    subprocess.run(command, check=True)
-
-
-# ===================================================================
 # File discovery
 # ===================================================================
 
@@ -234,6 +209,33 @@ def find_ply_files(input_dir: Path) -> list[Path]:
     if not files:
         raise RuntimeError(f"No frame_*.ply files found in {input_dir}")
     return sorted(files, key=lambda p: read_angle_from_filename(p.name))
+
+
+def load_scan_metadata(input_dir: Path) -> dict:
+    """Load capture settings when the scan was produced by main_scan.py."""
+    metadata_path = input_dir / "scan_metadata.json"
+    if not metadata_path.is_file():
+        return {}
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Expected a JSON object in {metadata_path}")
+    return metadata
+
+
+def resolve_orbit_radius(cli_radius_m: Optional[float], metadata: dict) -> float:
+    """Resolve and validate the effective camera-to-orbit-center radius."""
+    value = cli_radius_m
+    if value is None:
+        value = metadata.get("orbit_radius_m")
+    if value is None:
+        raise ValueError(
+            "Orbit radius is required. Pass --orbit-radius-m or reconstruct "
+            "a scan containing scan_metadata.json."
+        )
+    radius_m = float(value)
+    if not np.isfinite(radius_m) or radius_m <= 0.0:
+        raise ValueError("Orbit radius must be a finite positive number of metres.")
+    return radius_m
 
 
 def calculate_auto_radius(o3d, ply_files: list[Path]) -> float:
@@ -263,7 +265,12 @@ def calculate_auto_radius(o3d, ply_files: list[Path]) -> float:
         center_pts = finite # fallback if crop is empty
         
     radius = float(np.median(center_pts[:, 2]))
-    logger.info("Auto-calculated orbit radius from %s: %.3fm", target.name, radius)
+    logger.warning(
+        "Estimated visible-surface depth from %s: %.3fm. This is not a "
+        "calibrated optical-center orbit radius.",
+        target.name,
+        radius,
+    )
     return radius
 
 
@@ -313,6 +320,11 @@ def prepare_registration_cloud(o3d, cloud, initial_pose, voxel_size=None, crop_b
     selected_indices = np.flatnonzero(keep)
     selected = cloud.select_by_index(selected_indices.tolist())
     selected = selected.voxel_down_sample(voxel_size)
+    if len(selected.points) > PRE_ICP_SOR_NEIGHBORS:
+        selected, _ = selected.remove_statistical_outlier(
+            nb_neighbors=PRE_ICP_SOR_NEIGHBORS,
+            std_ratio=PRE_ICP_SOR_SIGMA,
+        )
     if len(selected.points) >= 3:
         selected.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(
@@ -327,6 +339,8 @@ def registration_result_is_acceptable(
     *,
     fitness: float,
     rmse_m: float,
+    prior_fitness: float,
+    prior_rmse_m: float,
     prior: np.ndarray,
     candidate: np.ndarray,
 ) -> tuple[bool, str, float, float]:
@@ -341,6 +355,15 @@ def registration_result_is_acceptable(
         return False, "translation correction exceeds prior guard", correction_m, correction_deg
     if correction_deg > ICP_MAX_CORRECTION_DEG:
         return False, "rotation correction exceeds prior guard", correction_m, correction_deg
+    prior_scores_are_finite = (
+        np.isfinite(prior_fitness) and np.isfinite(prior_rmse_m)
+    )
+    if prior_scores_are_finite:
+        fitness_not_worse = fitness >= prior_fitness - ICP_MAX_FITNESS_DROP
+        fitness_improved = fitness >= prior_fitness + ICP_MIN_FITNESS_GAIN
+        rmse_improved = rmse_m <= prior_rmse_m * ICP_RMSE_IMPROVEMENT_RATIO
+        if not fitness_not_worse or not (fitness_improved or rmse_improved):
+            return False, "ICP did not improve the pose prior", correction_m, correction_deg
     return True, "accepted", correction_m, correction_deg
 
 
@@ -390,7 +413,7 @@ def register_pair(o3d, source_id, target_id, kind, frames):
 
     criteria = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=ICP_ITERATIONS)
 
-    # Coarse pass: PointToPoint (no normals needed at 8mm)
+    # Coarse pass: PointToPoint with a narrow search around the motor prior
     coarse = o3d.pipelines.registration.registration_icp(
         source, target, ICP_COARSE_DISTANCE_M, prior,
         o3d.pipelines.registration.TransformationEstimationPointToPoint(),
@@ -407,6 +430,8 @@ def register_pair(o3d, source_id, target_id, kind, frames):
     accepted, reason, correction_m, correction_deg = registration_result_is_acceptable(
         fitness=float(fine.fitness),
         rmse_m=float(fine.inlier_rmse),
+        prior_fitness=prior_fitness,
+        prior_rmse_m=prior_rmse_m,
         prior=prior,
         candidate=candidate,
     )
@@ -522,165 +547,15 @@ def optimize_pose_graph(o3d, graph):
 
 
 # ===================================================================
-# CloudCompare stages
-# ===================================================================
-
-def _transform_single_frame(
-    frame: RegistrationFrame,
-    optimized_pose: np.ndarray,
-    matrix_dir: Path,
-    transformed_dir: Path,
-    skip_per_scan_sor: bool,
-    crop_bounds: Optional[tuple] = None,
-) -> Path:
-    """Transform a single frame via CloudCompare (used by parallel executor)."""
-    matrix_path = matrix_dir / f"{frame.path.stem}_optimized_matrix.txt"
-    output_path = transformed_dir / f"{frame.path.stem}_transformed.ply"
-    np.savetxt(matrix_path, optimized_pose, fmt="%.10f")
-
-    command = [
-        *CLOUDCOMPARE_COMMAND,
-        "-VERBOSITY", "2", "-SILENT", "-AUTO_SAVE", "OFF",
-        "-O", str(frame.path),
-        "-APPLY_TRANS", str(matrix_path),
-    ]
-    if crop_bounds is not None:
-        command.extend(["-CROP", cc_crop_argument(crop_bounds)])
-    if not skip_per_scan_sor:
-        command.extend(["-SOR", str(PRE_ICP_SOR_NEIGHBORS), str(PRE_ICP_SOR_SIGMA)])
-    command.extend([
-        "-C_EXPORT_FMT", "PLY",
-        "-SAVE_CLOUDS", "FILE", cc_file_argument(output_path),
-    ])
-
-    logger.info("Transforming %s (angle=%.2f deg)", frame.path.name, frame.angle_deg)
-    run_cc_command(command)
-    return output_path
-
-
-# Max parallel CC processes (flatpak + Qt overhead is ~750ms each;
-# running 4-6 in parallel hides the cold-start latency)
-CC_MAX_WORKERS = 4
-
-
-def cc_transform_and_clean(
-    frames: list[RegistrationFrame],
-    optimized_poses: list[np.ndarray],
-    output_dir: Path,
-    matrix_dir: Path,
-    skip_per_scan_sor: bool = False,
-    crop_bounds: Optional[tuple] = None,
-) -> list[Path]:
-    """Stage 3: Apply optimized poses via parallel CloudCompare calls."""
-    transformed_dir = output_dir / "01_transformed"
-    transformed_dir.mkdir(parents=True, exist_ok=True)
-    matrix_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Transforming %d clouds (%d parallel CC workers)...",
-                len(frames), CC_MAX_WORKERS)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CC_MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                _transform_single_frame, frame, pose,
-                matrix_dir, transformed_dir, skip_per_scan_sor, crop_bounds
-            ): i
-            for i, (frame, pose) in enumerate(zip(frames, optimized_poses))
-        }
-        results = {}
-        for future in concurrent.futures.as_completed(futures):
-            idx = futures[future]
-            results[idx] = future.result()
-
-    # Return paths in original frame order
-    return [results[i] for i in range(len(frames))]
-
-
-def cc_merge_clouds(
-    transformed_paths: list[Path],
-    merged_cloud_path: Path,
-    log_path: Path,
-) -> None:
-    """Stage 4: Merge all transformed scans, dedup, subsample, orient normals."""
-    command = [
-        *CLOUDCOMPARE_COMMAND,
-        "-VERBOSITY", "2", "-SILENT", "-AUTO_SAVE", "OFF",
-        "-LOG_FILE", str(log_path),
-        "-C_EXPORT_FMT", "PLY",
-        "-O", str(transformed_paths[0]),
-    ]
-
-    for incoming_path in transformed_paths[1:]:
-        command.extend(["-O", str(incoming_path), "-MERGE_CLOUDS"])
-
-    command.extend([
-        # Subsample FIRST to reduce point count from millions to thousands
-        "-SS", "SPATIAL", str(SPATIAL_SUBSAMPLE_M),
-        # Remove duplicates
-        "-RDP", str(REMOVE_DUPLICATES_DISTANCE_M),
-        # Run SOR on the much smaller, subsampled cloud
-        "-SOR", str(FINAL_SOR_NEIGHBORS), str(FINAL_SOR_SIGMA),
-        # Finally, estimate and orient normals
-        "-OCTREE_NORMALS", str(NORMAL_RADIUS_M),
-        "-ORIENT", "PLUS_BARYCENTER",
-        "-ORIENT_NORMS_MST", str(NORMAL_MST_NEIGHBORS),
-        "-SAVE_CLOUDS", "FILE", cc_file_argument(merged_cloud_path),
-    ])
-
-    logger.info("Merging %d clouds...", len(transformed_paths))
-    run_cc_command(command)
-
-
-def create_poisson_mesh(merged_cloud_path: Path, mesh_path: Path) -> None:
-    """Stage 5: Poisson surface reconstruction via Open3D."""
-    import open3d as o3d
-
-    cloud = o3d.io.read_point_cloud(str(merged_cloud_path))
-    if cloud.is_empty():
-        raise RuntimeError(f"Open3D could not read points from {merged_cloud_path}")
-
-    cloud.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=NORMAL_RADIUS_M, max_nn=50,
-        )
-    )
-    cloud.orient_normals_consistent_tangent_plane(NORMAL_MST_NEIGHBORS)
-
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        cloud, depth=POISSON_DEPTH, scale=POISSON_SCALE, linear_fit=False,
-    )
-
-    densities_array = np.asarray(densities)
-    if densities_array.size > 0 and POISSON_DENSITY_TRIM_QUANTILE > 0.0:
-        threshold = np.quantile(densities_array, POISSON_DENSITY_TRIM_QUANTILE)
-        mesh.remove_vertices_by_mask(densities_array < threshold)
-
-    mesh = mesh.crop(cloud.get_axis_aligned_bounding_box())
-    mesh.remove_degenerate_triangles()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_duplicated_vertices()
-    mesh.remove_non_manifold_edges()
-    mesh.compute_vertex_normals()
-
-    if not o3d.io.write_triangle_mesh(str(mesh_path), mesh,
-                                       write_ascii=False, compressed=False,
-                                       write_vertex_normals=True,
-                                       write_vertex_colors=True):
-        raise RuntimeError(f"Failed to save mesh to {mesh_path}")
-    logger.info("Saved Poisson mesh to %s (%d vertices)", mesh_path, len(mesh.vertices))
-
-
-# ===================================================================
 # Diagnostics
 # ===================================================================
 
-def save_diagnostics(
-    output_dir: Path,
+def build_diagnostics(
     frames: list[RegistrationFrame],
-    orbit_axis: np.ndarray,
     optimized_poses: list[np.ndarray],
     edges: list[RegistrationEdge],
-) -> None:
+    settings: dict,
+) -> dict:
     edge_dicts = []
     for edge in edges:
         edge_dicts.append({
@@ -694,11 +569,21 @@ def save_diagnostics(
             "correction_m": edge.correction_m,
             "correction_deg": edge.correction_deg,
             "usable": edge.accepted or edge.usable,
+            "prior_fitness": (
+                edge.prior_fitness if np.isfinite(edge.prior_fitness) else None
+            ),
+            "prior_rmse_m": (
+                edge.prior_rmse_m if np.isfinite(edge.prior_rmse_m) else None
+            ),
         })
 
     corrections = []
     for frame, opt_pose in zip(frames, optimized_poses):
         corr_m, corr_deg = transform_delta(frame.prior_pose, opt_pose)
+        if corr_m < 1e-12:
+            corr_m = 0.0
+        if corr_deg < 1e-9:
+            corr_deg = 0.0
         corrections.append({
             "filename": frame.path.name,
             "angle_deg": frame.angle_deg,
@@ -706,12 +591,22 @@ def save_diagnostics(
             "rotation_deg": corr_deg,
         })
 
-    diagnostics = {
+    return {
         "capture_count": len(frames),
-        "orbit_axis": orbit_axis.tolist(),
+        "settings": settings,
         "edges": edge_dicts,
         "optimized_pose_corrections": corrections,
     }
+
+
+def save_diagnostics(
+    output_dir: Path,
+    frames: list[RegistrationFrame],
+    optimized_poses: list[np.ndarray],
+    edges: list[RegistrationEdge],
+    settings: dict,
+) -> None:
+    diagnostics = build_diagnostics(frames, optimized_poses, edges, settings)
 
     diag_path = output_dir / "registration_diagnostics.json"
     diag_path.write_text(
@@ -727,18 +622,26 @@ def save_diagnostics(
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Reconstruct a merged point cloud and mesh from per-angle PLY captures."
+        description="Reconstruct a merged point cloud from per-angle PLY captures."
     )
     parser.add_argument("--input-dir", type=Path, required=True,
                         help="Directory containing frame_*.ply files (e.g. outputs/debug)")
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="Reconstruction output directory (default: <input-dir>/reconstruction)")
+    parser.add_argument(
+        "--registration-mode",
+        choices=("motor", "guarded-icp"),
+        default="motor",
+        help="Use deterministic motor poses or guarded ICP residual refinement (default: motor)",
+    )
     parser.add_argument("--auto-radius", action="store_true",
-                        help="Automatically calculate orbit-radius from the center of the first frame")
-    parser.add_argument("--orbit-radius-m", type=float, default=0.12,
-                        help="Camera orbit radius in metres (ignored if --auto-radius is used)")
-    parser.add_argument("--orbit-axis", type=float, nargs=3, default=[0.0, 1.0, 0.0],
-                        help="Orbit axis as X Y Z (default: 0 1 0 = Y-axis)")
+                        help="Estimate center-surface depth from the first frame (rough fallback; "
+                             "not a physical orbit-radius calibration)")
+    parser.add_argument("--orbit-radius-m", type=float, default=None,
+                        help="Camera orbit radius in metres; defaults to scan_metadata.json "
+                             "(ignored if --auto-radius is used)")
+    parser.add_argument("--orbit-axis", type=float, nargs=3, default=None,
+                        help="Orbit axis as X Y Z; defaults to scan metadata or 1 0 0")
     parser.add_argument("--pivot", type=float, nargs=3, default=None,
                         help="Pivot point in camera coords as X Y Z metres "
                              "(default: [0, 0, orbit-radius-m] = object centre in front of camera)")
@@ -746,10 +649,10 @@ def parse_args(argv=None):
                         help="Angle of the reference frame (default: 0)")
     parser.add_argument("--angle-sign", type=float, default=1.0,
                         help="Sign convention for angle direction (1.0 or -1.0)")
-    parser.add_argument("--crop-radius-m", type=float, default=0.3,
-                        help="Keep only points within this radius of the pivot (default: 0.3m = 30cm)")
-    parser.add_argument("--no-mesh", action="store_true",
-                        help="Skip Poisson mesh reconstruction")
+    parser.add_argument("--crop-radius-m", type=float, default=None,
+                        help="Half-extent of the object crop cube around the pivot "
+                             "(defaults to scan metadata or 0.15m; set <= 0 to disable)")
+
     parser.add_argument("--skip-per-scan-sor", action="store_true",
                         help="Skip per-scan SOR (much faster; final SOR still runs)")
     return parser.parse_args(argv)
@@ -765,36 +668,50 @@ def main(argv=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     matrix_dir = output_dir / "matrices"
     matrix_dir.mkdir(parents=True, exist_ok=True)
+    processing_log_path = output_dir / "processing.log"
+    file_handler = logging.FileHandler(processing_log_path, mode="w", encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    logging.getLogger().addHandler(file_handler)
 
-    import open3d as o3d
-    
     ply_files = find_ply_files(input_dir)
     logger.info("Found %d PLY files in %s", len(ply_files), input_dir)
+    scan_metadata = load_scan_metadata(input_dir)
 
-    orbit_axis = normalized_vector(np.array(args.orbit_axis), name="orbit-axis")
-    
+    orbit_axis_values = args.orbit_axis or scan_metadata.get(
+        "orbit_axis", [1.0, 0.0, 0.0]
+    )
+    orbit_axis = normalized_vector(np.array(orbit_axis_values), name="orbit-axis")
+
     if args.auto_radius:
+        import open3d as o3d
+
         orbit_radius_m = calculate_auto_radius(o3d, ply_files)
     else:
-        orbit_radius_m = args.orbit_radius_m
+        orbit_radius_m = resolve_orbit_radius(args.orbit_radius_m, scan_metadata)
 
     # Pivot = where the hand/object sits in camera space at angle=0.
     # Camera is on the ring, Z+ axis points inward at the object.
     # Object is at [0, 0, orbit_radius_m] in camera coordinates.
     pivot = np.array(args.pivot) if args.pivot else np.array([0.0, 0.0, orbit_radius_m])
 
-    r = args.crop_radius_m
+    reconstruction_metadata = scan_metadata.get("reconstruction", {})
+    if not isinstance(reconstruction_metadata, dict):
+        reconstruction_metadata = {}
+    crop_radius_m = args.crop_radius_m
+    if crop_radius_m is None:
+        crop_radius_m = float(reconstruction_metadata.get("crop_radius_m", 0.15))
+
+    r = crop_radius_m
     crop_bounds = (pivot[0] - r, pivot[1] - r, pivot[2] - r,
                    pivot[0] + r, pivot[1] + r, pivot[2] + r) if r > 0 else None
 
 
     merged_cloud_path = output_dir / "merged_cloud.ply"
-    mesh_path = output_dir / "poisson_mesh.ply"
-    log_path = output_dir / "cloudcompare.log"
 
     # Stage 1: Discover files and build orbit poses
-    logger.info("Stage 1/5: Discovering PLY files and building orbit poses...")
-    ply_files = find_ply_files(input_dir)
+    logger.info("Stage 1/4: Discovering PLY files and building orbit poses...")
     logger.info("Found %d point clouds.", len(ply_files))
     logger.info("Orbit radius: %.4f m, axis: %s, pivot: %s", orbit_radius_m, orbit_axis, pivot)
 
@@ -804,29 +721,44 @@ def main(argv=None):
         angle_sign=args.angle_sign,
     )
 
-    # Stage 2: Guarded ICP + Pose Graph
-    logger.info("Stage 2/5: Guarded ICP and pose-graph optimization...")
-    import open3d as o3d
-
-    frames = []
-    for i, (path, prior) in enumerate(zip(ply_files, priors), start=1):
-        cloud = o3d.io.read_point_cloud(str(path))
-        if cloud.is_empty():
-            raise RuntimeError(f"Open3D could not read points from {path}")
-        # Coarse cloud (4mm) used for ICP, cropped to ignore the room
-        reg_cloud = prepare_registration_cloud(
-            o3d, cloud, prior, voxel_size=REGISTRATION_VOXEL_M, crop_bounds=crop_bounds
-        )
-        frames.append(RegistrationFrame(
+    frames = [
+        RegistrationFrame(
             path=path,
             angle_deg=read_angle_from_filename(path.name),
             prior_pose=prior,
-            cloud=reg_cloud,
-        ))
-        logger.info("Loaded %d/%d %s: %d registration points", i, len(ply_files), path.name, len(reg_cloud.points))
+        )
+        for path, prior in zip(ply_files, priors)
+    ]
 
-    graph, edges = build_pose_graph(o3d, frames)
-    optimized_poses = optimize_pose_graph(o3d, graph)
+    if args.registration_mode == "motor":
+        logger.info("Stage 2/4: Using deterministic motor poses (ICP disabled).")
+        optimized_poses = [prior.copy() for prior in priors]
+        edges = []
+    else:
+        logger.info("Stage 2/4: Guarded ICP and pose-graph optimization...")
+        import open3d as o3d
+
+        for i, frame in enumerate(frames, start=1):
+            cloud = o3d.io.read_point_cloud(str(frame.path))
+            if cloud.is_empty():
+                raise RuntimeError(f"Open3D could not read points from {frame.path}")
+            frame.cloud = prepare_registration_cloud(
+                o3d,
+                cloud,
+                frame.prior_pose,
+                voxel_size=REGISTRATION_VOXEL_M,
+                crop_bounds=crop_bounds,
+            )
+            logger.info(
+                "Loaded %d/%d %s: %d registration points",
+                i,
+                len(frames),
+                frame.path.name,
+                len(frame.cloud.points),
+            )
+
+        graph, edges = build_pose_graph(o3d, frames)
+        optimized_poses = optimize_pose_graph(o3d, graph)
 
     # Save pose matrices
     np.save(output_dir / "optimized_poses.npy", np.stack(optimized_poses))
@@ -834,31 +766,92 @@ def main(argv=None):
         np.savetxt(matrix_dir / f"{frame.path.stem}_prior.txt", frame.prior_pose, fmt="%.10f")
         np.savetxt(matrix_dir / f"{frame.path.stem}_optimized.txt", opt_pose, fmt="%.10f")
 
-    save_diagnostics(output_dir, frames, orbit_axis, optimized_poses, edges)
+    settings = {
+        "processing_backend": "open3d+trimesh",
+        "registration_mode": args.registration_mode,
+        "orbit_radius_m": orbit_radius_m,
+        "orbit_radius_source": "auto" if args.auto_radius else (
+            "cli" if args.orbit_radius_m is not None else "scan_metadata"
+        ),
+        "orbit_axis": orbit_axis.tolist(),
+        "pivot": pivot.tolist(),
+        "reference_angle_deg": args.reference_angle_deg,
+        "angle_sign": args.angle_sign,
+        "crop_radius_m": crop_radius_m,
+        "per_scan_sor_enabled": not args.skip_per_scan_sor,
+        "registration_parameters": {
+            "voxel_m": REGISTRATION_VOXEL_M,
+            "normal_radius_m": REGISTRATION_NORMAL_RADIUS_M,
+            "coarse_distance_m": ICP_COARSE_DISTANCE_M,
+            "fine_distance_m": ICP_FINE_DISTANCE_M,
+            "iterations": ICP_ITERATIONS,
+            "min_fitness": ICP_MIN_FITNESS,
+            "max_rmse_m": ICP_MAX_RMSE_M,
+            "max_correction_m": ICP_MAX_CORRECTION_M,
+            "max_correction_deg": ICP_MAX_CORRECTION_DEG,
+            "max_fitness_drop": ICP_MAX_FITNESS_DROP,
+            "min_fitness_gain": ICP_MIN_FITNESS_GAIN,
+            "rmse_improvement_ratio": ICP_RMSE_IMPROVEMENT_RATIO,
+            "min_points": ICP_MIN_POINTS,
+            "pre_icp_sor_neighbors": PRE_ICP_SOR_NEIGHBORS,
+            "pre_icp_sor_sigma": PRE_ICP_SOR_SIGMA,
+            "orbit_prior_weight_accepted": ORBIT_PRIOR_WEIGHT_ACCEPTED,
+            "orbit_prior_weight_fallback": ORBIT_PRIOR_WEIGHT_FALLBACK,
+            "pose_graph_edge_prune_threshold": POSE_GRAPH_EDGE_PRUNE_THRESHOLD,
+        },
+        "cleanup_parameters": {
+            "per_scan_sor_neighbors": PER_SCAN_SOR_NEIGHBORS,
+            "per_scan_sor_sigma": PER_SCAN_SOR_SIGMA,
+            "final_sor_neighbors": FINAL_SOR_NEIGHBORS,
+            "final_sor_sigma": FINAL_SOR_SIGMA,
+            "remove_duplicates_distance_m": REMOVE_DUPLICATES_DISTANCE_M,
+            "spatial_subsample_m": SPATIAL_SUBSAMPLE_M,
+            "normal_radius_m": NORMAL_RADIUS_M,
+            "normal_max_neighbors": NORMAL_MAX_NEIGHBORS,
+            "normal_mst_neighbors": NORMAL_MST_NEIGHBORS,
+        },
+    }
+    save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
 
-    # Stage 3: CloudCompare transform (batched single call)
-    logger.info("Stage 3/5: CloudCompare batched transform...")
-    transformed_paths = cc_transform_and_clean(
-        frames, optimized_poses, output_dir, matrix_dir,
-        skip_per_scan_sor=args.skip_per_scan_sor, crop_bounds=crop_bounds
+    logger.info("Stage 3/4: Open3D full-resolution transform and cleanup...")
+    transformed_paths, transform_stats = transform_and_clean_clouds(
+        [frame.path for frame in frames],
+        optimized_poses,
+        output_dir / "01_transformed",
+        matrix_dir,
+        crop_bounds=crop_bounds,
+        skip_sor=args.skip_per_scan_sor,
+        sor_neighbors=PER_SCAN_SOR_NEIGHBORS,
+        sor_sigma=PER_SCAN_SOR_SIGMA,
+        max_workers=PROCESSING_MAX_WORKERS,
     )
 
-    # Stage 4: CloudCompare merge
-    logger.info("Stage 4/5: CloudCompare merge + final cleanup...")
-    cc_merge_clouds(transformed_paths, merged_cloud_path, log_path)
-
-    # Stage 5: Poisson mesh
-    if not args.no_mesh:
-        logger.info("Stage 5/5: Poisson surface reconstruction...")
-        create_poisson_mesh(merged_cloud_path, mesh_path)
-    else:
-        logger.info("Stage 5/5: Skipped (--no-mesh).")
+    logger.info("Stage 4/4: Open3D/Trimesh merge and final cleanup...")
+    merge_stats = merge_and_finalize_clouds(
+        transformed_paths,
+        merged_cloud_path,
+        pivot=pivot,
+        spatial_subsample_m=SPATIAL_SUBSAMPLE_M,
+        duplicate_distance_m=REMOVE_DUPLICATES_DISTANCE_M,
+        sor_neighbors=FINAL_SOR_NEIGHBORS,
+        sor_sigma=FINAL_SOR_SIGMA,
+        normal_radius_m=NORMAL_RADIUS_M,
+        normal_max_neighbors=NORMAL_MAX_NEIGHBORS,
+        normal_mst_neighbors=NORMAL_MST_NEIGHBORS,
+    )
+    settings["processing"] = {
+        "transformed_frames": transform_stats,
+        "merge": merge_stats,
+    }
+    save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
 
     logger.info("Finished!")
     logger.info("Merged cloud: %s", merged_cloud_path)
-    if not args.no_mesh:
-        logger.info("Poisson mesh: %s", mesh_path)
     logger.info("Diagnostics: %s", output_dir / "registration_diagnostics.json")
+    logger.info("Processing log: %s", processing_log_path)
+    file_handler.flush()
+    logging.getLogger().removeHandler(file_handler)
+    file_handler.close()
 
 
 if __name__ == "__main__":
