@@ -127,6 +127,9 @@ def transform_and_clean_clouds(
     matrix_dir: Path,
     *,
     crop_bounds: Optional[tuple[float, float, float, float, float, float]],
+    crop_bounds_by_cloud: Optional[
+        Sequence[Optional[tuple[float, float, float, float, float, float]]]
+    ] = None,
     skip_sor: bool,
     sor_neighbors: int,
     sor_sigma: float,
@@ -135,6 +138,8 @@ def transform_and_clean_clouds(
     """Transform, crop, filter, and save full-resolution scans."""
     if len(source_paths) != len(transforms):
         raise ValueError("source_paths and transforms must have the same length")
+    if crop_bounds_by_cloud is not None and len(crop_bounds_by_cloud) != len(source_paths):
+        raise ValueError("crop_bounds_by_cloud must match source_paths length")
     if not source_paths:
         raise ValueError("At least one source point cloud is required")
     if sor_neighbors < 1 or sor_sigma <= 0.0:
@@ -143,6 +148,11 @@ def transform_and_clean_clouds(
     transformed_dir.mkdir(parents=True, exist_ok=True)
     matrix_dir.mkdir(parents=True, exist_ok=True)
     worker_count = max(1, min(int(max_workers), len(source_paths)))
+    effective_crop_bounds = (
+        list(crop_bounds_by_cloud)
+        if crop_bounds_by_cloud is not None
+        else [crop_bounds] * len(source_paths)
+    )
 
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -153,7 +163,7 @@ def transform_and_clean_clouds(
                 transform,
                 transformed_dir,
                 matrix_dir,
-                crop_bounds=crop_bounds,
+                crop_bounds=effective_crop_bounds[index],
                 skip_sor=skip_sor,
                 sor_neighbors=sor_neighbors,
                 sor_sigma=sor_sigma,

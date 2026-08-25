@@ -83,6 +83,44 @@ class DepthFusionTests(unittest.TestCase):
 
 
 class ScanMetadataTests(unittest.TestCase):
+    def test_x_positions_default_to_the_existing_single_station(self):
+        args = main_scan.parse_args([])
+
+        self.assertEqual(args.x_positions_mm, [200.0])
+
+    def test_two_station_sequence_captures_a_full_orbit_at_each_x_position(self):
+        sequence = main_scan.generate_scan_sequence(10.0, [200.0, 280.0])
+
+        captures = [step for step in sequence if step["capture"]]
+        self.assertEqual(len(captures), 74)
+        self.assertEqual(
+            {step["station_index"] for step in captures},
+            {0, 1},
+        )
+        self.assertEqual(
+            sum(step["station_index"] == 0 for step in captures),
+            37,
+        )
+        self.assertEqual(
+            sum(step["station_index"] == 1 for step in captures),
+            37,
+        )
+
+        current_y = 0.0
+        for step in sequence:
+            if step["kind"] == "move_x":
+                self.assertEqual(current_y, 0.0)
+            else:
+                current_y = step["angle_deg"]
+
+    def test_station_filename_keeps_same_angle_captures_unique(self):
+        first = main_scan.capture_filename(0, 200.0, 0.0)
+        second = main_scan.capture_filename(1, 280.0, 0.0)
+
+        self.assertEqual(first, "frame_s00_x200.0_y+000.0.ply")
+        self.assertEqual(second, "frame_s01_x280.0_y+000.0.ply")
+        self.assertNotEqual(first, second)
+
     def test_records_geometry_and_depth_capture_settings(self):
         args = main_scan.parse_args(
             [
@@ -103,13 +141,25 @@ class ScanMetadataTests(unittest.TestCase):
             args,
             active_disparity=256,
             captured_angles=[0.0, 10.0],
+            captures=[
+                {
+                    "filename": "frame_s00_x200.0_y+000.0.ply",
+                    "station_index": 0,
+                    "x_position_mm": 200.0,
+                    "x_offset_m": 0.0,
+                    "angle_deg": 0.0,
+                }
+            ],
         )
 
+        self.assertEqual(metadata["schema_version"], 2)
         self.assertEqual(metadata["orbit_radius_m"], 0.1175)
         self.assertEqual(metadata["orbit_axis"], [1.0, 0.0, 0.0])
         self.assertEqual(metadata["capture"]["frames_per_angle"], 5)
         self.assertEqual(metadata["capture"]["depth_range_m"], [0.05, 0.3])
         self.assertEqual(metadata["captured_angles_deg"], [0.0, 10.0])
+        self.assertEqual(metadata["x_stage"]["positions_mm"], [200.0])
+        self.assertEqual(metadata["captures"][0]["x_offset_m"], 0.0)
 
 
 class RadiusCalibrationCaptureTests(unittest.TestCase):

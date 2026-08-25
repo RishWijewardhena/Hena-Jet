@@ -35,6 +35,13 @@ def parse_args(argv=None):
     parser.add_argument("--radius-m", type=float, default=None,
                         help="Radius from camera optical center to orbit center in metres "
                              "(required with --reconstruct)")
+    parser.add_argument(
+        "--x-positions-mm",
+        type=float,
+        nargs="+",
+        default=[200.0],
+        help="Absolute X stations to scan in millimetres (default: 200)",
+    )
     parser.add_argument("--orbit-axis", type=float, nargs=3, default=[1.0, 0.0, 0.0],
                         help="Orbit axis in camera coordinates (default: 1 0 0)")
     parser.add_argument("--registration-mode", choices=("motor", "guarded-icp"),
@@ -73,6 +80,43 @@ def generate_angle_sequence(step_deg):
         sequence.append({"angle": ang, "capture": True})
 
     return sequence
+
+
+def generate_scan_sequence(step_deg, x_positions_mm):
+    """Build safe absolute-X moves and one complete orbit per X station."""
+    sequence = []
+    for station_index, x_position_mm in enumerate(x_positions_mm):
+        sequence.append({
+            "kind": "move_x",
+            "capture": False,
+            "station_index": station_index,
+            "x_position_mm": float(x_position_mm),
+        })
+        for angle_step in generate_angle_sequence(step_deg):
+            sequence.append({
+                "kind": "move_y",
+                "capture": angle_step["capture"],
+                "station_index": station_index,
+                "x_position_mm": float(x_position_mm),
+                "angle_deg": float(angle_step["angle"]),
+            })
+        # Always put Y at zero before the next absolute X move.
+        sequence.append({
+            "kind": "move_y",
+            "capture": False,
+            "station_index": station_index,
+            "x_position_mm": float(x_position_mm),
+            "angle_deg": 0.0,
+        })
+    return sequence
+
+
+def capture_filename(station_index, x_position_mm, angle_deg):
+    """Return a unique, sortable filename for one station/angle capture."""
+    return (
+        f"frame_s{station_index:02d}_x{x_position_mm:.1f}_"
+        f"y{angle_deg:+06.1f}.ply"
+    )
 
 
 def color_frame_to_rgb(color_frame):
@@ -147,10 +191,10 @@ def capture_fused_rgbd(
     return latest_color, fused_depth, len(depth_frames)
 
 
-def build_scan_metadata(args, *, active_disparity, captured_angles):
+def build_scan_metadata(args, *, active_disparity, captured_angles, captures=None):
     """Create the portable capture contract consumed by reconstruction."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "orbit_radius_m": args.radius_m,
         "orbit_axis": [float(value) for value in args.orbit_axis],
         "step_deg": float(args.step_deg),
@@ -166,7 +210,13 @@ def build_scan_metadata(args, *, active_disparity, captured_angles):
         "reconstruction": {
             "crop_radius_m": float(args.crop_radius_m),
         },
+        "x_stage": {
+            "positions_mm": [float(value) for value in args.x_positions_mm],
+            "reference_position_mm": float(args.x_positions_mm[0]),
+            "positive_direction": "+orbit_axis",
+        },
         "captured_angles_deg": [float(value) for value in captured_angles],
+        "captures": list(captures or []),
     }
 
 
@@ -178,6 +228,7 @@ def save_frame_as_ply(
     output_dir,
     *,
     depth_trunc_m=3.0,
+    filename=None,
 ):
     """Create a colored point cloud from RGBD and save as PLY."""
     import open3d as o3d
@@ -203,7 +254,7 @@ def save_frame_as_ply(
 
     pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic_o3d)
 
-    out_path = output_dir / f"frame_{angle_deg:.1f}.ply"
+    out_path = output_dir / (filename or f"frame_{angle_deg:.1f}.ply")
     o3d.io.write_point_cloud(str(out_path), pcd)
     logger.info("Saved %d points -> %s", len(pcd.points), out_path.name)
     return out_path
@@ -218,23 +269,37 @@ def main():
         raise ValueError("Depth range must satisfy 0 <= min < max.")
     if args.radius_m is not None and args.radius_m <= 0.0:
         raise ValueError("--radius-m must be positive.")
+    if not args.x_positions_mm or not all(np.isfinite(args.x_positions_mm)):
+        raise ValueError("--x-positions-mm must contain finite positions.")
+    if len(set(args.x_positions_mm)) != len(args.x_positions_mm):
+        raise ValueError("--x-positions-mm must not contain duplicates.")
+    if len({f"{value:.1f}" for value in args.x_positions_mm}) != len(args.x_positions_mm):
+        raise ValueError("--x-positions-mm must be unique at 0.1 mm precision.")
     if args.reconstruct and args.radius_m is None:
         raise ValueError("--radius-m is required when --reconstruct is enabled.")
 
     # Ensure output dir exists
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    angle_sequence = generate_angle_sequence(args.step_deg)
+    scan_sequence = generate_scan_sequence(args.step_deg, args.x_positions_mm)
 
     if args.dry_run:
         logger.info("[DRY RUN] Would home motors here.")
-        for step in angle_sequence:
-            angle = step["angle"]
+        logger.info("[DRY RUN] Would select absolute positioning with G90.")
+        for step in scan_sequence:
+            if step["kind"] == "move_x":
+                logger.info(
+                    "[DRY RUN] Would move X to %.1f mm at Y=0.",
+                    step["x_position_mm"],
+                )
+                continue
+            angle = step["angle_deg"]
             logger.info("[DRY RUN] Would move Y to %.1f degrees.", angle)
             if step["capture"]:
-                logger.info("[DRY RUN] Would capture frame at %.1f degrees.", angle)
-            else:
-                logger.info("[DRY RUN] Would return without capturing.")
+                logger.info(
+                    "[DRY RUN] Would capture station %d at X=%.1f, Y=%.1f.",
+                    step["station_index"], step["x_position_mm"], angle,
+                )
         logger.info("[DRY RUN] Sequence complete.")
         return
 
@@ -242,6 +307,7 @@ def main():
 
     saved_files = []
     captured_angles = []
+    capture_manifest = []
     metadata_path = args.output_dir / "scan_metadata.json"
 
     with MotorController(port=args.port, baud=args.baud) as motor, \
@@ -249,6 +315,8 @@ def main():
 
         if not args.no_home:
             motor.home_all()
+        if not motor.send_command("G90"):
+            raise RuntimeError("Failed to select absolute motor positioning.")
 
         # Save intrinsics once
         if camera.intrinsics:
@@ -264,6 +332,7 @@ def main():
                     args,
                     active_disparity=camera.active_disparity,
                     captured_angles=captured_angles,
+                    captures=capture_manifest,
                 ),
                 indent=2,
             ) + "\n",
@@ -271,10 +340,19 @@ def main():
         )
         logger.info("Saved scan settings to %s", metadata_path)
 
-        logger.info("Starting scan with %d steps.", len(angle_sequence))
+        logger.info("Starting scan with %d motion steps.", len(scan_sequence))
 
-        for step in angle_sequence:
-            angle = step["angle"]
+        for step in scan_sequence:
+            if step["kind"] == "move_x":
+                logger.info(
+                    "Moving to station %d at X=%.1f mm...",
+                    step["station_index"], step["x_position_mm"],
+                )
+                motor.move_x(step["x_position_mm"], feedrate=500)
+                time.sleep(0.5)
+                continue
+
+            angle = step["angle_deg"]
             should_capture = step["capture"]
 
             logger.info("Moving Y to %.1f degrees...", angle)
@@ -310,15 +388,30 @@ def main():
                         angle,
                         args.output_dir,
                         depth_trunc_m=args.depth_max_m,
+                        filename=capture_filename(
+                            step["station_index"],
+                            step["x_position_mm"],
+                            angle,
+                        ),
                     )
                     saved_files.append(ply_path)
                     captured_angles.append(float(angle))
+                    capture_manifest.append({
+                        "filename": ply_path.name,
+                        "station_index": int(step["station_index"]),
+                        "x_position_mm": float(step["x_position_mm"]),
+                        "x_offset_m": float(
+                            (step["x_position_mm"] - args.x_positions_mm[0]) / 1000.0
+                        ),
+                        "angle_deg": float(angle),
+                    })
                     metadata_path.write_text(
                         json.dumps(
                             build_scan_metadata(
                                 args,
                                 active_disparity=camera.active_disparity,
                                 captured_angles=captured_angles,
+                                captures=capture_manifest,
                             ),
                             indent=2,
                         ) + "\n",

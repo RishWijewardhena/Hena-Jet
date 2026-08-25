@@ -26,6 +26,41 @@ def write_cloud(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
 
 
 class TransformAndCleanTests(unittest.TestCase):
+    def test_uses_a_different_crop_center_for_each_station(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            first = root / "frame_station_0.ply"
+            second = root / "frame_station_1.ply"
+            points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+            colors = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+            write_cloud(first, points, colors)
+            write_cloud(second, points, colors)
+
+            paths, _ = pointcloud_processing.transform_and_clean_clouds(
+                [first, second],
+                [np.eye(4), np.eye(4)],
+                root / "transformed",
+                root / "matrices",
+                crop_bounds=None,
+                crop_bounds_by_cloud=[
+                    (-0.1, -0.1, -0.1, 0.1, 0.1, 0.1),
+                    (0.9, -0.1, -0.1, 1.1, 0.1, 0.1),
+                ],
+                skip_sor=True,
+                sor_neighbors=10,
+                sor_sigma=2.0,
+                max_workers=1,
+            )
+
+            np.testing.assert_allclose(
+                np.asarray(o3d.io.read_point_cloud(str(paths[0])).points),
+                [[0.0, 0.0, 0.0]],
+            )
+            np.testing.assert_allclose(
+                np.asarray(o3d.io.read_point_cloud(str(paths[1])).points),
+                [[1.0, 0.0, 0.0]],
+            )
+
     def test_transforms_crops_and_preserves_colors_and_matrix_outputs(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)

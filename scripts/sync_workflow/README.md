@@ -14,13 +14,13 @@ main_scan.py arguments
         +-- fresh aligned RGB-D frame bursts
         +-- valid-depth median fusion
         v
-frame_<angle>.ply + intrinsics.json + scan_metadata.json
+frame_<station>_<x>_<angle>.ply + intrinsics.json + scan_metadata.json
         |
         v
 reconstruct_pipeline.py
         |
         +-- resolve radius, orbit axis, and crop settings
-        +-- calculate a motor pose prior for every angle
+        +-- calculate a motor pose prior for every X station and angle
         +-- use priors directly or cautiously refine them with ICP
         +-- transform and crop full-resolution scans in Open3D
         +-- merge, subsample, remove noise, and estimate normals
@@ -101,7 +101,7 @@ Unless `--no-home` is used, the motor performs this sequence:
 6. Move Y to its staging position with `G1 Y40 F500`.
 7. Move to the final scan staging position with `G1 X200 Y0 F500`.
 
-For every scan-angle movement, `move_y()` sends the absolute `G1 Y...` command followed by `M400`. `main_scan.py` then waits 0.5 seconds before capture.
+After homing, `main_scan.py` sends `G90` to explicitly select absolute positioning. It moves to each requested X station only while Y is at zero. Every `move_x()` and `move_y()` command is followed by `M400`, and the program waits 0.5 seconds after movement before capture.
 
 For a 10-degree step, capture order is:
 
@@ -112,6 +112,10 @@ reset to 0 without capturing
 ```
 
 The origin is captured once and the reset does not produce a duplicate frame.
+
+By default, this orbit runs once at X200. The opt-in command `--x-positions-mm 200 280` runs the complete orbit at X200, returns Y to zero, moves to X280, and repeats the complete orbit. With a 10-degree step this produces 37 captures per station, or 74 captures total.
+
+X positions are absolute Marlin millimetres. Reconstruction treats the first position as the reference and converts later differences to metres along the positive configured orbit axis. Therefore, X200 to X280 adds `[0.080, 0, 0]` metres when the default orbit axis is `[1, 0, 0]`. Calibrate this direction before relying on multi-station fusion if the physical X stage is not parallel to that camera-coordinate axis.
 
 ### 4. Capture and fuse an RGB-D burst
 
@@ -132,7 +136,7 @@ Open3D projects the fused RGB-D image through the camera intrinsics and writes o
 
 The program writes:
 
-- `frame_<angle>.ply`: the colored cloud at one motor position;
+- `frame_s<station>_x<position>_y<angle>.ply`: a unique colored cloud at one X/Y motor position;
 - `intrinsics.json`: camera projection parameters;
 - `scan_metadata.json`: scan geometry, capture settings, and completed angles.
 
@@ -140,7 +144,7 @@ Metadata is updated during scanning, so completed angles remain recorded if a la
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "orbit_radius_m": 0.1175,
   "orbit_axis": [1.0, 0.0, 0.0],
   "step_deg": 10.0,
@@ -154,11 +158,25 @@ Metadata is updated during scanning, so completed angles remain recorded if a la
     "depth_range_m": [0.02, 0.35]
   },
   "reconstruction": {"crop_radius_m": 0.15},
-  "captured_angles_deg": [0.0, 10.0]
+  "x_stage": {
+    "positions_mm": [200.0, 280.0],
+    "reference_position_mm": 200.0,
+    "positive_direction": "+orbit_axis"
+  },
+  "captured_angles_deg": [0.0, 10.0],
+  "captures": [
+    {
+      "filename": "frame_s00_x200.0_y+000.0.ply",
+      "station_index": 0,
+      "x_position_mm": 200.0,
+      "x_offset_m": 0.0,
+      "angle_deg": 0.0
+    }
+  ]
 }
 ```
 
-Exact fields may expand; `orbit_radius_m`, `orbit_axis`, and captured angles are the key reconstruction inputs.
+The ordered capture manifest is authoritative for schema-version-2 scans. Older `frame_<angle>.ply` datasets without a manifest remain supported as a single X station with zero translation offset.
 
 ### 6. Optionally reconstruct
 
@@ -173,6 +191,7 @@ With `--reconstruct`, the program closes the hardware after capture and launches
 | `--disparity` | Gemini 305 disparity range: 128 or 256. |
 | `--width`, `--height`, `--fps` | Requested RGB-D stream configuration. |
 | `--radius-m` | Optical-center to orbit-center distance in metres; required with `--reconstruct`. |
+| `--x-positions-mm` | One or more absolute X scan stations in millimetres; default `200`. |
 | `--orbit-axis X Y Z` | Orbit axis in camera coordinates; default `1 0 0`. |
 | `--registration-mode` | `motor` or `guarded-icp`; default `motor`. |
 | `--frames-per-angle` | Fresh frames fused per angle; default 5. |
@@ -187,7 +206,7 @@ Run `python scripts/sync_workflow/main_scan.py --help` for the exact current def
 
 ## Reconstruction flow: `reconstruct_pipeline.py`
 
-The program finds `frame_*.ply` files, extracts numeric angles, and sorts by angle rather than filename text.
+For schema-version-2 datasets, the program reads station, X position, offset, angle, and filename from the capture manifest, then groups captures by station and angle. Legacy datasets still extract angles from `frame_<angle>.ply` filenames.
 
 ### Configuration precedence
 
@@ -217,7 +236,7 @@ Orbit radius is resolved in this order:
 
 ### Stage 1: build motor priors
 
-For each angle, the pipeline constructs a rigid transform that rotates the scan around the calibrated axis and pivot. The zero-degree frame is the reference system. These deterministic matrices are saved as `*_prior.txt` and prevent registration drift around the orbit.
+For each capture, the pipeline constructs the circular motor transform and adds the station's metric X offset along the orbit axis. The X position does not change the circular radius. X200/Y0 is the reference system for `--x-positions-mm 200 280`, and X280 receives an additional 0.080 m translation. These deterministic matrices are saved as `*_prior.txt` and prevent registration drift.
 
 ### Stage 2: select or refine poses
 
@@ -228,7 +247,7 @@ For each angle, the pipeline constructs a rigid transform that rotates the scan 
 
 Motor mode is deliberately the default. Smooth hands, repeated geometry, background points, and partial overlap can give ICP a plausible but physically incorrect match.
 
-Guarded ICP processes adjacent pairs and a loop edge where applicable:
+Guarded ICP processes adjacent angles within each station, a loop edge for each complete orbit, and same-angle links between adjacent X stations:
 
 1. Transform and crop both clouds near their expected locations using motor priors.
 2. Downsample registration copies to 3 mm voxels.
@@ -262,7 +281,7 @@ The pose graph produces `optimized_poses.npy` and per-frame `*_optimized.txt` ma
 
 Registration uses reduced copies, but Open3D applies final matrices to the original PLYs. Four bounded workers transform, crop, optionally filter, and write the scans to `01_transformed/` in stable frame order.
 
-Despite its historical name, `--crop-radius-m` is the half-extent of an axis-aligned cube centered at the orbit pivot, not a spherical radius. A value of 0.15 keeps the interval from `pivot - 0.15` to `pivot + 0.15` m on each axis. A value at or below zero disables cropping.
+Despite its historical name, `--crop-radius-m` is the half-extent of an axis-aligned cube, not a spherical radius. Each station receives its own crop cube centered at `pivot + orbit_axis * x_offset_m`, preventing the second section from being clipped by the first station's bounds. A value at or below zero disables cropping.
 
 Per-scan SOR uses 10 neighbors and sigma 2.0 unless `--skip-per-scan-sor` is set.
 
@@ -337,6 +356,14 @@ Capture and reconstruct from motor poses:
 ```bash
 python scripts/sync_workflow/main_scan.py --port /dev/ttyUSB0 \
   --step-deg 10 --radius-m 0.1175 \
+  --registration-mode motor --reconstruct
+```
+
+Capture full 360-degree scans at X200 and X280, then fuse all 74 captures:
+
+```bash
+python scripts/sync_workflow/main_scan.py --port /dev/ttyUSB0 \
+  --x-positions-mm 200 280 --step-deg 10 --radius-m 0.1175 \
   --registration-mode motor --reconstruct
 ```
 

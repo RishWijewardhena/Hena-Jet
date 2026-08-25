@@ -76,6 +76,16 @@ PROCESSING_MAX_WORKERS = 4
 # ===================================================================
 
 @dataclass
+class CaptureRecord:
+    """Capture metadata needed to place one point cloud."""
+    path: Path
+    angle_deg: float
+    station_index: int = 0
+    x_position_mm: float = 200.0
+    x_offset_m: float = 0.0
+
+
+@dataclass
 class RegistrationEdge:
     """One pairwise registration constraint."""
     source_id: int
@@ -100,6 +110,9 @@ class RegistrationFrame:
     path: Path
     angle_deg: float
     prior_pose: np.ndarray
+    station_index: int = 0
+    x_position_mm: float = 200.0
+    x_offset_m: float = 0.0
     cloud: object = None
 
 
@@ -196,8 +209,10 @@ def points_inside_bounds(
 # ===================================================================
 
 def read_angle_from_filename(filename: str) -> float:
-    """Extract angle from filenames like frame_10.0.ply or frame_-20.0.ply."""
-    match = re.search(r"frame_([-]?\d+\.?\d*)", filename)
+    """Extract the Y angle from legacy or station-aware capture names."""
+    match = re.search(r"_y([+-]?\d+\.?\d*)", filename)
+    if match is None:
+        match = re.search(r"frame_([-]?\d+\.?\d*)", filename)
     if match is None:
         raise ValueError(f"Cannot extract angle from: {filename}")
     return float(match.group(1))
@@ -222,6 +237,48 @@ def load_scan_metadata(input_dir: Path) -> dict:
     return metadata
 
 
+def discover_captures(input_dir: Path, metadata: dict) -> list[CaptureRecord]:
+    """Load schema-v2 capture records, with legacy filename compatibility."""
+    manifest = metadata.get("captures")
+    if manifest is not None:
+        if not isinstance(manifest, list):
+            raise ValueError("scan_metadata.json captures must be a list")
+        if not manifest:
+            raise RuntimeError("scan_metadata.json contains no completed captures")
+        records = []
+        seen_filenames = set()
+        for item in manifest:
+            if not isinstance(item, dict):
+                raise ValueError("Each capture manifest entry must be an object")
+            filename = str(item.get("filename", ""))
+            if not filename or Path(filename).name != filename:
+                raise ValueError(f"Invalid capture filename: {filename!r}")
+            if filename in seen_filenames:
+                raise ValueError(f"Duplicate capture filename: {filename}")
+            path = input_dir / filename
+            if not path.is_file():
+                raise RuntimeError(f"Capture listed in metadata is missing: {path}")
+            seen_filenames.add(filename)
+            records.append(CaptureRecord(
+                path=path,
+                angle_deg=float(item["angle_deg"]),
+                station_index=int(item["station_index"]),
+                x_position_mm=float(item["x_position_mm"]),
+                x_offset_m=float(item["x_offset_m"]),
+            ))
+        if not all(
+            np.isfinite((record.angle_deg, record.x_position_mm, record.x_offset_m)).all()
+            for record in records
+        ):
+            raise ValueError("Capture geometry must contain finite values")
+        return sorted(records, key=lambda record: (record.station_index, record.angle_deg))
+
+    return [
+        CaptureRecord(path=path, angle_deg=read_angle_from_filename(path.name))
+        for path in find_ply_files(input_dir)
+    ]
+
+
 def resolve_orbit_radius(cli_radius_m: Optional[float], metadata: dict) -> float:
     """Resolve and validate the effective camera-to-orbit-center radius."""
     value = cli_radius_m
@@ -240,7 +297,10 @@ def resolve_orbit_radius(cli_radius_m: Optional[float], metadata: dict) -> float
 
 def calculate_auto_radius(o3d, ply_files: list[Path]) -> float:
     """Read frame_0.0.ply (or first frame), find the hand, and return its Z depth."""
-    target = next((p for p in ply_files if "frame_0.0.ply" in p.name), ply_files[0])
+    target = next(
+        (p for p in ply_files if abs(read_angle_from_filename(p.name)) < 1e-9),
+        ply_files[0],
+    )
     cloud = o3d.io.read_point_cloud(str(target))
     if cloud.is_empty():
         raise RuntimeError(f"Could not read points for auto-radius from {target}")
@@ -280,7 +340,7 @@ def calculate_auto_radius(o3d, ply_files: list[Path]) -> float:
 # ===================================================================
 
 def build_orbit_poses(
-    ply_files: list[Path],
+    captures: list[CaptureRecord],
     orbit_axis: np.ndarray,
     pivot: np.ndarray,
     reference_angle_deg: float,
@@ -288,13 +348,25 @@ def build_orbit_poses(
 ) -> list[np.ndarray]:
     """Build motor-angle pose priors."""
     poses = []
-    for path in ply_files:
-        angle = read_angle_from_filename(path.name)
+    for capture in captures:
+        angle = capture.angle_deg
         relative_angle = angle_sign * (angle - reference_angle_deg)
         # Normalize to [-180, 180)
         relative_angle = (relative_angle + 180.0) % 360.0 - 180.0
-        poses.append(rotation_about_axis(relative_angle, pivot, orbit_axis))
+        pose = rotation_about_axis(relative_angle, pivot, orbit_axis)
+        pose[:3, 3] += orbit_axis * capture.x_offset_m
+        poses.append(pose)
     return poses
+
+
+def crop_bounds_around(center: np.ndarray, half_extent_m: float):
+    """Return an axis-aligned crop cube around a station's orbit pivot."""
+    if half_extent_m <= 0.0:
+        return None
+    center = np.asarray(center, dtype=float)
+    lower = center - half_extent_m
+    upper = center + half_extent_m
+    return (*lower.tolist(), *upper.tolist())
 
 
 # ===================================================================
@@ -451,11 +523,37 @@ def register_pair(o3d, source_id, target_id, kind, frames):
     )
 
 
-def registration_pairs(frame_count, include_loop_closure=True):
-    """Return sequential pairs and an optional loop-closure pair."""
-    pairs = [(i, i + 1, "sequential") for i in range(frame_count - 1)]
-    if include_loop_closure and frame_count > 2:
-        pairs.append((0, frame_count - 1, "loop"))
+def registration_pairs(frames, include_loop_closure=True):
+    """Return within-station orbit pairs and same-angle station links."""
+    if isinstance(frames, int):
+        pairs = [(i, i + 1, "sequential") for i in range(frames - 1)]
+        if include_loop_closure and frames > 2:
+            pairs.append((0, frames - 1, "loop"))
+        return pairs
+
+    pairs = []
+    station_groups = {}
+    for index, frame in enumerate(frames):
+        station_groups.setdefault(frame.station_index, []).append(index)
+    ordered_stations = sorted(station_groups)
+    for station_index in ordered_stations:
+        indices = station_groups[station_index]
+        pairs.extend(
+            (source, target, "sequential")
+            for source, target in zip(indices, indices[1:])
+        )
+        if include_loop_closure and len(indices) > 2:
+            pairs.append((indices[0], indices[-1], "loop"))
+
+    for first_station, second_station in zip(ordered_stations, ordered_stations[1:]):
+        first_by_angle = {
+            round(frames[index].angle_deg, 9): index
+            for index in station_groups[first_station]
+        }
+        for second_index in station_groups[second_station]:
+            first_index = first_by_angle.get(round(frames[second_index].angle_deg, 9))
+            if first_index is not None:
+                pairs.append((first_index, second_index, "station"))
     return pairs
 
 
@@ -467,25 +565,25 @@ def build_pose_graph(o3d, frames):
             o3d.pipelines.registration.PoseGraphNode(frame.prior_pose.copy())
         )
 
-    all_pairs = registration_pairs(len(frames))
+    all_pairs = registration_pairs(frames)
 
-    # Run all sequential pairs in parallel (ICP releases the GIL)
-    sequential_pairs = [(s, t, k) for s, t, k in all_pairs if k == "sequential"]
-    loop_pairs = [(s, t, k) for s, t, k in all_pairs if k != "sequential"]
+    # Run sequential and cross-station motion pairs in parallel (ICP releases the GIL)
+    motion_pairs = [(s, t, k) for s, t, k in all_pairs if k != "loop"]
+    loop_pairs = [(s, t, k) for s, t, k in all_pairs if k == "loop"]
 
     edges = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = {
             executor.submit(register_pair, o3d, s, t, k, frames): (s, t, k)
-            for s, t, k in sequential_pairs
+            for s, t, k in motion_pairs
         }
         seq_edges = {}
         for future in concurrent.futures.as_completed(futures):
             edge = future.result()
             seq_edges[(edge.source_id, edge.target_id)] = edge
 
-    # Keep sequential edges in order
-    for s, t, _ in sequential_pairs:
+    # Keep motion edges in deterministic order
+    for s, t, _ in motion_pairs:
         edges.append(seq_edges[(s, t)])
 
     # Loop closure runs after (single pair, no parallelism needed)
@@ -502,9 +600,9 @@ def build_pose_graph(o3d, frames):
             edge.correction_m, edge.correction_deg, edge.reason,
         )
 
-        # Add orbit prior edge for sequential pairs
-        # Adaptive weight: higher when ICP fell back (trust motor angle more)
-        if edge.kind == "sequential":
+        # Add a deterministic prior for orbit and cross-station motor motion.
+        # Adaptive weight is higher when ICP falls back.
+        if edge.kind in ("sequential", "station"):
             prior = relative_camera_transform(
                 frames[edge.source_id].prior_pose,
                 frames[edge.target_id].prior_pose,
@@ -558,9 +656,19 @@ def build_diagnostics(
 ) -> dict:
     edge_dicts = []
     for edge in edges:
+        source_frame = frames[edge.source_id]
+        target_frame = frames[edge.target_id]
         edge_dicts.append({
             "source_id": edge.source_id,
             "target_id": edge.target_id,
+            "source_filename": source_frame.path.name,
+            "target_filename": target_frame.path.name,
+            "source_station_index": source_frame.station_index,
+            "target_station_index": target_frame.station_index,
+            "source_x_position_mm": source_frame.x_position_mm,
+            "target_x_position_mm": target_frame.x_position_mm,
+            "source_x_offset_m": source_frame.x_offset_m,
+            "target_x_offset_m": target_frame.x_offset_m,
             "kind": edge.kind,
             "accepted": edge.accepted,
             "reason": edge.reason,
@@ -587,6 +695,9 @@ def build_diagnostics(
         corrections.append({
             "filename": frame.path.name,
             "angle_deg": frame.angle_deg,
+            "station_index": frame.station_index,
+            "x_position_mm": frame.x_position_mm,
+            "x_offset_m": frame.x_offset_m,
             "translation_m": corr_m,
             "rotation_deg": corr_deg,
         })
@@ -675,9 +786,10 @@ def main(argv=None):
     )
     logging.getLogger().addHandler(file_handler)
 
-    ply_files = find_ply_files(input_dir)
-    logger.info("Found %d PLY files in %s", len(ply_files), input_dir)
     scan_metadata = load_scan_metadata(input_dir)
+    captures = discover_captures(input_dir, scan_metadata)
+    ply_files = [capture.path for capture in captures]
+    logger.info("Found %d PLY files in %s", len(ply_files), input_dir)
 
     orbit_axis_values = args.orbit_axis or scan_metadata.get(
         "orbit_axis", [1.0, 0.0, 0.0]
@@ -703,11 +815,6 @@ def main(argv=None):
     if crop_radius_m is None:
         crop_radius_m = float(reconstruction_metadata.get("crop_radius_m", 0.15))
 
-    r = crop_radius_m
-    crop_bounds = (pivot[0] - r, pivot[1] - r, pivot[2] - r,
-                   pivot[0] + r, pivot[1] + r, pivot[2] + r) if r > 0 else None
-
-
     merged_cloud_path = output_dir / "merged_cloud.ply"
 
     # Stage 1: Discover files and build orbit poses
@@ -716,18 +823,28 @@ def main(argv=None):
     logger.info("Orbit radius: %.4f m, axis: %s, pivot: %s", orbit_radius_m, orbit_axis, pivot)
 
     priors = build_orbit_poses(
-        ply_files, orbit_axis, pivot,
+        captures, orbit_axis, pivot,
         reference_angle_deg=args.reference_angle_deg,
         angle_sign=args.angle_sign,
     )
 
     frames = [
         RegistrationFrame(
-            path=path,
-            angle_deg=read_angle_from_filename(path.name),
+            path=capture.path,
+            angle_deg=capture.angle_deg,
             prior_pose=prior,
+            station_index=capture.station_index,
+            x_position_mm=capture.x_position_mm,
+            x_offset_m=capture.x_offset_m,
         )
-        for path, prior in zip(ply_files, priors)
+        for capture, prior in zip(captures, priors)
+    ]
+    frame_crop_bounds = [
+        crop_bounds_around(
+            pivot + orbit_axis * frame.x_offset_m,
+            crop_radius_m,
+        )
+        for frame in frames
     ]
 
     if args.registration_mode == "motor":
@@ -738,7 +855,9 @@ def main(argv=None):
         logger.info("Stage 2/4: Guarded ICP and pose-graph optimization...")
         import open3d as o3d
 
-        for i, frame in enumerate(frames, start=1):
+        for i, (frame, frame_bounds) in enumerate(
+            zip(frames, frame_crop_bounds), start=1,
+        ):
             cloud = o3d.io.read_point_cloud(str(frame.path))
             if cloud.is_empty():
                 raise RuntimeError(f"Open3D could not read points from {frame.path}")
@@ -747,7 +866,7 @@ def main(argv=None):
                 cloud,
                 frame.prior_pose,
                 voxel_size=REGISTRATION_VOXEL_M,
-                crop_bounds=crop_bounds,
+                crop_bounds=frame_bounds,
             )
             logger.info(
                 "Loaded %d/%d %s: %d registration points",
@@ -778,6 +897,20 @@ def main(argv=None):
         "reference_angle_deg": args.reference_angle_deg,
         "angle_sign": args.angle_sign,
         "crop_radius_m": crop_radius_m,
+        "x_stations": [
+            {
+                "station_index": station_index,
+                "x_position_mm": next(
+                    frame.x_position_mm for frame in frames
+                    if frame.station_index == station_index
+                ),
+                "x_offset_m": next(
+                    frame.x_offset_m for frame in frames
+                    if frame.station_index == station_index
+                ),
+            }
+            for station_index in sorted({frame.station_index for frame in frames})
+        ],
         "per_scan_sor_enabled": not args.skip_per_scan_sor,
         "registration_parameters": {
             "voxel_m": REGISTRATION_VOXEL_M,
@@ -819,7 +952,8 @@ def main(argv=None):
         optimized_poses,
         output_dir / "01_transformed",
         matrix_dir,
-        crop_bounds=crop_bounds,
+        crop_bounds=None,
+        crop_bounds_by_cloud=frame_crop_bounds,
         skip_sor=args.skip_per_scan_sor,
         sor_neighbors=PER_SCAN_SOR_NEIGHBORS,
         sor_sigma=PER_SCAN_SOR_SIGMA,
@@ -830,7 +964,10 @@ def main(argv=None):
     merge_stats = merge_and_finalize_clouds(
         transformed_paths,
         merged_cloud_path,
-        pivot=pivot,
+        pivot=(
+            pivot
+            + orbit_axis * float(np.mean(sorted({frame.x_offset_m for frame in frames})))
+        ),
         spatial_subsample_m=SPATIAL_SUBSAMPLE_M,
         duplicate_distance_m=REMOVE_DUPLICATES_DISTANCE_M,
         sor_neighbors=FINAL_SOR_NEIGHBORS,
