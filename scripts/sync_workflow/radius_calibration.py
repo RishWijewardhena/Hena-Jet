@@ -36,9 +36,9 @@ def _marker_corners(
 
 
 def marker_normal(corners: np.ndarray) -> np.ndarray:
-    """Calculate the outward normal implied by OpenCV marker corner order."""
+    """Calculate the outward normal from clockwise OpenCV marker corners."""
     points = np.asarray(corners, dtype=np.float64)
-    normal = np.cross(points[1] - points[0], points[2] - points[1])
+    normal = -np.cross(points[1] - points[0], points[2] - points[1])
     length = np.linalg.norm(normal)
     if length == 0.0:
         raise ValueError("Marker corners are degenerate.")
@@ -69,10 +69,10 @@ def build_profile_marker_map(
     half_width = profile_width_m / 2.0 + carrier_offset_m
     half_depth = profile_depth_m / 2.0 + carrier_offset_m
     definitions = [
-        (0, "front", [0.0, half_depth, z_offsets[0]], [1.0, 0.0, 0.0]),
-        (1, "right", [half_width, 0.0, z_offsets[1]], [0.0, -1.0, 0.0]),
-        (2, "back", [0.0, -half_depth, z_offsets[2]], [-1.0, 0.0, 0.0]),
-        (3, "left", [-half_width, 0.0, z_offsets[3]], [0.0, 1.0, 0.0]),
+        (0, "front", [0.0, half_depth, z_offsets[0]], [-1.0, 0.0, 0.0]),
+        (1, "right", [half_width, 0.0, z_offsets[1]], [0.0, 1.0, 0.0]),
+        (2, "back", [0.0, -half_depth, z_offsets[2]], [1.0, 0.0, 0.0]),
+        (3, "left", [-half_width, 0.0, z_offsets[3]], [0.0, -1.0, 0.0]),
     ]
 
     markers = []
@@ -234,9 +234,227 @@ def has_sufficient_angular_coverage(
     return largest_gap <= max_gap_deg + 1e-9
 
 
+def evaluate_trajectory(
+    samples: list[dict[str, Any]],
+    *,
+    min_unique_angles: int = 6,
+    max_gap_deg: float = 90.0,
+    mad_threshold: float = 3.5,
+) -> dict[str, Any]:
+    """Fit RGB/depth trajectories and decide whether a radius is publishable."""
+    reasons: list[str] = []
+    if len(samples) < 3:
+        return {
+            "quality_status": "invalid",
+            "quality_reasons": ["at least three accepted angle samples are required"],
+            "recommended_radius_m": None,
+            "rgb_fit": None,
+            "depth_fit": None,
+        }
+
+    rgb_points = np.asarray(
+        [sample["rgb_camera_center_m"] for sample in samples], dtype=np.float64
+    )
+    depth_points = np.asarray(
+        [sample["depth_camera_center_m"] for sample in samples], dtype=np.float64
+    )
+    rgb_fit = fit_orbit_circle(rgb_points, mad_threshold=mad_threshold)
+    depth_fit = fit_orbit_circle(depth_points, mad_threshold=mad_threshold)
+    depth_inliers = np.asarray(depth_fit["inlier_mask"], dtype=bool)
+    inlier_angles = [
+        float(sample["angle_deg"])
+        for sample, is_inlier in zip(samples, depth_inliers)
+        if is_inlier
+    ]
+
+    if len({round(angle % 360.0, 6) for angle in inlier_angles}) < min_unique_angles:
+        reasons.append(f"fewer than {min_unique_angles} unique inlier angles")
+    if not has_sufficient_angular_coverage(
+        inlier_angles,
+        min_unique_angles=min_unique_angles,
+        max_gap_deg=max_gap_deg,
+    ):
+        reasons.append(
+            f"insufficient angular coverage (largest allowed circular gap is {max_gap_deg:.1f} deg)"
+        )
+
+    valid = not reasons
+    return {
+        "quality_status": "valid" if valid else "invalid",
+        "quality_reasons": reasons,
+        "recommended_radius_m": depth_fit["radius_m"] if valid else None,
+        "rgb_fit": rgb_fit,
+        "depth_fit": depth_fit,
+    }
+
+
 def rvec_tvec_to_matrix(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
     rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64))
     matrix = np.eye(4, dtype=np.float64)
     matrix[:3, :3] = rotation
     matrix[:3, 3] = np.asarray(tvec, dtype=np.float64).reshape(3)
     return matrix
+
+
+def _mean_reprojection_error(
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+) -> float:
+    projected, _ = cv2.projectPoints(
+        object_points, rvec, tvec, camera_matrix, dist_coeffs
+    )
+    errors = np.linalg.norm(
+        projected.reshape(-1, 2) - np.asarray(image_points).reshape(-1, 2), axis=1
+    )
+    return float(np.mean(errors))
+
+
+def _marker_local_to_world(marker: dict[str, Any]) -> np.ndarray:
+    corners = np.asarray(marker["corners_m"], dtype=np.float64)
+    center = corners.mean(axis=0)
+    horizontal = corners[1] - corners[0]
+    horizontal /= np.linalg.norm(horizontal)
+    vertical = corners[0] - corners[3]
+    vertical /= np.linalg.norm(vertical)
+    local_z = np.cross(horizontal, vertical)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.column_stack((horizontal, vertical, local_z))
+    transform[:3, 3] = center
+    return transform
+
+
+def solve_profile_pose(
+    marker_map: dict[str, Any],
+    marker_corners,
+    marker_ids: np.ndarray,
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+) -> dict[str, Any]:
+    """Solve fixed-profile world-to-color pose, including one-marker views."""
+    markers_by_id = {
+        int(marker["id"]): marker for marker in marker_map.get("markers", [])
+    }
+    known = []
+    for corners, raw_id in zip(marker_corners, np.asarray(marker_ids).reshape(-1)):
+        marker_id = int(raw_id)
+        if marker_id in markers_by_id:
+            known.append(
+                (
+                    marker_id,
+                    markers_by_id[marker_id],
+                    # ArUco returns float32 corners. Keeping that dtype also
+                    # avoids an OpenCV IPPE degeneracy on exactly frontal views.
+                    np.asarray(corners, dtype=np.float32).reshape(4, 2),
+                )
+            )
+
+    empty_result = {
+        "ok": False,
+        "method": None,
+        "used_ids": [item[0] for item in known],
+        "world_to_camera": None,
+        "rvec": None,
+        "tvec": None,
+        "reprojection_error_px": None,
+    }
+    if not known:
+        return empty_result
+
+    if len(known) >= 2:
+        object_points = np.concatenate(
+            [np.asarray(item[1]["corners_m"], dtype=np.float64) for item in known]
+        )
+        image_points = np.concatenate([item[2] for item in known])
+        ok, rvec, tvec = cv2.solvePnP(
+            object_points,
+            image_points,
+            camera_matrix,
+            dist_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if not ok:
+            return empty_result
+        world_to_camera = rvec_tvec_to_matrix(rvec, tvec)
+        camera_points = (
+            world_to_camera[:3, :3] @ object_points.T
+            + world_to_camera[:3, 3:4]
+        ).T
+        if np.any(camera_points[:, 2] <= 0.0):
+            return empty_result
+        return {
+            "ok": True,
+            "method": "multi-marker-iterative",
+            "used_ids": [item[0] for item in known],
+            "world_to_camera": world_to_camera,
+            "rvec": rvec,
+            "tvec": tvec,
+            "reprojection_error_px": _mean_reprojection_error(
+                object_points,
+                image_points,
+                rvec,
+                tvec,
+                camera_matrix,
+                dist_coeffs,
+            ),
+        }
+
+    marker_id, marker, image_points = known[0]
+    marker_size_m = float(marker_map["marker_size_m"])
+    half = marker_size_m / 2.0
+    local_points = np.array(
+        [
+            [-half, half, 0.0],
+            [half, half, 0.0],
+            [half, -half, 0.0],
+            [-half, -half, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    result = cv2.solvePnPGeneric(
+        local_points,
+        image_points,
+        camera_matrix,
+        dist_coeffs,
+        flags=cv2.SOLVEPNP_IPPE_SQUARE,
+    )
+    ok, rvecs, tvecs = bool(result[0]), result[1], result[2]
+    if not ok:
+        return empty_result
+
+    marker_to_world = _marker_local_to_world(marker)
+    candidates = []
+    for rvec, tvec in zip(rvecs, tvecs):
+        marker_to_camera = rvec_tvec_to_matrix(rvec, tvec)
+        camera_points = (
+            marker_to_camera[:3, :3] @ local_points.T
+            + marker_to_camera[:3, 3:4]
+        ).T
+        if np.any(camera_points[:, 2] <= 0.0):
+            continue
+        error = _mean_reprojection_error(
+            local_points,
+            image_points,
+            rvec,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+        )
+        world_to_camera = marker_to_camera @ transform_inverse(marker_to_world)
+        candidates.append((error, world_to_camera, rvec, tvec))
+    if not candidates:
+        return empty_result
+
+    error, world_to_camera, rvec, tvec = min(candidates, key=lambda item: item[0])
+    return {
+        "ok": True,
+        "method": "single-marker-ippe",
+        "used_ids": [marker_id],
+        "world_to_camera": world_to_camera,
+        "rvec": rvec,
+        "tvec": tvec,
+        "reprojection_error_px": error,
+    }

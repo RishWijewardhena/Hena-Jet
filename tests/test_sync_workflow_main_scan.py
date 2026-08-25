@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -169,6 +170,46 @@ class RadiusCalibrationCaptureTests(unittest.TestCase):
         self.assertGreaterEqual(len(args.angles), 3)
         self.assertIn(0.0, args.angles)
         self.assertEqual(args.frames_per_angle, 5)
+        self.assertEqual(
+            args.marker_map,
+            Path("outputs/radius_markers/profile_marker_map.json"),
+        )
+
+    def test_rejects_pose_above_the_reprojection_error_limit(self):
+        class FakeDetector:
+            def detectMarkers(self, _gray):
+                return [], np.empty((0, 1), dtype=np.int32), []
+
+        solved_pose = {
+            "ok": True,
+            "method": "single-marker-ippe",
+            "used_ids": [0],
+            "world_to_camera": np.eye(4),
+            "rvec": np.zeros((3, 1)),
+            "tvec": np.array([[0.0], [0.0], [0.15]]),
+            "reprojection_error_px": 2.0,
+        }
+        with mock.patch.object(test_radius, "solve_profile_pose", return_value=solved_pose):
+            pose, _, _ = test_radius.estimate_frame_pose(
+                np.zeros((10, 10, 3), dtype=np.uint8),
+                {"markers": []},
+                FakeDetector(),
+                np.eye(3),
+                np.zeros((8, 1)),
+                np.eye(4),
+                max_reprojection_error_px=1.5,
+            )
+
+        self.assertFalse(pose["accepted"])
+        self.assertIn("exceeds 1.50px", pose["rejection_reason"])
+
+    def test_requires_enough_valid_pose_frames_per_angle(self):
+        args = test_radius.parse_args(
+            ["--frames-per-angle", "2", "--min-valid-poses-per-angle", "3"]
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot exceed"):
+            test_radius.validate_args(args)
 
 
 if __name__ == "__main__":

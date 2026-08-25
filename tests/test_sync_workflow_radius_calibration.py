@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PIL import Image
 import numpy as np
+import cv2
 
 
 SYNC_WORKFLOW_DIR = (
@@ -16,10 +17,13 @@ sys.path.insert(0, str(SYNC_WORKFLOW_DIR))
 
 from radius_calibration import (  # noqa: E402
     build_profile_marker_map,
+    camera_center_world,
     convert_world_to_color_to_world_to_depth,
+    evaluate_trajectory,
     fit_orbit_circle,
     has_sufficient_angular_coverage,
     marker_normal,
+    solve_profile_pose,
 )
 from generate_radius_markers import generate_marker_kit  # noqa: E402
 
@@ -130,6 +134,51 @@ class OrbitFitTests(unittest.TestCase):
             )
         )
 
+    def test_does_not_recommend_radius_without_full_angular_coverage(self):
+        angles = [0, 15, 30, 45, 60, 75]
+        samples = []
+        for angle in angles:
+            radians = np.deg2rad(angle)
+            center = [0.1175 * np.cos(radians), 0.1175 * np.sin(radians), 0.0]
+            samples.append(
+                {
+                    "angle_deg": angle,
+                    "rgb_camera_center_m": center,
+                    "depth_camera_center_m": center,
+                }
+            )
+
+        result = evaluate_trajectory(samples)
+
+        self.assertEqual(result["quality_status"], "invalid")
+        self.assertIsNone(result["recommended_radius_m"])
+        self.assertIn("angular coverage", " ".join(result["quality_reasons"]))
+
+    def test_recommends_depth_radius_for_a_valid_full_orbit(self):
+        samples = []
+        for angle in range(0, 360, 45):
+            radians = np.deg2rad(angle)
+            samples.append(
+                {
+                    "angle_deg": angle,
+                    "rgb_camera_center_m": [
+                        0.118 * np.cos(radians),
+                        0.118 * np.sin(radians),
+                        0.0,
+                    ],
+                    "depth_camera_center_m": [
+                        0.1175 * np.cos(radians),
+                        0.1175 * np.sin(radians),
+                        0.0,
+                    ],
+                }
+            )
+
+        result = evaluate_trajectory(samples)
+
+        self.assertEqual(result["quality_status"], "valid")
+        self.assertAlmostEqual(result["recommended_radius_m"], 0.1175, places=9)
+
 
 class CameraExtrinsicTests(unittest.TestCase):
     def test_converts_world_to_color_pose_to_world_to_depth_pose(self):
@@ -146,6 +195,77 @@ class CameraExtrinsicTests(unittest.TestCase):
         color_center_world = np.linalg.inv(world_to_color)[:3, 3]
         depth_center_world = np.linalg.inv(world_to_depth)[:3, 3]
         np.testing.assert_allclose(depth_center_world - color_center_world, [0.025, 0, 0])
+
+
+class ProfilePoseTests(unittest.TestCase):
+    def setUp(self):
+        self.marker_map = build_profile_marker_map()
+        self.camera_matrix = np.array(
+            [[900.0, 0.0, 640.0], [0.0, 900.0, 400.0], [0.0, 0.0, 1.0]]
+        )
+        self.dist_coeffs = np.zeros((8, 1), dtype=np.float64)
+        camera_center = np.array([0.0, 0.16, 0.0])
+        right = np.array([-1.0, 0.0, 0.0])
+        down = np.array([0.0, 0.0, -1.0])
+        forward = np.array([0.0, -1.0, 0.0])
+        self.world_to_camera = np.eye(4)
+        self.world_to_camera[:3, :3] = np.vstack((right, down, forward))
+        self.world_to_camera[:3, 3] = -self.world_to_camera[:3, :3] @ camera_center
+        self.rvec, _ = cv2.Rodrigues(self.world_to_camera[:3, :3])
+        self.tvec = self.world_to_camera[:3, 3].reshape(3, 1)
+
+    def projected_marker(self, marker_id):
+        marker = self.marker_map["markers"][marker_id]
+        corners, _ = cv2.projectPoints(
+            np.asarray(marker["corners_m"]),
+            self.rvec,
+            self.tvec,
+            self.camera_matrix,
+            self.dist_coeffs,
+        )
+        return corners.reshape(1, 4, 2).astype(np.float32)
+
+    def test_recovers_pose_from_two_mapped_markers(self):
+        result = solve_profile_pose(
+            self.marker_map,
+            [self.projected_marker(0), self.projected_marker(1)],
+            np.array([[0], [1]], dtype=np.int32),
+            self.camera_matrix,
+            self.dist_coeffs,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["method"], "multi-marker-iterative")
+        np.testing.assert_allclose(
+            camera_center_world(result["world_to_camera"]), [0.0, 0.16, 0.0], atol=1e-5
+        )
+
+    def test_recovers_pose_when_only_one_profile_face_is_visible(self):
+        result = solve_profile_pose(
+            self.marker_map,
+            [self.projected_marker(0)],
+            np.array([[0]], dtype=np.int32),
+            self.camera_matrix,
+            self.dist_coeffs,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["method"], "single-marker-ippe")
+        np.testing.assert_allclose(
+            camera_center_world(result["world_to_camera"]), [0.0, 0.16, 0.0], atol=5e-4
+        )
+
+    def test_ignores_unknown_marker_ids(self):
+        result = solve_profile_pose(
+            self.marker_map,
+            [self.projected_marker(0)],
+            np.array([[42]], dtype=np.int32),
+            self.camera_matrix,
+            self.dist_coeffs,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["used_ids"], [])
 
 
 if __name__ == "__main__":
