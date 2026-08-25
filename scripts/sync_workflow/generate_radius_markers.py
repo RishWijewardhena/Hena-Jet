@@ -24,8 +24,12 @@ def mm_to_px(value_mm: float, dpi: int) -> int:
     return int(round(value_mm / MM_PER_INCH * dpi))
 
 
-def _text_size(draw: ImageDraw.ImageDraw, text: str) -> tuple[int, int]:
-    box = draw.textbbox((0, 0), text, font=ImageFont.load_default())
+def _font(size_mm: float, dpi: int):
+    return ImageFont.truetype("DejaVuSans.ttf", mm_to_px(size_mm, dpi))
+
+
+def _text_size(draw: ImageDraw.ImageDraw, text: str, font=None) -> tuple[int, int]:
+    box = draw.textbbox((0, 0), text, font=font or ImageFont.load_default())
     return box[2] - box[0], box[3] - box[1]
 
 
@@ -145,16 +149,27 @@ def generate_marker_kit(
     page = Image.new("L", (page_width, page_height), 255)
     draw = ImageDraw.Draw(page)
     margin = mm_to_px(15.0, dpi)
-    draw.text((margin, margin), "Four-face ArUco orbit-radius calibration kit", fill=0)
+    title_font = _font(4.0, dpi)
+    warning_font = _font(3.2, dpi)
+    body_font = _font(2.6, dpi)
+    label_font = _font(2.4, dpi)
     draw.text(
-        (margin, margin + 24),
-        "PRINT AT ACTUAL SIZE / 100% - DO NOT FIT TO PAGE",
+        (margin, margin),
+        "Four-face ArUco orbit-radius calibration kit",
         fill=0,
+        font=title_font,
     )
     draw.text(
-        (margin, margin + 48),
+        (margin, margin + mm_to_px(6.0, dpi)),
+        "PRINT AT ACTUAL SIZE / 100% - DO NOT FIT TO PAGE",
+        fill=0,
+        font=warning_font,
+    )
+    draw.text(
+        (margin, margin + mm_to_px(11.0, dpi)),
         "18.0 mm coded square | 26.0 mm carrier | DICT_5X5_100",
         fill=0,
+        font=body_font,
     )
 
     start_y = margin + mm_to_px(18.0, dpi)
@@ -167,9 +182,10 @@ def generate_marker_kit(
         page.paste(carrier, (x, y))
         draw.rectangle((x, y, x + carrier_px - 1, y + carrier_px - 1), outline=128, width=2)
         draw.text(
-            (x, y + carrier_px + 8),
+            (x, y + carrier_px + mm_to_px(1.5, dpi)),
             f"ID {marker['id']} - {marker['face'].upper()} - UP toward +Z",
             fill=0,
+            font=label_font,
         )
 
     ruler_x = margin
@@ -180,8 +196,18 @@ def generate_marker_kit(
         x = ruler_x + mm_to_px(float(value_mm), dpi)
         tick = mm_to_px(4.0 if value_mm % 50 else 7.0, dpi)
         draw.line((x, ruler_y - tick, x, ruler_y + tick), fill=0, width=3)
-        draw.text((x - 8, ruler_y + tick + 5), str(value_mm), fill=0)
-    draw.text((ruler_x, ruler_y + mm_to_px(13.0, dpi)), "100 mm verification ruler", fill=0)
+        draw.text(
+            (x - mm_to_px(1.0, dpi), ruler_y + tick + mm_to_px(1.0, dpi)),
+            str(value_mm),
+            fill=0,
+            font=label_font,
+        )
+    draw.text(
+        (ruler_x, ruler_y + mm_to_px(13.0, dpi)),
+        "100 mm verification ruler",
+        fill=0,
+        font=body_font,
+    )
 
     png_path = output_dir / "profile_radius_markers_a4.png"
     pdf_path = output_dir / "profile_radius_markers_a4.pdf"

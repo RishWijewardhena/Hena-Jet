@@ -72,6 +72,66 @@ conda activate hena_jet
 
 Capture requires the Orbbec SDK, Open3D, and motor serial-port access. Reconstruction requires Open3D and Trimesh from the `hena_jet` environment; it has no CloudCompare or Flatpak dependency.
 
+## Calibrate the orbit radius with the fixed profile
+
+`test_radius.py` can measure the orbit radius from four ArUco markers attached to a stationary 20 x 40 mm profile. The profile does not have to be the rotation axis. It only has to remain rigid and stationary while the camera completes the orbit.
+
+### 1. Generate and print the marker kit
+
+```bash
+python scripts/sync_workflow/generate_radius_markers.py
+```
+
+This writes the following files under `outputs/radius_markers/`:
+
+- `profile_radius_markers_a4.pdf`: print-ready A4 sheet;
+- `profile_radius_markers_a4.png`: raster preview;
+- `markers/`: four individual 26 x 26 mm carrier images;
+- `profile_marker_map.json`: exact 3D marker-corner coordinates;
+- `profile_marker_placement.png`: face, ID, height, and orientation guide.
+
+Print the PDF using **Actual size / 100%**. Do not use **Fit to page**. Measure the printed 100 mm ruler and one black marker square before mounting anything; the black coded square must be 18.0 mm.
+
+The generated geometry assumes:
+
+- profile cross-section: 40 mm along map X and 20 mm along map Y;
+- carrier: 26 x 26 mm, with its marker plane 1 mm above the aluminium face;
+- IDs 0, 1, 2, and 3 on the front, right, back, and left faces;
+- marker center heights of -45, -15, +15, and +45 mm along the bar's +Z direction.
+
+The carriers are staggered by 30 mm so the oversized carriers on the narrow faces do not collide. Align every carrier center and UP direction with the placement guide. Moving, rotating, scaling, or swapping a marker after generating the map invalidates that map.
+
+### 2. Capture and calculate
+
+```bash
+python scripts/sync_workflow/test_radius.py \
+  --x-pos 400 \
+  --marker-map outputs/radius_markers/profile_marker_map.json \
+  --output-dir outputs/test_radius
+```
+
+At every commanded angle, the script retains the existing fused PLY and visual image, detects markers in all five RGB frames, and estimates the fixed-profile-to-RGB-camera pose. It uses joint PnP when two or more mapped markers are visible and an IPPE square solve when only one face is visible. Poses above 1.5 pixels mean reprojection error are rejected; an angle needs at least three accepted burst poses.
+
+The Gemini SDK transform maps depth-camera coordinates to RGB-camera coordinates. The script inverts that calibrated transform so the fitted trajectory uses the depth optical center required by `--radius-m`, not the RGB optical center.
+
+Accepted depth-camera centers are fitted to a 3D plane and circle. A robust 3.5-MAD refit removes trajectory outliers. A radius is recommended only with at least six unique inlier angles and no circular coverage gap above 90 degrees.
+
+Important outputs are:
+
+- `radius_calibration.json`: complete calibration, fits, quality decision, and per-frame diagnostics;
+- `radius_angle_summary.csv`: accepted angle centers and circle residuals;
+- `depth_camera_trajectory.ply`: green inlier and red rejected camera-center samples;
+- `pose_diagnostics/`: annotated ArUco detection images;
+- `calibration_capture.json`: capture summary and link to the calibration report.
+
+For a valid run, the console prints a directly usable value:
+
+```text
+• Recommended reconstruction argument: --radius-m 0.117420
+```
+
+If the report says `quality_status: invalid`, do not copy a radius. Inspect the annotated images, check printed scale and placement, improve illumination, and repeat the complete orbit. The tool reports the value but deliberately does not overwrite scan metadata or reconstruction settings.
+
 ## Capture flow: `main_scan.py`
 
 ### 1. Validate and plan
