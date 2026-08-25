@@ -258,8 +258,17 @@ def evaluate_trajectory(
     depth_points = np.asarray(
         [sample["depth_camera_center_m"] for sample in samples], dtype=np.float64
     )
-    rgb_fit = fit_orbit_circle(rgb_points, mad_threshold=mad_threshold)
-    depth_fit = fit_orbit_circle(depth_points, mad_threshold=mad_threshold)
+    try:
+        rgb_fit = fit_orbit_circle(rgb_points, mad_threshold=mad_threshold)
+        depth_fit = fit_orbit_circle(depth_points, mad_threshold=mad_threshold)
+    except (ValueError, np.linalg.LinAlgError) as exc:
+        return {
+            "quality_status": "invalid",
+            "quality_reasons": [f"trajectory circle fit failed: {exc}"],
+            "recommended_radius_m": None,
+            "rgb_fit": None,
+            "depth_fit": None,
+        }
     depth_inliers = np.asarray(depth_fit["inlier_mask"], dtype=bool)
     inlier_angles = [
         float(sample["angle_deg"])

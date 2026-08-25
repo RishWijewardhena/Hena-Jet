@@ -179,6 +179,22 @@ class OrbitFitTests(unittest.TestCase):
         self.assertEqual(result["quality_status"], "valid")
         self.assertAlmostEqual(result["recommended_radius_m"], 0.1175, places=9)
 
+    def test_degenerate_camera_centers_return_invalid_instead_of_crashing(self):
+        samples = [
+            {
+                "angle_deg": angle,
+                "rgb_camera_center_m": [0.0, 0.0, 0.0],
+                "depth_camera_center_m": [0.0, 0.0, 0.0],
+            }
+            for angle in range(0, 360, 45)
+        ]
+
+        result = evaluate_trajectory(samples)
+
+        self.assertEqual(result["quality_status"], "invalid")
+        self.assertIsNone(result["recommended_radius_m"])
+        self.assertIn("fit failed", " ".join(result["quality_reasons"]))
+
 
 class CameraExtrinsicTests(unittest.TestCase):
     def test_converts_world_to_color_pose_to_world_to_depth_pose(self):
