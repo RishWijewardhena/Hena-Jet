@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
+from PIL import Image
 import numpy as np
 
 
@@ -19,6 +21,7 @@ from radius_calibration import (  # noqa: E402
     has_sufficient_angular_coverage,
     marker_normal,
 )
+from generate_radius_markers import generate_marker_kit  # noqa: E402
 
 
 class ProfileMarkerMapTests(unittest.TestCase):
@@ -59,6 +62,24 @@ class ProfileMarkerMapTests(unittest.TestCase):
             np.testing.assert_allclose(
                 marker_normal(corners), expected_normals[marker["face"]], atol=1e-12
             )
+
+    def test_print_kit_contains_scaled_markers_map_and_placement_guide(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = generate_marker_kit(Path(temp_dir), dpi=600)
+
+            self.assertTrue(paths["pdf"].is_file())
+            self.assertTrue(paths["map"].is_file())
+            self.assertTrue(paths["placement_guide"].is_file())
+            self.assertEqual(len(paths["markers"]), 4)
+
+            marker_image = Image.open(paths["markers"][0]).convert("L")
+            non_white = np.argwhere(np.asarray(marker_image) < 128)
+            coded_height_px = int(non_white[:, 0].max() - non_white[:, 0].min() + 1)
+            coded_width_px = int(non_white[:, 1].max() - non_white[:, 1].min() + 1)
+            printed_width_mm = coded_width_px / 600.0 * 25.4
+            printed_height_mm = coded_height_px / 600.0 * 25.4
+            self.assertAlmostEqual(printed_width_mm, 18.0, delta=0.03)
+            self.assertAlmostEqual(printed_height_mm, 18.0, delta=0.03)
 
 
 class OrbitFitTests(unittest.TestCase):
