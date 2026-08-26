@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -169,11 +171,27 @@ class RadiusCalibrationCaptureTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(args.angles), 3)
         self.assertIn(0.0, args.angles)
-        self.assertEqual(args.frames_per_angle, 5)
+        self.assertEqual(args.frames_per_angle, 10)
+        self.assertEqual(args.min_valid_poses_per_angle, 6)
         self.assertEqual(
             args.marker_map,
             Path("outputs/radius_markers/profile_marker_map.json"),
         )
+
+    def test_loads_schema_two_map_with_per_marker_sizes(self):
+        marker_map = {
+            "schema_version": 2,
+            "dictionary": "DICT_5X5_100",
+            "marker_sizes_m": [0.018, 0.014, 0.018, 0.014],
+            "markers": [{"id": 0, "size_m": 0.018, "corners_m": []}],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "profile_marker_map.json"
+            path.write_text(json.dumps(marker_map), encoding="utf-8")
+
+            loaded = test_radius.load_marker_map(path)
+
+        self.assertEqual(loaded["schema_version"], 2)
 
     def test_rejects_pose_above_the_reprojection_error_limit(self):
         class FakeDetector:

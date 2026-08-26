@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import cv2
+from PIL import Image
 
 
 SYNC_WORKFLOW_DIR = (
@@ -98,6 +99,41 @@ class ProfileMarkerMapTests(unittest.TestCase):
                     "1": [0.080, 0.020],
                     "2": [0.110, 0.020],
                 },
+            )
+
+    def test_wrap_prints_each_coded_square_at_its_declared_physical_size(self):
+        dpi = 600
+        marker_sizes_mm = {0: 18.0, 1: 14.0, 2: 18.0, 3: 14.0}
+        marker_centers_mm = {
+            3: (20.0, 20.0),
+            0: (50.0, 20.0),
+            1: (80.0, 20.0),
+            2: (110.0, 20.0),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = generate_marker_kit(Path(temp_dir), dpi=dpi)
+            wrap = np.asarray(Image.open(paths["wrap_preview"]).convert("L"))
+
+        for marker_id, declared_size_mm in marker_sizes_mm.items():
+            center_x_mm, center_y_mm = marker_centers_mm[marker_id]
+            margin_mm = declared_size_mm / 2.0 + 1.0
+            x0 = round((center_x_mm - margin_mm) / 25.4 * dpi)
+            x1 = round((center_x_mm + margin_mm) / 25.4 * dpi)
+            y0 = round((center_y_mm - margin_mm) / 25.4 * dpi)
+            y1 = round((center_y_mm + margin_mm) / 25.4 * dpi)
+            black_pixels = np.argwhere(wrap[y0:y1, x0:x1] < 10)
+            printed_height_px, printed_width_px = np.ptp(black_pixels, axis=0) + 1
+
+            self.assertAlmostEqual(
+                printed_width_px * 25.4 / dpi,
+                declared_size_mm,
+                delta=0.03,
+            )
+            self.assertAlmostEqual(
+                printed_height_px * 25.4 / dpi,
+                declared_size_mm,
+                delta=0.03,
             )
 
 

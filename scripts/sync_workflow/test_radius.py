@@ -52,12 +52,12 @@ def parse_args(argv=None):
         default=[0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0, -180.0],
         help="Motor angles used to observe the fixed marker profile",
     )
-    parser.add_argument("--frames-per-angle", type=int, default=5)
+    parser.add_argument("--frames-per-angle", type=int, default=10)
     parser.add_argument("--depth-min-m", type=float, default=0.02)
     parser.add_argument("--depth-max-m", type=float, default=0.35)
     parser.add_argument("--timeout-ms", type=int, default=2000)
     parser.add_argument("--max-reprojection-error-px", type=float, default=1.5)
-    parser.add_argument("--min-valid-poses-per-angle", type=int, default=3)
+    parser.add_argument("--min-valid-poses-per-angle", type=int, default=6)
     parser.add_argument("--min-unique-angles", type=int, default=6)
     parser.add_argument("--max-angle-gap-deg", type=float, default=90.0)
     parser.add_argument("--pose-axis-length-m", type=float, default=0.025)
@@ -67,10 +67,17 @@ def parse_args(argv=None):
 def load_marker_map(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as file:
         marker_map = json.load(file)
-    required = {"dictionary", "marker_size_m", "markers"}
+    required = {"dictionary", "markers"}
     missing = required - marker_map.keys()
     if missing:
         raise ValueError(f"Marker map is missing fields: {', '.join(sorted(missing))}")
+    has_global_size = marker_map.get("marker_size_m") is not None
+    if not has_global_size and any(
+        marker.get("size_m") is None for marker in marker_map["markers"]
+    ):
+        raise ValueError(
+            "Marker map must provide marker_size_m or size_m for every marker"
+        )
     return marker_map
 
 

@@ -79,7 +79,7 @@ def _draw_centerline_without_markers(
     y = mm_to_px(WRAP_HEIGHT_MM / 2.0, dpi)
     excluded = []
     for marker_id, (center_x_mm, _) in MARKER_CENTERS_MM.items():
-        half = marker_sizes_mm[marker_id] / 2.0 + 1.0
+        half = marker_sizes_mm[marker_id] / 2.0 + 4.0
         excluded.append((center_x_mm - half, center_x_mm + half))
     cursor_mm = 0.0
     for start_mm, end_mm in sorted(excluded):
@@ -116,9 +116,16 @@ def _create_wrap_image(marker_map: dict[str, Any], dpi: int) -> Image.Image:
     }
 
     glue_end_px = mm_to_px(10.0, dpi)
+    glue_zone = Image.new("L", (glue_end_px, height_px), 255)
+    glue_draw = ImageDraw.Draw(glue_zone)
     hatch_step = max(4, mm_to_px(2.0, dpi))
     for offset in range(-height_px, glue_end_px + height_px, hatch_step):
-        draw.line((offset, height_px, offset + height_px, 0), fill=235, width=1)
+        glue_draw.line(
+            (offset, height_px, offset + height_px, 0),
+            fill=235,
+            width=1,
+        )
+    wrap.paste(glue_zone, (0, 0))
 
     _draw_centerline_without_markers(
         draw,
@@ -335,9 +342,23 @@ def generate_marker_kit(
     )
     draw.text(
         (wrap_x, wrap_y - mm_to_px(5.0, dpi)),
-        "This long edge points toward the RIGHT end of the horizontal bar  ->",
+        "The TOP edge of this strip must face the RIGHT end of the horizontal bar",
         fill=0,
         font=_font(2.4, dpi),
+    )
+    arrow_x = wrap_x + wrap.width + mm_to_px(7.0, dpi)
+    draw.line(
+        (arrow_x, wrap_y + mm_to_px(15.0, dpi), arrow_x, wrap_y),
+        fill=0,
+        width=max(3, mm_to_px(0.4, dpi)),
+    )
+    draw.polygon(
+        [
+            (arrow_x, wrap_y - mm_to_px(3.0, dpi)),
+            (arrow_x - mm_to_px(1.5, dpi), wrap_y + mm_to_px(1.0, dpi)),
+            (arrow_x + mm_to_px(1.5, dpi), wrap_y + mm_to_px(1.0, dpi)),
+        ],
+        fill=0,
     )
 
     instruction_y = wrap_y + wrap.height + mm_to_px(12.0, dpi)
