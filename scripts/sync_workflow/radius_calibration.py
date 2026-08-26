@@ -9,11 +9,11 @@ import numpy as np
 
 
 DEFAULT_DICTIONARY = "DICT_5X5_100"
-DEFAULT_MARKER_SIZE_M = 0.018
+DEFAULT_MARKER_SIZES_M = (0.018, 0.014, 0.018, 0.014)
 DEFAULT_PROFILE_WIDTH_M = 0.040
 DEFAULT_PROFILE_DEPTH_M = 0.020
-DEFAULT_CARRIER_OFFSET_M = 0.001
-DEFAULT_AXIAL_OFFSETS_M = (-0.045, -0.015, 0.015, 0.045)
+DEFAULT_CARRIER_OFFSET_M = 0.0001
+DEFAULT_AXIAL_OFFSETS_M = (0.0, 0.0, 0.0, 0.0)
 
 
 def _marker_corners(
@@ -48,15 +48,16 @@ def marker_normal(corners: np.ndarray) -> np.ndarray:
 def build_profile_marker_map(
     *,
     dictionary: str = DEFAULT_DICTIONARY,
-    marker_size_m: float = DEFAULT_MARKER_SIZE_M,
+    marker_sizes_m: Iterable[float] = DEFAULT_MARKER_SIZES_M,
     profile_width_m: float = DEFAULT_PROFILE_WIDTH_M,
     profile_depth_m: float = DEFAULT_PROFILE_DEPTH_M,
     carrier_offset_m: float = DEFAULT_CARRIER_OFFSET_M,
     axial_offsets_m: Iterable[float] = DEFAULT_AXIAL_OFFSETS_M,
 ) -> dict[str, Any]:
     """Build the fixed 3D marker map for a rectangular four-face profile."""
-    if marker_size_m <= 0.0:
-        raise ValueError("marker_size_m must be positive")
+    marker_sizes = tuple(float(value) for value in marker_sizes_m)
+    if len(marker_sizes) != 4 or any(value <= 0.0 for value in marker_sizes):
+        raise ValueError("Exactly four positive marker sizes are required")
     if profile_width_m <= 0.0 or profile_depth_m <= 0.0:
         raise ValueError("Profile dimensions must be positive")
     if carrier_offset_m < 0.0:
@@ -70,20 +71,22 @@ def build_profile_marker_map(
     half_depth = profile_depth_m / 2.0 + carrier_offset_m
     definitions = [
         (0, "front", [0.0, half_depth, z_offsets[0]], [-1.0, 0.0, 0.0]),
-        (1, "right", [half_width, 0.0, z_offsets[1]], [0.0, 1.0, 0.0]),
+        (1, "top", [half_width, 0.0, z_offsets[1]], [0.0, 1.0, 0.0]),
         (2, "back", [0.0, -half_depth, z_offsets[2]], [1.0, 0.0, 0.0]),
-        (3, "left", [-half_width, 0.0, z_offsets[3]], [0.0, -1.0, 0.0]),
+        (3, "bottom", [-half_width, 0.0, z_offsets[3]], [0.0, -1.0, 0.0]),
     ]
 
     markers = []
     for marker_id, face, center_values, horizontal_values in definitions:
         center = np.asarray(center_values, dtype=np.float64)
         horizontal = np.asarray(horizontal_values, dtype=np.float64)
+        marker_size_m = marker_sizes[marker_id]
         corners = _marker_corners(center, horizontal, marker_size_m)
         markers.append(
             {
                 "id": marker_id,
                 "face": face,
+                "size_m": marker_size_m,
                 "center_m": center.tolist(),
                 "corners_m": corners.tolist(),
                 "outward_normal": marker_normal(corners).tolist(),
@@ -92,18 +95,18 @@ def build_profile_marker_map(
         )
 
     return {
-        "schema_version": 1,
-        "purpose": "four-face fixed-profile orbit-radius calibration",
+        "schema_version": 2,
+        "purpose": "same-position continuous-wrap orbit-radius calibration",
         "dictionary": dictionary,
-        "marker_size_m": float(marker_size_m),
+        "marker_sizes_m": list(marker_sizes),
         "profile_cross_section_m": [float(profile_width_m), float(profile_depth_m)],
         "carrier_offset_m": float(carrier_offset_m),
         "world_frame": {
             "units": "meters",
-            "origin": "profile cross-section center at the midpoint of the four marker levels",
-            "x_axis": "toward the right profile face",
+            "origin": "profile cross-section center on the shared marker centerline",
+            "x_axis": "toward the top profile face",
             "y_axis": "toward the front profile face",
-            "z_axis": "up along the profile bar",
+            "z_axis": "along the horizontal profile toward its chosen right end",
         },
         "markers": markers,
     }
@@ -412,7 +415,10 @@ def solve_profile_pose(
         }
 
     marker_id, marker, image_points = known[0]
-    marker_size_m = float(marker_map["marker_size_m"])
+    marker_size_value = marker.get("size_m", marker_map.get("marker_size_m"))
+    if marker_size_value is None:
+        return empty_result
+    marker_size_m = float(marker_size_value)
     half = marker_size_m / 2.0
     local_points = np.array(
         [
@@ -453,14 +459,53 @@ def solve_profile_pose(
             dist_coeffs,
         )
         world_to_camera = marker_to_camera @ transform_inverse(marker_to_world)
-        candidates.append((error, world_to_camera, rvec, tvec))
+        camera_center = camera_center_world(world_to_camera)
+        marker_center = np.asarray(marker["center_m"], dtype=np.float64)
+        outward_normal = np.asarray(marker["outward_normal"], dtype=np.float64)
+        if float(np.dot(camera_center - marker_center, outward_normal)) <= 0.0:
+            continue
+        candidates.append((error, world_to_camera, rvec, tvec, "single-marker-ippe"))
+    if not candidates:
+        object_points = np.asarray(marker["corners_m"], dtype=np.float64)
+        fallback_ok, fallback_rvec, fallback_tvec = cv2.solvePnP(
+            object_points,
+            image_points,
+            camera_matrix,
+            dist_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if fallback_ok:
+            fallback_pose = rvec_tvec_to_matrix(fallback_rvec, fallback_tvec)
+            fallback_center = camera_center_world(fallback_pose)
+            marker_center = np.asarray(marker["center_m"], dtype=np.float64)
+            outward_normal = np.asarray(marker["outward_normal"], dtype=np.float64)
+            if float(np.dot(fallback_center - marker_center, outward_normal)) > 0.0:
+                fallback_error = _mean_reprojection_error(
+                    object_points,
+                    image_points,
+                    fallback_rvec,
+                    fallback_tvec,
+                    camera_matrix,
+                    dist_coeffs,
+                )
+                candidates.append(
+                    (
+                        fallback_error,
+                        fallback_pose,
+                        fallback_rvec,
+                        fallback_tvec,
+                        "single-marker-iterative-fallback",
+                    )
+                )
     if not candidates:
         return empty_result
 
-    error, world_to_camera, rvec, tvec = min(candidates, key=lambda item: item[0])
+    error, world_to_camera, rvec, tvec, method = min(
+        candidates, key=lambda item: item[0]
+    )
     return {
         "ok": True,
-        "method": "single-marker-ippe",
+        "method": method,
         "used_ids": [marker_id],
         "world_to_camera": world_to_camera,
         "rvec": rvec,

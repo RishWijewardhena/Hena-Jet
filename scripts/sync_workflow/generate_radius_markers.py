@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the printable four-face ArUco orbit-radius calibration kit."""
+"""Generate an exact A4 ArUco wrap for a horizontal 20 x 40 mm profile."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from radius_calibration import build_profile_marker_map
@@ -18,6 +17,22 @@ from radius_calibration import build_profile_marker_map
 MM_PER_INCH = 25.4
 A4_SIZE_MM = (210.0, 297.0)
 DEFAULT_OUTPUT_DIR = Path("outputs/radius_markers")
+WRAP_LENGTH_MM = 130.0
+WRAP_HEIGHT_MM = 40.0
+FOLD_POSITIONS_MM = (10.0, 30.0, 70.0, 90.0)
+MARKER_CENTERS_MM = {
+    3: (20.0, 20.0),   # bottom, 14 mm
+    0: (50.0, 20.0),   # front, 18 mm
+    1: (80.0, 20.0),   # top, 14 mm
+    2: (110.0, 20.0),  # back, 18 mm
+}
+FACE_RANGES_MM = (
+    ("glue tab", 0.0, 10.0),
+    ("bottom / ID 3", 10.0, 30.0),
+    ("front / ID 0", 30.0, 70.0),
+    ("top / ID 1", 70.0, 90.0),
+    ("back / ID 2", 90.0, 130.0),
+)
 
 
 def mm_to_px(value_mm: float, dpi: int) -> int:
@@ -28,66 +43,212 @@ def _font(size_mm: float, dpi: int):
     return ImageFont.truetype("DejaVuSans.ttf", mm_to_px(size_mm, dpi))
 
 
-def _text_size(draw: ImageDraw.ImageDraw, text: str, font=None) -> tuple[int, int]:
-    box = draw.textbbox((0, 0), text, font=font or ImageFont.load_default())
-    return box[2] - box[0], box[3] - box[1]
-
-
-def _make_carrier(
-    dictionary,
-    marker_id: int,
+def _dashed_line(
+    draw: ImageDraw.ImageDraw,
+    start: tuple[int, int],
+    end: tuple[int, int],
     *,
-    marker_size_mm: float,
-    carrier_size_mm: float,
+    fill,
+    width: int,
+    dash_px: int,
+) -> None:
+    x0, y0 = start
+    x1, y1 = end
+    if x0 == x1:
+        for y in range(y0, y1, dash_px * 2):
+            draw.line((x0, y, x1, min(y + dash_px, y1)), fill=fill, width=width)
+    elif y0 == y1:
+        for x in range(x0, x1, dash_px * 2):
+            draw.line((x, y0, min(x + dash_px, x1), y1), fill=fill, width=width)
+    else:
+        raise ValueError("Only horizontal and vertical dashed lines are supported")
+
+
+def _marker_image(dictionary, marker_id: int, size_mm: float, dpi: int) -> Image.Image:
+    size_px = mm_to_px(size_mm, dpi)
+    marker = cv2.aruco.generateImageMarker(dictionary, marker_id, size_px)
+    return Image.fromarray(marker).convert("L")
+
+
+def _draw_centerline_without_markers(
+    draw: ImageDraw.ImageDraw,
+    *,
     dpi: int,
-) -> Image.Image:
-    carrier_px = mm_to_px(carrier_size_mm, dpi)
-    marker_px = mm_to_px(marker_size_mm, dpi)
-    marker = cv2.aruco.generateImageMarker(dictionary, marker_id, marker_px)
-    image = Image.new("L", (carrier_px, carrier_px), 255)
-    offset = (carrier_px - marker_px) // 2
-    image.paste(Image.fromarray(marker), (offset, offset))
-    return image
+    marker_sizes_mm: dict[int, float],
+) -> None:
+    y = mm_to_px(WRAP_HEIGHT_MM / 2.0, dpi)
+    excluded = []
+    for marker_id, (center_x_mm, _) in MARKER_CENTERS_MM.items():
+        half = marker_sizes_mm[marker_id] / 2.0 + 1.0
+        excluded.append((center_x_mm - half, center_x_mm + half))
+    cursor_mm = 0.0
+    for start_mm, end_mm in sorted(excluded):
+        if start_mm > cursor_mm:
+            _dashed_line(
+                draw,
+                (mm_to_px(cursor_mm, dpi), y),
+                (mm_to_px(start_mm, dpi), y),
+                fill=175,
+                width=max(1, mm_to_px(0.15, dpi)),
+                dash_px=max(2, mm_to_px(1.2, dpi)),
+            )
+        cursor_mm = max(cursor_mm, end_mm)
+    if cursor_mm < WRAP_LENGTH_MM:
+        _dashed_line(
+            draw,
+            (mm_to_px(cursor_mm, dpi), y),
+            (mm_to_px(WRAP_LENGTH_MM, dpi), y),
+            fill=175,
+            width=max(1, mm_to_px(0.15, dpi)),
+            dash_px=max(2, mm_to_px(1.2, dpi)),
+        )
 
 
-def _draw_placement_guide(marker_map: dict[str, Any], output_path: Path) -> None:
-    image = Image.new("RGB", (1500, 1050), "white")
-    draw = ImageDraw.Draw(image)
-    draw.text((45, 35), "20 x 40 mm profile marker placement", fill="black")
-    draw.text(
-        (45, 65),
-        "Z points up the bar. Match every ID, face name, and UP arrow.",
-        fill="black",
+def _create_wrap_image(marker_map: dict[str, Any], dpi: int) -> Image.Image:
+    width_px = mm_to_px(WRAP_LENGTH_MM, dpi)
+    height_px = mm_to_px(WRAP_HEIGHT_MM, dpi)
+    wrap = Image.new("L", (width_px, height_px), 255)
+    draw = ImageDraw.Draw(wrap)
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
+    marker_sizes_mm = {
+        int(marker["id"]): float(marker["size_m"]) * 1000.0
+        for marker in marker_map["markers"]
+    }
+
+    glue_end_px = mm_to_px(10.0, dpi)
+    hatch_step = max(4, mm_to_px(2.0, dpi))
+    for offset in range(-height_px, glue_end_px + height_px, hatch_step):
+        draw.line((offset, height_px, offset + height_px, 0), fill=235, width=1)
+
+    _draw_centerline_without_markers(
+        draw,
+        dpi=dpi,
+        marker_sizes_mm=marker_sizes_mm,
     )
 
-    face_x = {"front": 220, "right": 520, "back": 820, "left": 1120}
-    top = 150
-    bottom = 900
-    for face, x in face_x.items():
-        width = 220 if face in {"front", "back"} else 130
-        draw.rectangle((x - width // 2, top, x + width // 2, bottom), outline="gray", width=4)
-        draw.text((x - 30, bottom + 15), face.upper(), fill="black")
-        draw.line((x, top + 55, x, top + 5), fill="green", width=6)
-        draw.polygon([(x, top - 15), (x - 12, top + 10), (x + 12, top + 10)], fill="green")
-        draw.text((x + 16, top + 5), "+Z / UP", fill="green")
+    fold_width = max(1, mm_to_px(0.20, dpi))
+    dash_px = max(3, mm_to_px(1.5, dpi))
+    for fold_mm in FOLD_POSITIONS_MM:
+        x = mm_to_px(fold_mm, dpi)
+        _dashed_line(
+            draw,
+            (x, 0),
+            (x, height_px - 1),
+            fill=105,
+            width=fold_width,
+            dash_px=dash_px,
+        )
 
-    z_min = -0.060
-    z_max = 0.060
     for marker in marker_map["markers"]:
-        face = marker["face"]
-        z_m = marker["center_m"][2]
-        fraction = (z_max - z_m) / (z_max - z_min)
-        y = int(round(top + 95 + fraction * (bottom - top - 180)))
-        x = face_x[face]
-        draw.rectangle((x - 48, y - 48, x + 48, y + 48), outline="black", width=4)
-        label = f"ID {marker['id']}  Z={z_m * 1000:+.0f} mm"
-        text_width, _ = _text_size(draw, label)
-        draw.text((x - text_width // 2, y + 58), label, fill="black")
+        marker_id = int(marker["id"])
+        center_x_mm, center_y_mm = MARKER_CENTERS_MM[marker_id]
+        marker_size_mm = marker_sizes_mm[marker_id]
+        image = _marker_image(dictionary, marker_id, marker_size_mm, dpi)
+        x = mm_to_px(center_x_mm, dpi) - image.width // 2
+        y = mm_to_px(center_y_mm, dpi) - image.height // 2
+        wrap.paste(image, (x, y))
 
+    label_font = _font(1.8, dpi)
+    labels = {
+        3: "BOTTOM  ID 3  14 mm",
+        0: "FRONT  ID 0  18 mm",
+        1: "TOP  ID 1  14 mm",
+        2: "BACK  ID 2  18 mm",
+    }
+    for marker_id, label in labels.items():
+        center_x_mm, _ = MARKER_CENTERS_MM[marker_id]
+        box = draw.textbbox((0, 0), label, font=label_font)
+        text_width = box[2] - box[0]
+        draw.text(
+            (mm_to_px(center_x_mm, dpi) - text_width // 2, mm_to_px(1.5, dpi)),
+            label,
+            fill=60,
+            font=label_font,
+        )
+
+    glue_font = _font(1.6, dpi)
     draw.text(
-        (45, 995),
-        "Reference: Z=0 is halfway between the four marker levels; successive centers are 30 mm apart.",
+        (mm_to_px(1.0, dpi), mm_to_px(34.0, dpi)),
+        "GLUE",
+        fill=90,
+        font=glue_font,
+    )
+    return wrap
+
+
+def _draw_ruler(draw: ImageDraw.ImageDraw, x: int, y: int, dpi: int) -> None:
+    length = mm_to_px(100.0, dpi)
+    label_font = _font(2.2, dpi)
+    draw.line((x, y, x + length, y), fill=0, width=max(2, mm_to_px(0.2, dpi)))
+    for value_mm in range(0, 101, 10):
+        tick_x = x + mm_to_px(float(value_mm), dpi)
+        tick = mm_to_px(5.0 if value_mm % 50 else 7.0, dpi)
+        draw.line((tick_x, y - tick, tick_x, y + tick), fill=0, width=2)
+        draw.text(
+            (tick_x - mm_to_px(1.0, dpi), y + tick + mm_to_px(1.0, dpi)),
+            str(value_mm),
+            fill=0,
+            font=label_font,
+        )
+    draw.text(
+        (x, y + mm_to_px(14.0, dpi)),
+        "100 mm verification ruler",
+        fill=0,
+        font=_font(2.6, dpi),
+    )
+
+
+def _draw_placement_guide(output_path: Path) -> None:
+    image = Image.new("RGB", (1800, 950), "white")
+    draw = ImageDraw.Draw(image)
+    title = ImageFont.truetype("DejaVuSans.ttf", 38)
+    body = ImageFont.truetype("DejaVuSans.ttf", 24)
+    small = ImageFont.truetype("DejaVuSans.ttf", 20)
+    draw.text((45, 30), "Continuous wrap for horizontal 20 x 40 mm profile", fill="black", font=title)
+    draw.text(
+        (45, 85),
+        "All marker centers share one line along the bar. The top strip edge points to the chosen RIGHT end.",
         fill="black",
+        font=body,
+    )
+
+    scale = 10
+    x0, y0 = 90, 240
+    width, height = int(WRAP_LENGTH_MM * scale), int(WRAP_HEIGHT_MM * scale)
+    draw.rectangle((x0, y0, x0 + width, y0 + height), outline="red", width=4)
+    draw.rectangle((x0, y0, x0 + 100, y0 + height), fill=(240, 240, 240), outline="gray")
+    for fold_mm in FOLD_POSITIONS_MM:
+        x = x0 + int(fold_mm * scale)
+        for y in range(y0, y0 + height, 24):
+            draw.line((x, y, x, min(y + 12, y0 + height)), fill="blue", width=3)
+
+    marker_sizes = {0: 18, 1: 14, 2: 18, 3: 14}
+    for marker_id, (cx_mm, cy_mm) in MARKER_CENTERS_MM.items():
+        half = marker_sizes[marker_id] * scale / 2
+        cx, cy = x0 + cx_mm * scale, y0 + cy_mm * scale
+        draw.rectangle((cx - half, cy - half, cx + half, cy + half), fill="black")
+        draw.text((cx - 28, cy - 12), f"ID {marker_id}", fill="white", font=small)
+
+    for face, start_mm, end_mm in FACE_RANGES_MM:
+        cx = x0 + int((start_mm + end_mm) / 2.0 * scale)
+        draw.text((cx - 55, y0 + height + 22), face.upper(), fill="black", font=small)
+    draw.text((x0, y0 - 70), "CUT: solid red outline", fill="red", font=body)
+    draw.text((x0 + 470, y0 - 70), "FOLD: dashed blue lines", fill="blue", font=body)
+    draw.line((x0 + width + 80, y0 + height, x0 + width + 80, y0), fill="green", width=7)
+    draw.polygon(
+        [
+            (x0 + width + 80, y0 - 28),
+            (x0 + width + 64, y0 + 8),
+            (x0 + width + 96, y0 + 8),
+        ],
+        fill="green",
+    )
+    draw.text((x0 + width + 105, y0 + 15), "+Z / RIGHT END", fill="green", font=body)
+    draw.text(
+        (90, 820),
+        "Wrap order from the lower-rear seam: glue tab -> bottom -> front -> top -> back.",
+        fill="black",
+        font=body,
     )
     image.save(output_path)
 
@@ -96,118 +257,106 @@ def generate_marker_kit(
     output_dir: Path,
     *,
     dpi: int = 600,
-    marker_size_mm: float = 18.0,
-    carrier_size_mm: float = 26.0,
     profile_width_mm: float = 40.0,
     profile_depth_mm: float = 20.0,
-    carrier_offset_mm: float = 1.0,
-    axial_offsets_mm: tuple[float, float, float, float] = (-45.0, -15.0, 15.0, 45.0),
+    carrier_offset_mm: float = 0.1,
 ) -> dict[str, Any]:
-    """Write a print-ready marker kit and return all generated paths."""
+    """Write the replacement continuous wrap, marker map, and guide."""
     if dpi <= 0:
         raise ValueError("dpi must be positive")
-    if carrier_size_mm <= marker_size_mm:
-        raise ValueError("carrier_size_mm must be larger than marker_size_mm")
+    if profile_width_mm != 40.0 or profile_depth_mm != 20.0:
+        raise ValueError("This exact wrap is designed for a 20 x 40 mm profile")
 
     output_dir = Path(output_dir)
-    markers_dir = output_dir / "markers"
-    markers_dir.mkdir(parents=True, exist_ok=True)
-
+    output_dir.mkdir(parents=True, exist_ok=True)
     marker_map = build_profile_marker_map(
-        marker_size_m=marker_size_mm * 0.001,
+        marker_sizes_m=[0.018, 0.014, 0.018, 0.014],
         profile_width_m=profile_width_mm * 0.001,
         profile_depth_m=profile_depth_mm * 0.001,
         carrier_offset_m=carrier_offset_mm * 0.001,
-        axial_offsets_m=[value * 0.001 for value in axial_offsets_mm],
+        axial_offsets_m=[0.0, 0.0, 0.0, 0.0],
     )
     marker_map.update(
         {
-            "carrier_size_m": carrier_size_mm * 0.001,
             "print_dpi": dpi,
-            "print_instruction": "Print the PDF at Actual size / 100%; never use Fit to page.",
+            "print_instruction": "Print at Actual size / 100%; never use Fit to page.",
+            "wrap": {
+                "material": "ordinary A4 paper attached with a thin, even glue layer",
+                "size_m": [0.130, 0.040],
+                "profile_perimeter_m": 0.120,
+                "overlap_tab_m": 0.010,
+                "fold_positions_m": [0.010, 0.030, 0.070, 0.090],
+                "seam": "lower-rear profile corner",
+                "marker_centers_unwrapped_m": {
+                    str(marker_id): [x_mm * 0.001, y_mm * 0.001]
+                    for marker_id, (x_mm, y_mm) in MARKER_CENTERS_MM.items()
+                },
+                "positive_profile_axis": "top edge of the strip toward the chosen right end",
+            },
         }
     )
 
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
-    carrier_images: list[Image.Image] = []
-    marker_paths: list[Path] = []
-    for marker in marker_map["markers"]:
-        carrier = _make_carrier(
-            dictionary,
-            marker["id"],
-            marker_size_mm=marker_size_mm,
-            carrier_size_mm=carrier_size_mm,
-            dpi=dpi,
-        )
-        marker_path = markers_dir / f"marker_{marker['id']}_{marker['face']}.png"
-        carrier.save(marker_path, dpi=(dpi, dpi))
-        carrier_images.append(carrier)
-        marker_paths.append(marker_path)
+    wrap = _create_wrap_image(marker_map, dpi)
+    wrap_preview_path = output_dir / "profile_radius_wrap.png"
+    wrap.save(wrap_preview_path, dpi=(dpi, dpi))
 
     page_width = mm_to_px(A4_SIZE_MM[0], dpi)
     page_height = mm_to_px(A4_SIZE_MM[1], dpi)
     page = Image.new("L", (page_width, page_height), 255)
     draw = ImageDraw.Draw(page)
     margin = mm_to_px(15.0, dpi)
-    title_font = _font(4.0, dpi)
-    warning_font = _font(3.2, dpi)
-    body_font = _font(2.6, dpi)
-    label_font = _font(2.4, dpi)
     draw.text(
         (margin, margin),
-        "Four-face ArUco orbit-radius calibration kit",
+        "Exact ArUco wrap - horizontal 20 x 40 mm profile",
         fill=0,
-        font=title_font,
+        font=_font(4.0, dpi),
     )
     draw.text(
         (margin, margin + mm_to_px(6.0, dpi)),
         "PRINT AT ACTUAL SIZE / 100% - DO NOT FIT TO PAGE",
         fill=0,
-        font=warning_font,
+        font=_font(3.2, dpi),
     )
     draw.text(
         (margin, margin + mm_to_px(11.0, dpi)),
-        "18.0 mm coded square | 26.0 mm carrier | DICT_5X5_100",
+        "Solid outline = CUT | dashed lines = FOLD | centers lie on one longitudinal position",
         fill=0,
-        font=body_font,
+        font=_font(2.4, dpi),
     )
 
-    start_y = margin + mm_to_px(18.0, dpi)
-    column_x = [margin, margin + mm_to_px(55.0, dpi)]
-    row_y = [start_y, start_y + mm_to_px(55.0, dpi)]
-    carrier_px = mm_to_px(carrier_size_mm, dpi)
-    for index, (marker, carrier) in enumerate(zip(marker_map["markers"], carrier_images)):
-        x = column_x[index % 2]
-        y = row_y[index // 2]
-        page.paste(carrier, (x, y))
-        draw.rectangle((x, y, x + carrier_px - 1, y + carrier_px - 1), outline=128, width=2)
-        draw.text(
-            (x, y + carrier_px + mm_to_px(1.5, dpi)),
-            f"ID {marker['id']} - {marker['face'].upper()} - UP toward +Z",
-            fill=0,
-            font=label_font,
-        )
-
-    ruler_x = margin
-    ruler_y = row_y[-1] + carrier_px + mm_to_px(25.0, dpi)
-    ruler_length = mm_to_px(100.0, dpi)
-    draw.line((ruler_x, ruler_y, ruler_x + ruler_length, ruler_y), fill=0, width=4)
-    for value_mm in range(0, 101, 10):
-        x = ruler_x + mm_to_px(float(value_mm), dpi)
-        tick = mm_to_px(4.0 if value_mm % 50 else 7.0, dpi)
-        draw.line((x, ruler_y - tick, x, ruler_y + tick), fill=0, width=3)
-        draw.text(
-            (x - mm_to_px(1.0, dpi), ruler_y + tick + mm_to_px(1.0, dpi)),
-            str(value_mm),
-            fill=0,
-            font=label_font,
-        )
+    wrap_x = margin
+    wrap_y = margin + mm_to_px(24.0, dpi)
+    page.paste(wrap, (wrap_x, wrap_y))
+    cut_width = max(2, mm_to_px(0.25, dpi))
+    draw.rectangle(
+        (wrap_x, wrap_y, wrap_x + wrap.width - 1, wrap_y + wrap.height - 1),
+        outline=0,
+        width=cut_width,
+    )
     draw.text(
-        (ruler_x, ruler_y + mm_to_px(13.0, dpi)),
-        "100 mm verification ruler",
+        (wrap_x, wrap_y - mm_to_px(5.0, dpi)),
+        "This long edge points toward the RIGHT end of the horizontal bar  ->",
         fill=0,
-        font=body_font,
+        font=_font(2.4, dpi),
     )
+
+    instruction_y = wrap_y + wrap.height + mm_to_px(12.0, dpi)
+    instructions = [
+        "1. Verify the ruler and marker sizes before cutting.",
+        "2. Cut only the solid outer rectangle; do not cut around markers.",
+        "3. Pre-crease every dashed fold line, keeping each marker surface flat.",
+        "4. Start at the lower-rear corner and wrap: bottom, front, top, back.",
+        "5. Apply a thin even glue layer; avoid bubbles, wrinkles, and glossy tape over markers.",
+    ]
+    body_font = _font(2.5, dpi)
+    for index, instruction in enumerate(instructions):
+        draw.text(
+            (margin, instruction_y + index * mm_to_px(5.0, dpi)),
+            instruction,
+            fill=0,
+            font=body_font,
+        )
+    _draw_ruler(draw, margin, instruction_y + mm_to_px(42.0, dpi), dpi)
 
     png_path = output_dir / "profile_radius_markers_a4.png"
     pdf_path = output_dir / "profile_radius_markers_a4.pdf"
@@ -216,14 +365,13 @@ def generate_marker_kit(
     page.save(png_path, dpi=(dpi, dpi))
     page.convert("RGB").save(pdf_path, "PDF", resolution=float(dpi))
     map_path.write_text(json.dumps(marker_map, indent=2) + "\n", encoding="utf-8")
-    _draw_placement_guide(marker_map, placement_path)
-
+    _draw_placement_guide(placement_path)
     return {
         "pdf": pdf_path,
         "png": png_path,
         "map": map_path,
         "placement_guide": placement_path,
-        "markers": marker_paths,
+        "wrap_preview": wrap_preview_path,
     }
 
 
@@ -238,9 +386,10 @@ def main() -> None:
     args = parse_args()
     paths = generate_marker_kit(args.output_dir, dpi=args.dpi)
     print(f"PDF: {paths['pdf']}")
+    print(f"Exact wrap preview: {paths['wrap_preview']}")
     print(f"Marker map: {paths['map']}")
     print(f"Placement guide: {paths['placement_guide']}")
-    print("Print the PDF at Actual size / 100%; do not use Fit to page.")
+    print("Print at Actual size / 100%; do not use Fit to page.")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from PIL import Image
 import numpy as np
 import cv2
 
@@ -29,61 +29,76 @@ from generate_radius_markers import generate_marker_kit  # noqa: E402
 
 
 class ProfileMarkerMapTests(unittest.TestCase):
-    def test_uses_requested_profile_carrier_and_axial_geometry(self):
+    def test_uses_same_position_mixed_size_horizontal_wrap_geometry(self):
         marker_map = build_profile_marker_map()
 
         self.assertEqual(marker_map["dictionary"], "DICT_5X5_100")
-        self.assertEqual(marker_map["marker_size_m"], 0.018)
+        self.assertEqual(marker_map["schema_version"], 2)
         self.assertEqual(marker_map["profile_cross_section_m"], [0.040, 0.020])
-        self.assertEqual(marker_map["carrier_offset_m"], 0.001)
+        self.assertEqual(marker_map["carrier_offset_m"], 0.0001)
+        self.assertEqual(
+            [marker["size_m"] for marker in marker_map["markers"]],
+            [0.018, 0.014, 0.018, 0.014],
+        )
         self.assertEqual(
             [marker["center_m"][2] for marker in marker_map["markers"]],
-            [-0.045, -0.015, 0.015, 0.045],
+            [0.0, 0.0, 0.0, 0.0],
+        )
+        self.assertEqual(
+            [marker["face"] for marker in marker_map["markers"]],
+            ["front", "top", "back", "bottom"],
         )
 
         centers = {
             marker["face"]: np.asarray(marker["center_m"])
             for marker in marker_map["markers"]
         }
-        np.testing.assert_allclose(centers["front"], [0.0, 0.011, -0.045])
-        np.testing.assert_allclose(centers["right"], [0.021, 0.0, -0.015])
-        np.testing.assert_allclose(centers["back"], [0.0, -0.011, 0.015])
-        np.testing.assert_allclose(centers["left"], [-0.021, 0.0, 0.045])
+        np.testing.assert_allclose(centers["front"], [0.0, 0.0101, 0.0])
+        np.testing.assert_allclose(centers["top"], [0.0201, 0.0, 0.0])
+        np.testing.assert_allclose(centers["back"], [0.0, -0.0101, 0.0])
+        np.testing.assert_allclose(centers["bottom"], [-0.0201, 0.0, 0.0])
 
-    def test_marker_corners_are_18_mm_and_face_outward(self):
+    def test_marker_corners_use_per_face_sizes_and_point_outward(self):
         marker_map = build_profile_marker_map()
         expected_normals = {
             "front": [0.0, 1.0, 0.0],
-            "right": [1.0, 0.0, 0.0],
+            "top": [1.0, 0.0, 0.0],
             "back": [0.0, -1.0, 0.0],
-            "left": [-1.0, 0.0, 0.0],
+            "bottom": [-1.0, 0.0, 0.0],
         }
 
         for marker in marker_map["markers"]:
             corners = np.asarray(marker["corners_m"])
             side_lengths = np.linalg.norm(np.roll(corners, -1, axis=0) - corners, axis=1)
-            np.testing.assert_allclose(side_lengths, 0.018, atol=1e-12)
+            np.testing.assert_allclose(side_lengths, marker["size_m"], atol=1e-12)
             np.testing.assert_allclose(
                 marker_normal(corners), expected_normals[marker["face"]], atol=1e-12
             )
 
-    def test_print_kit_contains_scaled_markers_map_and_placement_guide(self):
+    def test_print_kit_contains_exact_continuous_wrap_and_fold_geometry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = generate_marker_kit(Path(temp_dir), dpi=600)
 
             self.assertTrue(paths["pdf"].is_file())
             self.assertTrue(paths["map"].is_file())
             self.assertTrue(paths["placement_guide"].is_file())
-            self.assertEqual(len(paths["markers"]), 4)
+            self.assertTrue(paths["wrap_preview"].is_file())
 
-            marker_image = Image.open(paths["markers"][0]).convert("L")
-            non_white = np.argwhere(np.asarray(marker_image) < 128)
-            coded_height_px = int(non_white[:, 0].max() - non_white[:, 0].min() + 1)
-            coded_width_px = int(non_white[:, 1].max() - non_white[:, 1].min() + 1)
-            printed_width_mm = coded_width_px / 600.0 * 25.4
-            printed_height_mm = coded_height_px / 600.0 * 25.4
-            self.assertAlmostEqual(printed_width_mm, 18.0, delta=0.03)
-            self.assertAlmostEqual(printed_height_mm, 18.0, delta=0.03)
+            generated_map = json.loads(paths["map"].read_text(encoding="utf-8"))
+            self.assertEqual(generated_map["wrap"]["size_m"], [0.130, 0.040])
+            self.assertEqual(
+                generated_map["wrap"]["fold_positions_m"],
+                [0.010, 0.030, 0.070, 0.090],
+            )
+            self.assertEqual(
+                generated_map["wrap"]["marker_centers_unwrapped_m"],
+                {
+                    "3": [0.020, 0.020],
+                    "0": [0.050, 0.020],
+                    "1": [0.080, 0.020],
+                    "2": [0.110, 0.020],
+                },
+            )
 
 
 class OrbitFitTests(unittest.TestCase):
@@ -266,9 +281,33 @@ class ProfilePoseTests(unittest.TestCase):
         )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["method"], "single-marker-ippe")
+        self.assertIn(
+            result["method"],
+            {"single-marker-ippe", "single-marker-iterative-fallback"},
+        )
         np.testing.assert_allclose(
             camera_center_world(result["world_to_camera"]), [0.0, 0.16, 0.0], atol=5e-4
+        )
+
+    def test_single_marker_pose_prefers_the_markers_own_size(self):
+        marker = self.marker_map["markers"][0]
+        center = np.asarray(marker["center_m"], dtype=np.float64)
+        corners = np.asarray(marker["corners_m"], dtype=np.float64)
+        marker["size_m"] = 0.014
+        marker["corners_m"] = (center + (corners - center) * (14.0 / 18.0)).tolist()
+        self.marker_map["marker_size_m"] = 0.018
+
+        result = solve_profile_pose(
+            self.marker_map,
+            [self.projected_marker(0)],
+            np.array([[0]], dtype=np.int32),
+            self.camera_matrix,
+            self.dist_coeffs,
+        )
+
+        self.assertTrue(result["ok"])
+        np.testing.assert_allclose(
+            camera_center_world(result["world_to_camera"]), [0.0, 0.16, 0.0], atol=6e-4
         )
 
     def test_ignores_unknown_marker_ids(self):
