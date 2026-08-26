@@ -84,22 +84,26 @@ python scripts/sync_workflow/generate_radius_markers.py
 
 This writes the following files under `outputs/radius_markers/`:
 
-- `profile_radius_markers_a4.pdf`: print-ready A4 sheet;
+- `profile_radius_markers_a4.pdf`: exact print-ready A4 wrap sheet;
 - `profile_radius_markers_a4.png`: raster preview;
-- `markers/`: four individual 26 x 26 mm carrier images;
+- `profile_radius_wrap.png`: the exact 130 x 40 mm unwrapped strip;
 - `profile_marker_map.json`: exact 3D marker-corner coordinates;
-- `profile_marker_placement.png`: face, ID, height, and orientation guide.
+- `profile_marker_placement.png`: fold order, face, seam, and orientation guide.
 
-Print the PDF using **Actual size / 100%**. Do not use **Fit to page**. Measure the printed 100 mm ruler and one black marker square before mounting anything; the black coded square must be 18.0 mm.
+Print the PDF on ordinary matte A4 paper using **Actual size / 100%**. Do not use **Fit to page**. Before cutting, verify the printed 100 mm ruler, an 18 mm front/back marker, and a 14 mm top/bottom marker.
 
 The generated geometry assumes:
 
 - profile cross-section: 40 mm along map X and 20 mm along map Y;
-- carrier: 26 x 26 mm, with its marker plane 1 mm above the aluminium face;
-- IDs 0, 1, 2, and 3 on the front, right, back, and left faces;
-- marker center heights of -45, -15, +15, and +45 mm along the bar's +Z direction.
+- wrap: 130 mm around the profile and 40 mm along the bar;
+- profile perimeter: 120 mm plus a 10 mm blank glue tab;
+- paper/glue marker-plane offset: approximately 0.1 mm;
+- ID 0 on the front broad face and ID 2 on the back broad face, both 18 mm;
+- ID 1 on the top narrow face and ID 3 on the bottom narrow face, both 14 mm;
+- all marker centers on the same longitudinal centerline;
+- map +Z along the horizontal profile toward its chosen right end.
 
-The carriers are staggered by 30 mm so the oversized carriers on the narrow faces do not collide. Align every carrier center and UP direction with the placement guide. Moving, rotating, scaling, or swapping a marker after generating the map invalidates that map.
+Cut only the solid 130 x 40 mm outline. Pre-crease the dashed lines at 10, 30, 70, and 90 mm without bending a marker. Beginning at the lower-rear seam, wrap in this order: glue tab, bottom, front, top, back. The long edge identified by the arrow must point toward the chosen right end of the profile. Apply a thin, even glue layer and keep every coded square flat, without bubbles or glossy tape. Moving, scaling, swapping, or independently rotating a marker invalidates the map.
 
 ### 2. Capture and calculate
 
@@ -110,7 +114,7 @@ python scripts/sync_workflow/test_radius.py \
   --output-dir outputs/test_radius
 ```
 
-At every commanded angle, the script retains the existing fused PLY and visual image, detects markers in all five RGB frames, and estimates the fixed-profile-to-RGB-camera pose. It uses joint PnP when two or more mapped markers are visible and an IPPE square solve when only one face is visible. Poses above 1.5 pixels mean reprojection error are rejected; an angle needs at least three accepted burst poses.
+At every commanded angle, the script retains the existing fused PLY and visual image, detects markers in all ten RGB frames, and estimates the fixed-profile-to-RGB-camera pose. It uses joint PnP when two or more mapped markers are visible and the marker's own 18 mm or 14 mm size when only one face is visible. A face-half-space check rejects mirrored planar poses, with an iterative fallback for exactly face-on views. Poses above 1.5 pixels mean reprojection error are rejected; an angle needs at least six accepted burst poses.
 
 The Gemini SDK transform maps depth-camera coordinates to RGB-camera coordinates. The script inverts that calibrated transform so the fitted trajectory uses the depth optical center required by `--radius-m`, not the RGB optical center.
 
