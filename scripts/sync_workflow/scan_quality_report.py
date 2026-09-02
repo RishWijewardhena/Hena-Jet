@@ -111,16 +111,16 @@ def main(argv=None):
             logger.info("Merged surface plane-RMS: %.3f mm",
                         report["merged_plane_rms_m"] * 1000.0)
 
-    # Compute cross-view residuals reusing trees
+    # Compute cross-view residuals reusing cached trees
     separations = {}
     for separation in args.separations_deg:
         values = []
         for angle, points in clouds.items():
-            other = clouds.get(angle + separation)
-            if other is None:
+            other_angle = angle + separation
+            if other_angle not in clouds:
                 continue
-            other_tree = cloud_trees[angle + separation]
-            residual = cross_view_residual_m(points, other, max_pair_distance_m=0.008)
+            other_tree = cloud_trees[other_angle]
+            residual = cross_view_residual_m(points, None, max_pair_distance_m=0.008, tree_b=other_tree)
             if residual is not None:
                 values.append(residual)
         if values:

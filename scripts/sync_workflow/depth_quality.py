@@ -33,21 +33,37 @@ def cross_view_residual_m(
     *,
     max_pair_distance_m: float = 0.008,
     min_pairs: int = 100,
+    tree_b=None,
 ) -> float | None:
     """Median nearest-neighbour distance from *points_a* to *points_b*.
 
     Only pairs closer than ``max_pair_distance_m`` count, so non-overlapping
     regions do not dominate. Returns ``None`` when the overlap is too small.
+
+    Args:
+        points_a: Nx3 query points
+        points_b: Nx3 target points (or None if tree_b is provided)
+        max_pair_distance_m: Maximum distance threshold for counted pairs
+        min_pairs: Minimum number of pairs required to return a value
+        tree_b: Optional prebuilt cKDTree over points_b; if None, builds internally
     """
     from scipy.spatial import cKDTree
 
     a = np.asarray(points_a, dtype=np.float64)
-    b = np.asarray(points_b, dtype=np.float64)
-    if a.ndim != 2 or a.shape[1] != 3 or b.ndim != 2 or b.shape[1] != 3:
-        raise ValueError("Both inputs must be Nx3 point arrays")
-    if len(a) == 0 or len(b) == 0:
+    if a.ndim != 2 or a.shape[1] != 3:
+        raise ValueError("points_a must be Nx3")
+    if len(a) == 0:
         return None
-    distances, _ = cKDTree(b).query(a)
+
+    if tree_b is None:
+        b = np.asarray(points_b, dtype=np.float64)
+        if b.ndim != 2 or b.shape[1] != 3:
+            raise ValueError("Both inputs must be Nx3 point arrays")
+        if len(b) == 0:
+            return None
+        tree_b = cKDTree(b)
+
+    distances, _ = tree_b.query(a)
     overlapping = distances[distances < max_pair_distance_m]
     if len(overlapping) < min_pairs:
         return None

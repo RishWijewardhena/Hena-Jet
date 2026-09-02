@@ -69,6 +69,29 @@ class CrossViewResidualTests(unittest.TestCase):
 
         self.assertIsNone(cross_view_residual_m(pts, far))
 
+    def test_prebuilt_tree_gives_same_result_as_internal_build(self):
+        # Verify that prebuilt cKDTree path gives identical result to internal build
+        from scipy.spatial import cKDTree
+
+        rng = np.random.default_rng(5)
+        pts_a = rng.uniform(-0.02, 0.02, size=(500, 3))
+        pts_b = rng.uniform(-0.02, 0.02, size=(500, 3))
+
+        # Internal build path
+        result_internal = cross_view_residual_m(pts_a, pts_b)
+
+        # Prebuilt tree path
+        tree_b = cKDTree(np.asarray(pts_b, dtype=np.float64))
+        result_prebuilt = cross_view_residual_m(pts_a, None, tree_b=tree_b)
+
+        # Both should produce identical results
+        if result_internal is None and result_prebuilt is None:
+            pass  # Both returned None, test passes
+        elif result_internal is not None and result_prebuilt is not None:
+            self.assertAlmostEqual(result_internal, result_prebuilt, places=10)
+        else:
+            self.fail(f"Mismatch: internal={result_internal}, prebuilt={result_prebuilt}")
+
 
 if __name__ == "__main__":
     unittest.main()
