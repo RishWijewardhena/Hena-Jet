@@ -11,6 +11,40 @@ DISPARITY_PIXELS_BY_MODE = {
     mode: pixels for pixels, mode in DISPARITY_MODE_BY_PIXELS.items()
 }
 
+
+def aligned_pointcloud_intrinsics(camera_param) -> dict[str, float | int | str]:
+    """Return intrinsics for software depth-to-color aligned depth frames.
+
+    D2C alignment reprojects depth pixels into the RGB camera image and
+    coordinate system. Back-projecting that aligned depth with the original
+    depth-camera intrinsics changes metric X/Y scale and is not geometrically
+    valid.
+    """
+    intrinsic = camera_param.rgb_intrinsic
+    return {
+        "width": int(intrinsic.width),
+        "height": int(intrinsic.height),
+        "fx": float(intrinsic.fx),
+        "fy": float(intrinsic.fy),
+        "cx": float(intrinsic.cx),
+        "cy": float(intrinsic.cy),
+        "coordinate_frame": "color",
+    }
+
+
+def depth_pointcloud_intrinsics(camera_param) -> dict[str, float | int | str]:
+    """Return intrinsics for an unaligned depth image fallback."""
+    intrinsic = camera_param.depth_intrinsic
+    return {
+        "width": int(intrinsic.width),
+        "height": int(intrinsic.height),
+        "fx": float(intrinsic.fx),
+        "fy": float(intrinsic.fy),
+        "cx": float(intrinsic.cx),
+        "cy": float(intrinsic.cy),
+        "coordinate_frame": "depth",
+    }
+
 try:
     from pyorbbecsdk import (
         AlignFilter,
@@ -109,6 +143,7 @@ class CameraController:
         self.intrinsics = None
         self.dist_coeffs = None
         self.active_disparity = None
+        self.pointcloud_coordinate_frame = None
 
     def __enter__(self):
         self.start()
@@ -164,11 +199,14 @@ class CameraController:
         config.enable_stream(color_profile)
         config.enable_stream(depth_profile)
         
-        # We prefer software D2C alignment as hardware alignment is not supported for all resolutions.
+        # Match the SDK point-cloud example: enable raw streams here, then run
+        # an explicit software depth-to-color AlignFilter on every FrameSet.
+        align_to_color = True
         try:
-            config.set_align_mode(OBAlignMode.SW_MODE)
+            self.align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
         except Exception as e:
-            logger.warning(f"Could not set SW align mode: {e}. Will not align.")
+            logger.warning(f"Could not create D2C AlignFilter: {e}. Will not align.")
+            align_to_color = False
 
         try:
             self.pipeline.enable_frame_sync()
@@ -182,15 +220,14 @@ class CameraController:
             self.pipeline.wait_for_frames(1000)
 
         self.camera_param = self.pipeline.get_camera_param()
-        # Parse intrinsics for typical open3d / cv2 usage
-        self.intrinsics = {
-            "width": self.camera_param.depth_intrinsic.width,
-            "height": self.camera_param.depth_intrinsic.height,
-            "fx": self.camera_param.depth_intrinsic.fx,
-            "fy": self.camera_param.depth_intrinsic.fy,
-            "cx": self.camera_param.depth_intrinsic.cx,
-            "cy": self.camera_param.depth_intrinsic.cy,
-        }
+        # SW_MODE is depth-to-color alignment. The aligned depth image must be
+        # back-projected with RGB intrinsics and lives in the RGB camera frame.
+        self.intrinsics = (
+            aligned_pointcloud_intrinsics(self.camera_param)
+            if align_to_color
+            else depth_pointcloud_intrinsics(self.camera_param)
+        )
+        self.pointcloud_coordinate_frame = self.intrinsics["coordinate_frame"]
         logger.info(f"Camera intrinsics initialized: {self.intrinsics}")
 
     def capture_aligned_rgbd(self, timeout_ms: int = 1000) -> Tuple[Optional[object], Optional[object]]:
@@ -216,6 +253,13 @@ class CameraController:
         if frames is None:
             logger.warning("Timeout waiting for fresh frames.")
             return None, None
+
+        if self.align_filter is not None:
+            aligned = self.align_filter.process(frames)
+            if aligned is None:
+                logger.warning("Depth-to-color alignment failed.")
+                return None, None
+            frames = aligned.as_frame_set() if hasattr(aligned, "as_frame_set") else aligned
 
         color_frame = frames.get_color_frame()
         depth_frame = frames.get_depth_frame()

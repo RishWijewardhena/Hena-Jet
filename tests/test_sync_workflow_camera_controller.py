@@ -10,7 +10,11 @@ SYNC_WORKFLOW_DIR = (
 )
 sys.path.insert(0, str(SYNC_WORKFLOW_DIR))
 
-from camera_controller import configure_disparity_search_range
+from camera_controller import (
+    CameraController,
+    aligned_pointcloud_intrinsics,
+    configure_disparity_search_range,
+)
 
 
 class FakeDevice:
@@ -59,6 +63,70 @@ class TestDisparitySearchRange(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "requested 256.*reported 128"):
             configure_disparity_search_range(device, "256")
+
+
+class TestAlignedPointCloudIntrinsics(unittest.TestCase):
+    def test_depth_to_color_alignment_uses_color_intrinsics(self):
+        class Intrinsic:
+            width = 848
+            height = 530
+            fx = 910.0
+            fy = 911.0
+            cx = 423.0
+            cy = 264.0
+
+        class DifferentDepthIntrinsic(Intrinsic):
+            fx = 780.0
+            fy = 781.0
+
+        class CameraParameters:
+            rgb_intrinsic = Intrinsic()
+            depth_intrinsic = DifferentDepthIntrinsic()
+
+        result = aligned_pointcloud_intrinsics(CameraParameters())
+
+        self.assertEqual(result["coordinate_frame"], "color")
+        self.assertEqual(result["fx"], 910.0)
+        self.assertEqual(result["fy"], 911.0)
+
+    def test_capture_explicitly_processes_each_frameset_through_d2c_alignment(self):
+        raw_frames = object()
+        aligned_color = object()
+        aligned_depth = object()
+
+        class AlignedFrames:
+            def as_frame_set(self):
+                return self
+
+            def get_color_frame(self):
+                return aligned_color
+
+            def get_depth_frame(self):
+                return aligned_depth
+
+        aligned_frames = AlignedFrames()
+
+        class FakeAlignFilter:
+            def __init__(self):
+                self.inputs = []
+
+            def process(self, frames):
+                self.inputs.append(frames)
+                return aligned_frames
+
+        class FakePipeline:
+            def wait_for_frames(self, timeout_ms):
+                return None if timeout_ms == 10 else raw_frames
+
+        camera = CameraController()
+        camera.pipeline = FakePipeline()
+        camera.align_filter = FakeAlignFilter()
+
+        color, depth = camera.capture_aligned_rgbd(timeout_ms=2000)
+
+        self.assertIs(color, aligned_color)
+        self.assertIs(depth, aligned_depth)
+        self.assertEqual(camera.align_filter.inputs, [raw_frames])
 
 
 if __name__ == "__main__":
