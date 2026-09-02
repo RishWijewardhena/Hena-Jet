@@ -29,7 +29,9 @@ def parse_args(argv=None):
                         help="Merged cloud (default: <scan-dir>/reconstruction/merged_cloud.ply)")
     parser.add_argument("--pivot", type=float, nargs=3, default=None,
                         help="Patch centre in metres; default reads orbit radius from scan_metadata.json")
-    parser.add_argument("--patch-half-extent-m", type=float, default=0.010)
+    parser.add_argument("--patch-half-extent-m", type=float, default=0.020)
+    parser.add_argument("--subsample", type=int, default=4,
+                        help="Keep every Nth point when loading PLY files (default 4)")
     parser.add_argument("--separations-deg", type=float, nargs="+",
                         default=[10.0, 30.0, 90.0, 180.0])
     parser.add_argument("--output", type=Path, default=None,
@@ -57,35 +59,59 @@ def resolve_pivot(args) -> np.ndarray:
 
 
 def main(argv=None):
+    from scipy.spatial import cKDTree
+
     args = parse_args(argv)
     pivot = resolve_pivot(args)
     merged_path = args.merged or (args.scan_dir / "reconstruction" / "merged_cloud.ply")
 
-    report: dict[str, object] = {"scan_dir": str(args.scan_dir), "pivot_m": pivot.tolist()}
+    report: dict[str, object] = {
+        "scan_dir": str(args.scan_dir),
+        "pivot_m": pivot.tolist(),
+        "subsample": args.subsample,
+    }
 
+    # Load all transformed clouds once, keyed by angle
     transformed = sorted(glob.glob(str(args.scan_dir / "reconstruction" / "01_transformed" / "*.ply")))
-    per_frame = []
+    clouds: dict[float, np.ndarray] = {}
+    cloud_trees: dict[float, cKDTree] = {}
+
     for path in transformed:
-        patch = patch_near(load_points(Path(path)), pivot, args.patch_half_extent_m)
+        match = ANGLE_PATTERN.search(Path(path).name)
+        if match:
+            angle = float(match.group(1))
+            points = load_points(Path(path))
+            # Subsample
+            points = points[::args.subsample]
+            clouds[angle] = points
+            cloud_trees[angle] = cKDTree(points)
+
+    # Compute per-frame metrics from loaded clouds
+    per_frame = []
+    frame_count = 0
+    for angle, points in clouds.items():
+        patch = patch_near(points, pivot, args.patch_half_extent_m)
+        frame_count += 1
         if len(patch) >= 50:
             per_frame.append(surface_plane_rms_m(patch))
+
     if per_frame:
         report["single_frame_plane_rms_m"] = float(np.median(per_frame))
-        logger.info("Single-frame surface plane-RMS (median): %.3f mm",
-                    report["single_frame_plane_rms_m"] * 1000.0)
+        report["single_frame_frames_used"] = len(per_frame)
+        logger.info("Single-frame surface plane-RMS (median, %d/%d frames): %.3f mm",
+                    len(per_frame), frame_count, report["single_frame_plane_rms_m"] * 1000.0)
 
+    # Compute merged metrics
     if merged_path.is_file():
-        patch = patch_near(load_points(merged_path), pivot, args.patch_half_extent_m)
+        merged_points = load_points(merged_path)
+        merged_points = merged_points[::args.subsample]
+        patch = patch_near(merged_points, pivot, args.patch_half_extent_m)
         if len(patch) >= 50:
             report["merged_plane_rms_m"] = surface_plane_rms_m(patch)
             logger.info("Merged surface plane-RMS: %.3f mm",
                         report["merged_plane_rms_m"] * 1000.0)
 
-    clouds: dict[float, np.ndarray] = {}
-    for path in transformed:
-        match = ANGLE_PATTERN.search(Path(path).name)
-        if match:
-            clouds[float(match.group(1))] = load_points(Path(path))
+    # Compute cross-view residuals reusing trees
     separations = {}
     for separation in args.separations_deg:
         values = []
@@ -93,7 +119,8 @@ def main(argv=None):
             other = clouds.get(angle + separation)
             if other is None:
                 continue
-            residual = cross_view_residual_m(points, other)
+            other_tree = cloud_trees[angle + separation]
+            residual = cross_view_residual_m(points, other, max_pair_distance_m=0.008)
             if residual is not None:
                 values.append(residual)
         if values:

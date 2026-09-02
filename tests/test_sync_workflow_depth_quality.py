@@ -52,11 +52,15 @@ class CrossViewResidualTests(unittest.TestCase):
         self.assertAlmostEqual(cross_view_residual_m(pts, pts), 0.0)
 
     def test_detects_a_known_uniform_offset(self):
-        rng = np.random.default_rng(3)
-        pts = rng.uniform(-0.02, 0.02, size=(2000, 3))
+        # Regular grid with 20 mm spacing (far larger than the 2 mm shift)
+        # ensures each point's nearest neighbour is unambiguously its shifted partner
+        # Use a large grid to have >100 points for the min_pairs threshold
+        grid = np.arange(-0.04, 0.041, 0.020)  # -40, -20, 0, +20, +40 mm
+        xx, yy, zz = np.meshgrid(grid, grid, grid, indexing="ij")
+        pts = np.column_stack((xx.ravel(), yy.ravel(), zz.ravel()))
         shifted = pts + np.array([0.002, 0.0, 0.0])
 
-        self.assertAlmostEqual(cross_view_residual_m(pts, shifted), 0.002, places=3)
+        self.assertAlmostEqual(cross_view_residual_m(pts, shifted), 0.002, places=4)
 
     def test_returns_none_when_clouds_do_not_overlap(self):
         rng = np.random.default_rng(4)
