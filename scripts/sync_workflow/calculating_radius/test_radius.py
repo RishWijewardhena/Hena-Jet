@@ -35,6 +35,7 @@ from calculating_radius.radius_calibration import (
     classify_pose,
     convert_world_to_color_to_world_to_depth,
     evaluate_trajectory,
+    orbit_geometry_in_camera_frame,
     orbbec_extrinsic_to_matrix,
     solve_profile_pose,
 )
@@ -470,6 +471,31 @@ def main():
     )
     if trajectory["quality_status"] == "valid":
         trajectory["recommended_radius_m"] = trajectory[pointcloud_fit_key]["radius_m"]
+        reference_sample = next(
+            (sample for sample in valid_samples if abs(float(sample["angle_deg"])) < 1e-9),
+            None,
+        )
+        reference_pose = None
+        reference_pose_key = (
+            "world_to_color"
+            if calibration["pointcloud_coordinate_frame"] == "color"
+            else "world_to_depth"
+        )
+        for angle_result in angle_results:
+            if abs(float(angle_result["angle_deg"])) >= 1e-9:
+                continue
+            for frame in angle_result.get("frames", []):
+                if frame.get("accepted"):
+                    reference_pose = np.asarray(
+                        frame[reference_pose_key], dtype=np.float64
+                    )
+                    break
+        if reference_sample is not None and reference_pose is not None:
+            trajectory["orbit_geometry"] = orbit_geometry_in_camera_frame(
+                trajectory[pointcloud_fit_key]["center_m"],
+                trajectory[pointcloud_fit_key]["axis"],
+                reference_pose,
+            )
     report = {
         "schema_version": 1,
         "purpose": "four-face ArUco depth-camera orbit-radius calibration",
@@ -478,6 +504,7 @@ def main():
         "recommended_radius_m": trajectory["recommended_radius_m"],
         "rgb_fit": trajectory["rgb_fit"],
         "depth_fit": trajectory["depth_fit"],
+        "orbit_geometry": trajectory.get("orbit_geometry"),
         "marker_map": str(args.marker_map),
         "marker_geometry": marker_map,
         "motor": {"x_position_mm": args.x_pos, "angles_deg": [float(a) for a in args.angles]},

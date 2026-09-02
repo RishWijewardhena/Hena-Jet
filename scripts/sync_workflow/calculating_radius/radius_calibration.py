@@ -153,6 +153,29 @@ def camera_center_world(world_to_camera: np.ndarray) -> np.ndarray:
     return transform_inverse(world_to_camera)[:3, 3]
 
 
+def orbit_geometry_in_camera_frame(
+    center_m,
+    axis,
+    world_to_camera: np.ndarray,
+) -> dict[str, Any]:
+    """Express a fitted orbit centre and axis in the reference camera frame."""
+    pose = np.asarray(world_to_camera, dtype=np.float64)
+    if pose.shape != (4, 4):
+        raise ValueError("world_to_camera must be a 4x4 matrix")
+    centre = np.asarray(center_m, dtype=np.float64).reshape(3)
+    direction = np.asarray(axis, dtype=np.float64).reshape(3)
+    length = float(np.linalg.norm(direction))
+    if length <= 0.0:
+        raise ValueError("Orbit axis must be non-zero")
+
+    pivot = pose[:3, :3] @ centre + pose[:3, 3]
+    rotated_axis = pose[:3, :3] @ (direction / length)
+    return {
+        "pivot_m": pivot.tolist(),
+        "axis": (rotated_axis / np.linalg.norm(rotated_axis)).tolist(),
+    }
+
+
 def classify_pose(
     pose: dict[str, Any],
     *,

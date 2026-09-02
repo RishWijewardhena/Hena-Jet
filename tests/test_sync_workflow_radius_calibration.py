@@ -30,6 +30,7 @@ from calculating_radius.radius_calibration import (  # noqa: E402
     fit_orbit_circle,
     has_sufficient_angular_coverage,
     marker_normal,
+    orbit_geometry_in_camera_frame,
     solve_profile_pose,
 )
 from calculating_radius.generate_radius_markers import generate_marker_kit  # noqa: E402
@@ -497,6 +498,49 @@ class CameraExtrinsicTests(unittest.TestCase):
         color_center_world = np.linalg.inv(world_to_color)[:3, 3]
         depth_center_world = np.linalg.inv(world_to_depth)[:3, 3]
         np.testing.assert_allclose(depth_center_world - color_center_world, [0.025, 0, 0])
+
+
+class OrbitGeometryTests(unittest.TestCase):
+    def test_transforms_centre_as_a_point_and_axis_as_a_direction(self):
+        world_to_camera = np.eye(4)
+        world_to_camera[:3, 3] = [0.10, -0.20, 0.30]
+
+        geometry = orbit_geometry_in_camera_frame(
+            [0.01, 0.02, 0.03], [0.0, 0.0, 1.0], world_to_camera
+        )
+
+        np.testing.assert_allclose(geometry["pivot_m"], [0.11, -0.18, 0.33])
+        np.testing.assert_allclose(geometry["axis"], [0.0, 0.0, 1.0])
+
+    def test_rotates_the_axis_without_translating_it(self):
+        world_to_camera = np.eye(4)
+        # 90 degrees about world +Z maps +X to +Y.
+        world_to_camera[:3, :3] = [
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+        world_to_camera[:3, 3] = [1.0, 2.0, 3.0]
+
+        geometry = orbit_geometry_in_camera_frame(
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], world_to_camera
+        )
+
+        np.testing.assert_allclose(geometry["axis"], [0.0, 1.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(geometry["pivot_m"], [1.0, 2.0, 3.0])
+
+    def test_returns_a_unit_axis(self):
+        geometry = orbit_geometry_in_camera_frame(
+            [0.0, 0.0, 0.0], [0.0, 3.0, 4.0], np.eye(4)
+        )
+
+        self.assertAlmostEqual(float(np.linalg.norm(geometry["axis"])), 1.0)
+
+    def test_rejects_a_degenerate_axis(self):
+        with self.assertRaises(ValueError):
+            orbit_geometry_in_camera_frame(
+                [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], np.eye(4)
+            )
 
 
 class ProfilePoseTests(unittest.TestCase):

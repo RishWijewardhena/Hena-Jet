@@ -860,6 +860,15 @@ def parse_args(argv=None):
     parser.add_argument("--pivot", type=float, nargs=3, default=None,
                         help="Pivot point in camera coords as X Y Z metres "
                              "(default: [0, 0, orbit-radius-m] = object centre in front of camera)")
+    parser.add_argument(
+        "--orbit-geometry",
+        type=Path,
+        default=None,
+        help=(
+            "radius_calibration.json whose measured orbit_geometry supplies "
+            "the pivot and axis instead of [0,0,R] / [1,0,0]"
+        ),
+    )
     parser.add_argument("--reference-angle-deg", type=float, default=0.0,
                         help="Angle of the reference frame (default: 0)")
     parser.add_argument("--angle-sign", type=float, default=1.0,
@@ -941,8 +950,21 @@ def main(argv=None):
     else:
         orbit_radius_m = resolve_orbit_radius(args.orbit_radius_m, scan_metadata)
 
+    measured_geometry = None
+    if args.orbit_geometry is not None:
+        calibration = json.loads(args.orbit_geometry.read_text(encoding="utf-8"))
+        measured_geometry = calibration.get("orbit_geometry")
+        if not measured_geometry:
+            raise ValueError(
+                f"{args.orbit_geometry} has no orbit_geometry block; re-run the "
+                "radius calibration with a valid full-orbit result."
+            )
+        orbit_axis = np.asarray(measured_geometry["axis"], dtype=float)
+
     if args.pivot:
         pivot = np.array(args.pivot, dtype=float)
+    elif measured_geometry is not None:
+        pivot = np.asarray(measured_geometry["pivot_m"], dtype=float)
     elif measured_pose_mode:
         pivot = np.asarray(pose_map["profile_origin_in_reference_m"], dtype=float)
     else:
@@ -1080,6 +1102,9 @@ def main(argv=None):
             else "scan_metadata"
         ),
         "pose_map": str(args.pose_map) if args.pose_map else None,
+        "orbit_geometry_source": (
+            str(args.orbit_geometry) if args.orbit_geometry else None
+        ),
         "orbit_axis": orbit_axis.tolist(),
         "pivot": pivot.tolist(),
         "reference_angle_deg": (
