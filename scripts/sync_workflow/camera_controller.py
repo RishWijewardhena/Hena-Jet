@@ -1,6 +1,8 @@
 import logging
 from typing import Tuple, Optional
 
+from depth_filters import DEFAULT_ENABLED_FILTERS, apply_depth_filters, select_depth_filters
+
 logger = logging.getLogger(__name__)
 
 DISPARITY_MODE_BY_PIXELS = {
@@ -131,14 +133,17 @@ def configure_disparity_search_range(device, requested_disparity: str | int) -> 
 class CameraController:
     """Wrapper for Orbbec Gemini 305 camera operations."""
 
-    def __init__(self, width: int = 848, height: int = 530, fps: int = 30, disparity: str = "256"):
+    def __init__(self, width: int = 848, height: int = 530, fps: int = 30,
+                 disparity: str = "256", depth_filters=DEFAULT_ENABLED_FILTERS):
         self.width = width
         self.height = height
         self.fps = fps
         self.disparity = disparity
-        
+
         self.pipeline = None
         self.align_filter = None
+        self.depth_filter_names = tuple(depth_filters or ())
+        self.depth_filters = []
         self.camera_param = None
         self.intrinsics = None
         self.dist_coeffs = None
@@ -215,6 +220,19 @@ class CameraController:
 
         self.pipeline.start(config)
 
+        try:
+            depth_sensor = self.pipeline.get_device().get_sensor(OBSensorType.DEPTH_SENSOR)
+            self.depth_filters = select_depth_filters(
+                depth_sensor.get_recommended_filters(), self.depth_filter_names
+            )
+            logger.info(
+                "Depth filters enabled: %s",
+                [f.get_name() for f in self.depth_filters if f.is_enabled()],
+            )
+        except Exception as e:
+            logger.warning("Depth post-processing unavailable: %s", e)
+            self.depth_filters = []
+
         # Wait a few frames for auto-exposure to settle
         for _ in range(10):
             self.pipeline.wait_for_frames(1000)
@@ -267,6 +285,11 @@ class CameraController:
         if color_frame is None or depth_frame is None:
             logger.warning("Incomplete frame pair.")
             return None, None
+
+        if self.depth_filters:
+            filtered = apply_depth_filters(depth_frame, self.depth_filters)
+            if filtered is not None:
+                depth_frame = filtered
 
         return color_frame, depth_frame
 
