@@ -40,7 +40,7 @@ def parse_args(argv=None):
         "--x-positions-mm",
         type=float,
         nargs="+",
-        default=[200.0],
+        default=[150.0],
         help="Absolute X stations to scan in millimetres (default: 200)",
     )
     parser.add_argument("--orbit-axis", type=float, nargs=3, default=[1.0, 0.0, 0.0],
@@ -51,16 +51,33 @@ def parse_args(argv=None):
                         help="Fresh RGB-D frames to median-combine at each angle")
     parser.add_argument("--depth-min-m", type=float, default=0.02,
                         help="Discard depth closer than this distance")
-    parser.add_argument("--depth-max-m", type=float, default=0.35,
+    parser.add_argument("--depth-max-m", type=float, default=0.25,
                         help="Discard depth farther than this distance")
     parser.add_argument("--crop-radius-m", type=float, default=0.15,
-                        help="Reconstruction crop-cube half-extent around the orbit center")
+                        help="Final reconstruction crop-cube half-extent around the orbit center")
+    parser.add_argument(
+        "--registration-crop-radius-m",
+        type=float,
+        default=None,
+        help=(
+            "Tighter crop-cube half-extent used only by guarded ICP "
+            "(default: min(final crop, 0.10 m))"
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/scan"), help="Output directory for PLY files")
     parser.add_argument("--dry-run", action="store_true", help="Print sequence without moving or capturing")
     parser.add_argument("--no-home", action="store_true", help="Skip the homing sequence (use only if already homed)")
     parser.add_argument("--reconstruct", action="store_true", help="Auto-run reconstruct_pipeline.py after capture")
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.registration_crop_radius_m is None:
+        args.registration_crop_radius_m = 0.10
+        if args.crop_radius_m > 0.0:
+            args.registration_crop_radius_m = min(
+                args.registration_crop_radius_m,
+                args.crop_radius_m,
+            )
+    return args
 
 
 def generate_angle_sequence(step_deg):
@@ -210,6 +227,7 @@ def build_scan_metadata(args, *, active_disparity, captured_angles, captures=Non
         },
         "reconstruction": {
             "crop_radius_m": float(args.crop_radius_m),
+            "registration_crop_radius_m": float(args.registration_crop_radius_m),
         },
         "x_stage": {
             "positions_mm": [float(value) for value in args.x_positions_mm],
@@ -256,6 +274,13 @@ def main():
         raise ValueError("Depth range must satisfy 0 <= min < max.")
     if args.radius_m is not None and args.radius_m <= 0.0:
         raise ValueError("--radius-m must be positive.")
+    if not np.isfinite(args.crop_radius_m) or args.crop_radius_m <= 0.0:
+        raise ValueError("--crop-radius-m must be finite and positive.")
+    if (
+        not np.isfinite(args.registration_crop_radius_m)
+        or args.registration_crop_radius_m <= 0.0
+    ):
+        raise ValueError("--registration-crop-radius-m must be finite and positive.")
     if not args.x_positions_mm or not all(np.isfinite(args.x_positions_mm)):
         raise ValueError("--x-positions-mm must contain finite positions.")
     if len(set(args.x_positions_mm)) != len(args.x_positions_mm):
@@ -426,6 +451,7 @@ def main():
             "--registration-mode", args.registration_mode,
             "--orbit-axis", *(str(value) for value in args.orbit_axis),
             "--crop-radius-m", str(args.crop_radius_m),
+            "--registration-crop-radius-m", str(args.registration_crop_radius_m),
         ]
 
         logger.info("$ %s", " ".join(cmd))

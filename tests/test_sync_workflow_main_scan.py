@@ -16,7 +16,7 @@ SYNC_WORKFLOW_DIR = (
 sys.path.insert(0, str(SYNC_WORKFLOW_DIR))
 
 import main_scan
-import test_radius
+from calculating_radius import test_radius
 
 
 class DepthFusionTests(unittest.TestCase):
@@ -91,6 +91,26 @@ class ScanMetadataTests(unittest.TestCase):
 
         self.assertEqual(args.x_positions_mm, [200.0])
 
+    def test_registration_crop_defaults_to_10cm(self):
+        args = main_scan.parse_args([])
+
+        self.assertEqual(args.registration_crop_radius_m, 0.10)
+
+    def test_automatic_registration_crop_does_not_exceed_the_final_crop(self):
+        args = main_scan.parse_args(["--crop-radius-m", "0.075"])
+
+        self.assertEqual(args.registration_crop_radius_m, 0.075)
+
+    def test_explicit_registration_crop_is_preserved(self):
+        args = main_scan.parse_args(
+            [
+                "--crop-radius-m", "0.075",
+                "--registration-crop-radius-m", "0.09",
+            ]
+        )
+
+        self.assertEqual(args.registration_crop_radius_m, 0.09)
+
     def test_two_station_sequence_captures_a_full_orbit_at_each_x_position(self):
         sequence = main_scan.generate_scan_sequence(10.0, [200.0, 280.0])
 
@@ -137,6 +157,8 @@ class ScanMetadataTests(unittest.TestCase):
                 "0.05",
                 "--depth-max-m",
                 "0.30",
+                "--x-positions-mm",
+                "200",
             ]
         )
 
@@ -160,6 +182,11 @@ class ScanMetadataTests(unittest.TestCase):
         self.assertEqual(metadata["orbit_axis"], [1.0, 0.0, 0.0])
         self.assertEqual(metadata["capture"]["frames_per_angle"], 5)
         self.assertEqual(metadata["capture"]["depth_range_m"], [0.05, 0.3])
+        self.assertEqual(metadata["reconstruction"]["crop_radius_m"], 0.15)
+        self.assertEqual(
+            metadata["reconstruction"]["registration_crop_radius_m"],
+            0.10,
+        )
         self.assertEqual(metadata["captured_angles_deg"], [0.0, 10.0])
         self.assertEqual(metadata["x_stage"]["positions_mm"], [200.0])
         self.assertEqual(metadata["captures"][0]["x_offset_m"], 0.0)
@@ -200,8 +227,8 @@ class RadiusCalibrationCaptureTests(unittest.TestCase):
 
         solved_pose = {
             "ok": True,
-            "method": "single-marker-ippe",
-            "used_ids": [0],
+            "method": "multi-marker-iterative",
+            "used_ids": [0, 1],
             "world_to_camera": np.eye(4),
             "rvec": np.zeros((3, 1)),
             "tvec": np.array([[0.0], [0.0], [0.15]]),
@@ -220,6 +247,34 @@ class RadiusCalibrationCaptureTests(unittest.TestCase):
 
         self.assertFalse(pose["accepted"])
         self.assertIn("exceeds 1.50px", pose["rejection_reason"])
+
+    def test_rejects_pose_that_sees_only_one_marker_face(self):
+        class FakeDetector:
+            def detectMarkers(self, _gray):
+                return [], np.empty((0, 1), dtype=np.int32), []
+
+        solved_pose = {
+            "ok": True,
+            "method": "single-marker-ippe",
+            "used_ids": [0],
+            "world_to_camera": np.eye(4),
+            "rvec": np.zeros((3, 1)),
+            "tvec": np.array([[0.0], [0.0], [0.15]]),
+            "reprojection_error_px": 0.3,
+        }
+        with mock.patch.object(test_radius, "solve_profile_pose", return_value=solved_pose):
+            pose, _, _ = test_radius.estimate_frame_pose(
+                np.zeros((10, 10, 3), dtype=np.uint8),
+                {"markers": []},
+                FakeDetector(),
+                np.eye(3),
+                np.zeros((8, 1)),
+                np.eye(4),
+                max_reprojection_error_px=1.5,
+            )
+
+        self.assertFalse(pose["accepted"])
+        self.assertIn("fewer than 2 mapped markers", pose["rejection_reason"])
 
     def test_requires_enough_valid_pose_frames_per_angle(self):
         args = test_radius.parse_args(

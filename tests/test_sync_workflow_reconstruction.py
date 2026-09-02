@@ -34,6 +34,60 @@ class ReconstructionCliTests(unittest.TestCase):
 
         self.assertEqual(radius, 0.1175)
 
+    def test_accepts_measured_aruco_pose_mode_and_pose_map(self):
+        args = reconstruct_pipeline.parse_args(
+            [
+                "--input-dir", "scan",
+                "--registration-mode", "aruco",
+                "--pose-map", "calibration/orbit_pose_map.json",
+            ]
+        )
+
+        self.assertEqual(args.registration_mode, "aruco")
+        self.assertEqual(args.pose_map, Path("calibration/orbit_pose_map.json"))
+
+    def test_rejects_pose_map_for_a_different_pointcloud_camera_frame(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            input_dir = Path(temporary_dir)
+            (input_dir / "intrinsics.json").write_text(
+                json.dumps({"coordinate_frame": "color"})
+            )
+
+            with self.assertRaisesRegex(ValueError, "coordinate-frame mismatch"):
+                reconstruct_pipeline.validate_pose_map_coordinate_frame(
+                    input_dir, {"pointcloud_coordinate_frame": "depth"}
+                )
+
+    def test_registration_crop_defaults_to_10cm_without_shrinking_final_crop(self):
+        args = reconstruct_pipeline.parse_args(["--input-dir", "scan"])
+
+        final_crop_m, registration_crop_m = reconstruct_pipeline.resolve_crop_radii(
+            args.crop_radius_m,
+            args.registration_crop_radius_m,
+            {"crop_radius_m": 0.15},
+        )
+
+        self.assertEqual(final_crop_m, 0.15)
+        self.assertEqual(registration_crop_m, 0.10)
+
+    def test_registration_crop_respects_a_smaller_final_crop_and_explicit_override(self):
+        self.assertEqual(
+            reconstruct_pipeline.resolve_crop_radii(
+                None,
+                None,
+                {"crop_radius_m": 0.075},
+            ),
+            (0.075, 0.075),
+        )
+        self.assertEqual(
+            reconstruct_pipeline.resolve_crop_radii(
+                0.12,
+                0.085,
+                {"crop_radius_m": 0.15, "registration_crop_radius_m": 0.09},
+            ),
+            (0.12, 0.085),
+        )
+
 
 class MultiStationPoseTests(unittest.TestCase):
     def test_manifest_captures_are_loaded_in_station_and_angle_order(self):
@@ -133,6 +187,61 @@ class MultiStationPoseTests(unittest.TestCase):
             self.assertTrue(all(item.station_index == 0 for item in captures))
             self.assertTrue(all(item.x_offset_m == 0.0 for item in captures))
 
+    def test_measured_pose_priors_are_loaded_by_angle(self):
+        angle_0_pose = np.eye(4)
+        angle_10_pose = np.eye(4)
+        angle_10_pose[:3, 3] = [0.002, -0.001, 0.020]
+        pose_map = {
+            "schema_version": 1,
+            "x_position_mm": 150.0,
+            "angles": [
+                {
+                    "angle_deg": 0.0,
+                    "pose_valid": True,
+                    "camera_to_reference": angle_0_pose.tolist(),
+                },
+                {
+                    "angle_deg": 10.0,
+                    "pose_valid": True,
+                    "camera_to_reference": angle_10_pose.tolist(),
+                },
+            ],
+        }
+        captures = [
+            reconstruct_pipeline.CaptureRecord(
+                Path("frame_0.ply"), 0.0, x_position_mm=150.0
+            ),
+            reconstruct_pipeline.CaptureRecord(
+                Path("frame_10.ply"), 10.0, x_position_mm=150.0
+            ),
+        ]
+
+        poses = reconstruct_pipeline.build_measured_pose_priors(captures, pose_map)
+
+        np.testing.assert_allclose(poses[0], angle_0_pose)
+        np.testing.assert_allclose(poses[1], angle_10_pose)
+
+    def test_measured_pose_map_rejects_a_different_x_station(self):
+        pose_map = {
+            "schema_version": 1,
+            "x_position_mm": 150.0,
+            "angles": [
+                {
+                    "angle_deg": 0.0,
+                    "pose_valid": True,
+                    "camera_to_reference": np.eye(4).tolist(),
+                }
+            ],
+        }
+        captures = [
+            reconstruct_pipeline.CaptureRecord(
+                Path("frame_0.ply"), 0.0, x_position_mm=200.0
+            )
+        ]
+
+        with self.assertRaisesRegex(ValueError, "X=150.0 mm"):
+            reconstruct_pipeline.build_measured_pose_priors(captures, pose_map)
+
 
 class GuardedIcpTests(unittest.TestCase):
     def test_rejects_an_icp_result_that_undoes_one_motor_step(self):
@@ -175,6 +284,21 @@ class GuardedIcpTests(unittest.TestCase):
 
         self.assertTrue(accepted)
         self.assertEqual(reason, "accepted")
+
+    def test_rejects_rmse_too_close_to_the_correspondence_limit(self):
+        accepted, reason, _, _ = (
+            reconstruct_pipeline.registration_result_is_acceptable(
+                fitness=0.50,
+                rmse_m=0.00175,
+                prior_fitness=0.45,
+                prior_rmse_m=0.0020,
+                prior=np.eye(4),
+                candidate=np.eye(4),
+            )
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "RMSE exceeds threshold")
 
     def test_rejects_a_small_correction_that_does_not_improve_the_prior(self):
         candidate = np.eye(4)
@@ -235,6 +359,54 @@ class GuardedIcpTests(unittest.TestCase):
 
         self.assertEqual(len(prepared.points), 24)
         self.assertEqual(prepared.sor_call, (20, 1.5))
+
+    def test_registration_crop_excludes_points_retained_by_the_final_crop(self):
+        class FakeCloud:
+            def __init__(self, points):
+                self.points = np.asarray(points, dtype=float)
+
+            def select_by_index(self, indices):
+                return FakeCloud(self.points[indices])
+
+            def voxel_down_sample(self, _voxel_size):
+                return self
+
+            def estimate_normals(self, _search):
+                return None
+
+        class FakeGeometry:
+            PointCloud = FakeCloud
+
+            class KDTreeSearchParamHybrid:
+                def __init__(self, **_kwargs):
+                    pass
+
+        class FakeOpen3D:
+            geometry = FakeGeometry
+
+        points = np.array([
+            [0.000, 0.0, 0.100],
+            [0.099, 0.0, 0.100],
+            [0.120, 0.0, 0.100],
+        ])
+        pivot = np.array([0.0, 0.0, 0.1])
+        registration_bounds = reconstruct_pipeline.crop_bounds_around(pivot, 0.10)
+        final_bounds = reconstruct_pipeline.crop_bounds_around(pivot, 0.15)
+
+        prepared = reconstruct_pipeline.prepare_registration_cloud(
+            FakeOpen3D,
+            FakeCloud(points),
+            np.eye(4),
+            crop_bounds=registration_bounds,
+        )
+
+        self.assertEqual(len(prepared.points), 2)
+        self.assertEqual(
+            np.count_nonzero(
+                reconstruct_pipeline.points_inside_bounds(points, final_bounds)
+            ),
+            3,
+        )
 
 
 class ReconstructionDiagnosticsTests(unittest.TestCase):
@@ -309,6 +481,96 @@ class ReconstructionDiagnosticsTests(unittest.TestCase):
 
 
 class ReconstructionEndToEndTests(unittest.TestCase):
+    def test_aruco_pose_pipeline_uses_measured_full_transforms_without_a_radius(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            input_dir = root / "scan"
+            output_dir = root / "reconstruction"
+            input_dir.mkdir()
+
+            reference_points = np.array(
+                [
+                    [x, y, z]
+                    for x in np.linspace(-0.015, 0.015, 8)
+                    for y in np.linspace(-0.010, 0.010, 6)
+                    for z in (0.035, 0.045)
+                ]
+            )
+            colors = np.tile([0.7, 0.2, 0.1], (len(reference_points), 1))
+            angle_0_pose = np.eye(4)
+            angle_90_pose = reconstruct_pipeline.rotation_about_axis(
+                12.0, np.array([0.0, 0.0, 0.04]), np.array([0.2, 0.9, 0.1])
+            )
+            filenames = [
+                "frame_s00_x150.0_y+000.0.ply",
+                "frame_s00_x150.0_y+090.0.ply",
+            ]
+            for filename, camera_to_reference in zip(
+                filenames, (angle_0_pose, angle_90_pose)
+            ):
+                cloud = o3d.geometry.PointCloud()
+                raw_points = reconstruct_pipeline.transformed_points(
+                    reference_points, np.linalg.inv(camera_to_reference)
+                )
+                cloud.points = o3d.utility.Vector3dVector(raw_points)
+                cloud.colors = o3d.utility.Vector3dVector(colors)
+                self.assertTrue(o3d.io.write_point_cloud(str(input_dir / filename), cloud))
+
+            metadata = {
+                "schema_version": 2,
+                "captures": [
+                    {
+                        "filename": filename,
+                        "station_index": 0,
+                        "x_position_mm": 150.0,
+                        "x_offset_m": 0.0,
+                        "angle_deg": angle,
+                    }
+                    for filename, angle in zip(filenames, (0.0, 90.0))
+                ],
+            }
+            (input_dir / "scan_metadata.json").write_text(json.dumps(metadata))
+            pose_map = {
+                "schema_version": 1,
+                "quality_status": "valid",
+                "x_position_mm": 150.0,
+                "reference_angle_deg": 0.0,
+                "profile_origin_in_reference_m": [0.0, 0.0, 0.04],
+                "orbit_axis_reference": [1.0, 0.0, 0.0],
+                "orbit_fit_profile_frame": None,
+                "angles": [
+                    {
+                        "angle_deg": angle,
+                        "pose_valid": True,
+                        "camera_to_reference": pose.tolist(),
+                    }
+                    for angle, pose in ((0.0, angle_0_pose), (90.0, angle_90_pose))
+                ],
+            }
+            pose_map_path = root / "orbit_pose_map.json"
+            pose_map_path.write_text(json.dumps(pose_map))
+
+            reconstruct_pipeline.main(
+                [
+                    "--input-dir", str(input_dir),
+                    "--output-dir", str(output_dir),
+                    "--registration-mode", "aruco",
+                    "--pose-map", str(pose_map_path),
+                    "--crop-radius-m", "0.08",
+                    "--skip-per-scan-sor",
+                ]
+            )
+
+            merged = o3d.io.read_point_cloud(str(output_dir / "merged_cloud.ply"))
+            bounds = merged.get_axis_aligned_bounding_box()
+            np.testing.assert_allclose(bounds.get_min_bound(), reference_points.min(axis=0), atol=0.002)
+            np.testing.assert_allclose(bounds.get_max_bound(), reference_points.max(axis=0), atol=0.002)
+            diagnostics = json.loads(
+                (output_dir / "registration_diagnostics.json").read_text()
+            )
+            self.assertEqual(diagnostics["settings"]["registration_mode"], "aruco")
+            self.assertEqual(diagnostics["settings"]["orbit_radius_m"], None)
+
     def test_two_station_motor_pipeline_fuses_both_x_positions(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
@@ -435,6 +697,11 @@ class ReconstructionEndToEndTests(unittest.TestCase):
             self.assertEqual(
                 diagnostics["settings"]["processing_backend"],
                 "open3d+trimesh",
+            )
+            self.assertEqual(diagnostics["settings"]["crop_radius_m"], 0.05)
+            self.assertEqual(
+                diagnostics["settings"]["registration_crop_radius_m"],
+                0.05,
             )
             self.assertEqual(
                 diagnostics["settings"]["processing"]["merge"]["input_clouds"],
