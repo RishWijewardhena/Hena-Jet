@@ -285,5 +285,30 @@ class RadiusCalibrationCaptureTests(unittest.TestCase):
             test_radius.validate_args(args)
 
 
+class FuseDepthFramesTests(unittest.TestCase):
+    def test_requires_a_minimum_number_of_valid_samples(self):
+        frames = [
+            np.array([[0.25, 0.25]], dtype=np.float32),
+            np.array([[0.25, 0.00]], dtype=np.float32),
+            np.array([[0.25, 0.00]], dtype=np.float32),
+        ]
+
+        fused = main_scan.fuse_depth_frames(
+            frames, min_depth_m=0.02, max_depth_m=0.35, min_valid_samples=2
+        )
+
+        np.testing.assert_allclose(fused, [[0.25, 0.0]])
+
+    def test_defaults_to_accepting_a_single_valid_sample(self):
+        frames = [
+            np.array([[0.25]], dtype=np.float32),
+            np.array([[0.00]], dtype=np.float32),
+        ]
+
+        fused = main_scan.fuse_depth_frames(frames, min_depth_m=0.02, max_depth_m=0.35)
+
+        np.testing.assert_allclose(fused, [[0.25]])
+
+
 if __name__ == "__main__":
     unittest.main()

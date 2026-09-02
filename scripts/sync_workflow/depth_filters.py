@@ -43,3 +43,17 @@ def apply_depth_filters(depth_frame, filters):
         if result is not None:
             processed = result
     return processed
+
+
+def gate_by_confidence(depth_m, confidence, *, min_confidence: int):
+    """Zero out depth pixels the sensor reports below *min_confidence*."""
+    import numpy as np
+
+    depth = np.array(depth_m, dtype=np.float32, copy=True)
+    if confidence is None:
+        return depth
+    conf = np.asarray(confidence)
+    if conf.shape != depth.shape:
+        raise ValueError("confidence and depth_m must have the same shape")
+    depth[conf < min_confidence] = 0.0
+    return depth
