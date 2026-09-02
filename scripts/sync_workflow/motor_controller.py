@@ -92,11 +92,11 @@ class MotorController:
             "G28 Z",
             "G28 A",
             "G28 X",
-            "G1 X25 F1000",   # Move X to 0 to avoid limit switches
-            # "G1 Y15 F1000",  # Move Y to 15 to avoid limit switches
+            "G1 X25 F1000",   # Move X to 25 to hit the y limit switch
+            # "G1 Y15 F1000",  # Move Y to 15 5to avoid limit switches
             "G28 Y",
-            "G1 Y40 F500",
-            "G1 X200 Y0 F500"
+            "G1 Y10 F500",
+            "G1 X30 Y0 F500"
         ]
         for cmd in sequence:
             success = self.send_command(cmd, dry_run=dry_run)
