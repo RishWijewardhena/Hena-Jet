@@ -8,10 +8,17 @@ import csv
 import json
 import logging
 from pathlib import Path
+import sys
 import time
 
 import cv2
 import numpy as np
+
+# Keep the existing sibling-module imports working when this script is run
+# directly from the calculating_radius subdirectory.
+SYNC_WORKFLOW_DIR = Path(__file__).resolve().parents[1]
+if str(SYNC_WORKFLOW_DIR) not in sys.path:
+    sys.path.insert(0, str(SYNC_WORKFLOW_DIR))
 
 from camera_controller import CameraController
 from main_scan import (
@@ -21,8 +28,11 @@ from main_scan import (
     save_frame_as_ply,
 )
 from motor_controller import MotorController
-from radius_calibration import (
+from calculating_radius.radius_calibration import (
+    build_detector_parameters,
+    build_fit_samples,
     camera_center_world,
+    classify_pose,
     convert_world_to_color_to_world_to_depth,
     evaluate_trajectory,
     orbbec_extrinsic_to_matrix,
@@ -44,19 +54,36 @@ def parse_args(argv=None):
     parser.add_argument("--baud", type=int, default=250000, help="Baud rate")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/test_radius"))
     parser.add_argument("--marker-map", type=Path, default=DEFAULT_MARKER_MAP)
-    parser.add_argument("--x-pos", type=float, default=400.0, help="Absolute X calibration position in mm")
+    parser.add_argument("--x-pos", type=float, default=80.0, help="Absolute X calibration position in mm")
     parser.add_argument(
         "--angles",
         type=float,
         nargs="+",
-        default=[0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0, -180.0],
-        help="Motor angles used to observe the fixed marker profile",
+        default=[
+            0.0, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0,
+            -30.0, -60.0, -90.0, -120.0, -150.0, -180.0,
+        ],
+        help="Motor angles used to observe the fixed marker profile "
+        "(positive 0..180 sweep, then negative -30..-180 sweep)",
     )
     parser.add_argument("--frames-per-angle", type=int, default=10)
     parser.add_argument("--depth-min-m", type=float, default=0.02)
     parser.add_argument("--depth-max-m", type=float, default=0.35)
     parser.add_argument("--timeout-ms", type=int, default=2000)
     parser.add_argument("--max-reprojection-error-px", type=float, default=1.5)
+    parser.add_argument(
+        "--min-markers-per-pose",
+        type=int,
+        default=1,
+        help="Minimum mapped ArUco markers a frame pose must use to enter the radius "
+        "fit (lower to 1 only if angular coverage fails)",
+    )
+    parser.add_argument(
+        "--per-angle-median",
+        action="store_true",
+        help="Fit the orbit circle to one median camera center per angle instead of "
+        "every accepted frame pose",
+    )
     parser.add_argument("--min-valid-poses-per-angle", type=int, default=6)
     parser.add_argument("--min-unique-angles", type=int, default=6)
     parser.add_argument("--max-angle-gap-deg", type=float, default=90.0)
@@ -121,7 +148,7 @@ def make_detector(dictionary_name: str):
     if dictionary_id is None:
         raise ValueError(f"Unsupported ArUco dictionary: {dictionary_name}")
     dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
-    return cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
+    return cv2.aruco.ArucoDetector(dictionary, build_detector_parameters())
 
 
 def capture_calibration_burst(camera, args):
@@ -151,6 +178,7 @@ def estimate_frame_pose(
     dist_coeffs,
     depth_to_color,
     max_reprojection_error_px,
+    min_markers=2,
 ):
     gray = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
@@ -158,22 +186,18 @@ def estimate_frame_pose(
         ids = np.empty((0, 1), dtype=np.int32)
     pose = solve_profile_pose(marker_map, corners, ids, camera_matrix, dist_coeffs)
     pose["detected_ids"] = ids.reshape(-1).astype(int).tolist()
-    pose["accepted"] = False
-    pose["rejection_reason"] = None
-    if not pose["ok"]:
-        pose["rejection_reason"] = "no usable mapped marker pose"
-    elif not np.isfinite(pose["reprojection_error_px"]):
-        pose["rejection_reason"] = "non-finite reprojection error"
-    elif pose["reprojection_error_px"] > max_reprojection_error_px:
-        pose["rejection_reason"] = (
-            f"reprojection error exceeds {max_reprojection_error_px:.2f}px"
-        )
-    else:
+    accepted, rejection_reason = classify_pose(
+        pose,
+        max_reprojection_error_px=max_reprojection_error_px,
+        min_markers=min_markers,
+    )
+    pose["accepted"] = accepted
+    pose["rejection_reason"] = rejection_reason
+    if accepted:
         world_to_color = pose["world_to_camera"]
         world_to_depth = convert_world_to_color_to_world_to_depth(
             world_to_color, depth_to_color
         )
-        pose["accepted"] = True
         pose["world_to_depth"] = world_to_depth
         pose["rgb_camera_center_m"] = camera_center_world(world_to_color)
         pose["depth_camera_center_m"] = camera_center_world(world_to_depth)
@@ -266,6 +290,7 @@ def capture_and_save(camera, angle, args, calibration):
             calibration["dist_coeffs"],
             calibration["depth_to_color"],
             args.max_reprojection_error_px,
+            min_markers=args.min_markers_per_pose,
         )
         overlay = _draw_detection_overlay(
             pose_color,
@@ -371,6 +396,8 @@ def validate_args(args) -> None:
         raise ValueError("Depth range must satisfy 0 <= min < max.")
     if args.max_reprojection_error_px <= 0.0:
         raise ValueError("--max-reprojection-error-px must be positive.")
+    if not 1 <= args.min_markers_per_pose <= 4:
+        raise ValueError("--min-markers-per-pose must be within [1, 4].")
     if args.min_unique_angles < 3:
         raise ValueError("--min-unique-angles must be at least 3.")
     if not (0.0 < args.max_angle_gap_deg <= 360.0):
@@ -383,7 +410,7 @@ def main():
     if not args.marker_map.is_file():
         raise FileNotFoundError(
             f"Marker map not found: {args.marker_map}. Generate it with: "
-            "python scripts/sync_workflow/generate_radius_markers.py"
+            "python scripts/sync_workflow/calculating_radius/generate_radius_markers.py"
         )
     marker_map = load_marker_map(args.marker_map)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -403,6 +430,7 @@ def main():
             "camera_matrix": camera_matrix,
             "dist_coeffs": dist_coeffs,
             "depth_to_color": depth_to_color,
+            "pointcloud_coordinate_frame": camera.pointcloud_coordinate_frame,
         }
 
         logger.info("Homing motors...")
@@ -427,12 +455,21 @@ def main():
             previous_angle = angle
         motor.move_y(0.0, feedrate=500)
 
-    valid_samples = [result for result in angle_results if result["pose_valid"]]
+    valid_samples = build_fit_samples(
+        angle_results, use_all_frames=not args.per_angle_median
+    )
     trajectory = evaluate_trajectory(
         valid_samples,
         min_unique_angles=args.min_unique_angles,
         max_gap_deg=args.max_angle_gap_deg,
     )
+    pointcloud_fit_key = (
+        "rgb_fit"
+        if calibration["pointcloud_coordinate_frame"] == "color"
+        else "depth_fit"
+    )
+    if trajectory["quality_status"] == "valid":
+        trajectory["recommended_radius_m"] = trajectory[pointcloud_fit_key]["radius_m"]
     report = {
         "schema_version": 1,
         "purpose": "four-face ArUco depth-camera orbit-radius calibration",
@@ -446,12 +483,15 @@ def main():
         "motor": {"x_position_mm": args.x_pos, "angles_deg": [float(a) for a in args.angles]},
         "acceptance": {
             "max_reprojection_error_px": args.max_reprojection_error_px,
+            "min_markers_per_pose": args.min_markers_per_pose,
+            "per_angle_median": bool(args.per_angle_median),
             "min_valid_poses_per_angle": args.min_valid_poses_per_angle,
             "min_unique_angles": args.min_unique_angles,
             "max_angle_gap_deg": args.max_angle_gap_deg,
         },
         "camera": {
             "active_disparity": active_disparity,
+            "pointcloud_coordinate_frame": calibration["pointcloud_coordinate_frame"],
             "rgb_intrinsics": calibration["rgb_intrinsics"],
             "rgb_distortion": calibration["dist_coeffs"].reshape(-1).tolist(),
             "depth_to_color": calibration["depth_to_color"].tolist(),
@@ -482,8 +522,21 @@ def main():
     if trajectory["quality_status"] == "valid":
         radius = trajectory["recommended_radius_m"]
         logger.info("• Estimated RGB-camera orbit radius: %.3f mm", trajectory["rgb_fit"]["radius_m"] * 1000.0)
-        logger.info("• Estimated depth-camera orbit radius: %.3f mm", radius * 1000.0)
+        logger.info("• Estimated depth-camera orbit radius: %.3f mm", trajectory["depth_fit"]["radius_m"] * 1000.0)
+        logger.info(
+            "• Point-cloud coordinate frame: %s camera",
+            calibration["pointcloud_coordinate_frame"],
+        )
         logger.info("• Depth trajectory RMSE: %.3f mm", trajectory["depth_fit"]["rmse_m"] * 1000.0)
+        depth_ci_low = trajectory["depth_fit"].get("radius_ci_low_m")
+        depth_ci_high = trajectory["depth_fit"].get("radius_ci_high_m")
+        if depth_ci_low is not None:
+            logger.info(
+                "• Depth radius 95%% CI: [%.3f, %.3f] mm (std %.3f mm)",
+                depth_ci_low * 1000.0,
+                depth_ci_high * 1000.0,
+                trajectory["depth_fit"]["radius_std_m"] * 1000.0,
+            )
         logger.info("• Recommended reconstruction argument: --radius-m %.6f", radius)
     else:
         logger.error("• Radius calibration is INVALID; no radius is recommended.")

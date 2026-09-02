@@ -6,12 +6,19 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 import cv2
 from PIL import Image, ImageDraw, ImageFont
 
-from radius_calibration import build_profile_marker_map
+# Make the calculating_radius package importable when this file is executed
+# directly from the repository root.
+SYNC_WORKFLOW_DIR = Path(__file__).resolve().parents[1]
+if str(SYNC_WORKFLOW_DIR) not in sys.path:
+    sys.path.insert(0, str(SYNC_WORKFLOW_DIR))
+
+from calculating_radius.radius_calibration import build_profile_marker_map
 
 
 MM_PER_INCH = 25.4

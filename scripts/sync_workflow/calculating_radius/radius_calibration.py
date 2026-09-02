@@ -106,7 +106,7 @@ def build_profile_marker_map(
             "origin": "profile cross-section center on the shared marker centerline",
             "x_axis": "toward the top profile face",
             "y_axis": "toward the front profile face",
-            "z_axis": "along the horizontal profile toward its chosen right end",
+            "z_axis": "along the printed strip top-edge direction",
         },
         "markers": markers,
     }
@@ -139,8 +139,74 @@ def orbbec_extrinsic_to_matrix(extrinsic: Any) -> np.ndarray:
     return matrix
 
 
+def build_detector_parameters() -> "cv2.aruco.DetectorParameters":
+    """ArUco detector parameters with sub-pixel corner refinement enabled."""
+    params = cv2.aruco.DetectorParameters()
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    params.cornerRefinementWinSize = 5
+    params.cornerRefinementMaxIterations = 50
+    params.cornerRefinementMinAccuracy = 0.01
+    return params
+
+
 def camera_center_world(world_to_camera: np.ndarray) -> np.ndarray:
     return transform_inverse(world_to_camera)[:3, 3]
+
+
+def classify_pose(
+    pose: dict[str, Any],
+    *,
+    max_reprojection_error_px: float,
+    min_markers: int = 2,
+) -> tuple[bool, str | None]:
+    """Decide whether a solved profile pose may feed the orbit-radius fit."""
+    if not pose.get("ok"):
+        return False, "no usable mapped marker pose"
+    error = pose.get("reprojection_error_px")
+    if error is None or not np.isfinite(error):
+        return False, "non-finite reprojection error"
+    if len(pose.get("used_ids") or []) < min_markers:
+        return False, f"fewer than {min_markers} mapped markers in view"
+    if error > max_reprojection_error_px:
+        return False, f"reprojection error exceeds {max_reprojection_error_px:.2f}px"
+    return True, None
+
+
+def build_fit_samples(
+    angle_results: list[dict[str, Any]],
+    *,
+    use_all_frames: bool = True,
+) -> list[dict[str, Any]]:
+    """Flatten accepted camera centers into circle-fit samples.
+
+    With ``use_all_frames`` every accepted per-frame camera center becomes a
+    sample; otherwise a single per-angle median sample is emitted.
+    """
+    samples: list[dict[str, Any]] = []
+    for angle_result in angle_results:
+        if not angle_result.get("pose_valid"):
+            continue
+        angle_deg = float(angle_result["angle_deg"])
+        if use_all_frames:
+            for frame in angle_result.get("frames", []):
+                if not frame.get("accepted"):
+                    continue
+                samples.append(
+                    {
+                        "angle_deg": angle_deg,
+                        "rgb_camera_center_m": list(frame["rgb_camera_center_m"]),
+                        "depth_camera_center_m": list(frame["depth_camera_center_m"]),
+                    }
+                )
+        else:
+            samples.append(
+                {
+                    "angle_deg": angle_deg,
+                    "rgb_camera_center_m": list(angle_result["rgb_camera_center_m"]),
+                    "depth_camera_center_m": list(angle_result["depth_camera_center_m"]),
+                }
+            )
+    return samples
 
 
 def _fit_circle_once(points: np.ndarray) -> dict[str, Any]:
@@ -176,6 +242,34 @@ def _fit_circle_once(points: np.ndarray) -> dict[str, Any]:
     }
 
 
+def _refine_circle_geometric(
+    points: np.ndarray,
+    center: np.ndarray,
+    axis: np.ndarray,
+    radius: float,
+) -> dict[str, Any]:
+    """Refine centre and radius by minimising true 3D point-to-circle distance."""
+    from scipy.optimize import least_squares
+
+    axis = axis / np.linalg.norm(axis)
+
+    def residuals(params: np.ndarray) -> np.ndarray:
+        c = params[:3]
+        r = params[3]
+        rel = points - c
+        plane = rel @ axis
+        radial = np.linalg.norm(rel - np.outer(plane, axis), axis=1)
+        return np.concatenate((radial - r, plane))
+
+    x0 = np.array([center[0], center[1], center[2], radius], dtype=np.float64)
+    solution = least_squares(residuals, x0, method="lm", max_nfev=2000)
+    refined_center = np.asarray(solution.x[:3], dtype=np.float64)
+    refined_radius = float(solution.x[3])
+    if refined_radius <= 0.0:
+        raise ValueError("Geometric circle refinement produced a non-positive radius")
+    return {"center": refined_center, "axis": axis, "radius": refined_radius}
+
+
 def fit_orbit_circle(
     camera_centers_m: np.ndarray,
     *,
@@ -201,25 +295,74 @@ def fit_orbit_circle(
     fitted = _fit_circle_once(points[inliers])
     center = fitted["center"]
     axis = fitted["axis"]
+    radius = fitted["radius"]
     if axis[2] < 0.0:
         axis = -axis
+
+    try:
+        refined = _refine_circle_geometric(points[inliers], center, axis, radius)
+        center = refined["center"]
+        radius = refined["radius"]
+    except (ValueError, np.linalg.LinAlgError, ImportError):
+        pass
 
     centered = points - center
     plane_distance = centered @ axis
     radial_vectors = centered - np.outer(plane_distance, axis)
     radial_distance = np.linalg.norm(radial_vectors, axis=1)
-    all_residuals = np.sqrt(
-        (radial_distance - fitted["radius"]) ** 2 + plane_distance**2
-    )
+    all_residuals = np.sqrt((radial_distance - radius) ** 2 + plane_distance**2)
     inlier_residuals = all_residuals[inliers]
     return {
-        "radius_m": float(fitted["radius"]),
+        "radius_m": float(radius),
         "center_m": center.tolist(),
         "axis": axis.tolist(),
         "residuals_m": all_residuals.tolist(),
         "inlier_mask": inliers.tolist(),
         "rmse_m": float(np.sqrt(np.mean(inlier_residuals**2))),
         "max_residual_m": float(np.max(inlier_residuals)),
+    }
+
+
+def bootstrap_radius_ci(
+    camera_centers_m: np.ndarray,
+    *,
+    n_resamples: int = 250,
+    confidence: float = 0.95,
+    seed: int = 0,
+    mad_threshold: float = 3.5,
+) -> dict[str, Any]:
+    """Bootstrap a confidence interval for the fitted orbit radius."""
+    points = np.asarray(camera_centers_m, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 3:
+        raise ValueError("At least three 3D camera centers are required")
+
+    rng = np.random.default_rng(seed)
+    radii: list[float] = []
+    for _ in range(n_resamples):
+        sample = points[rng.integers(0, len(points), size=len(points))]
+        try:
+            radii.append(
+                fit_orbit_circle(sample, mad_threshold=mad_threshold)["radius_m"]
+            )
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+
+    if len(radii) < max(2, n_resamples // 10):
+        return {
+            "radius_std_m": None,
+            "radius_ci_low_m": None,
+            "radius_ci_high_m": None,
+            "n_resamples_ok": len(radii),
+        }
+
+    radii_arr = np.asarray(radii, dtype=np.float64)
+    tail = (1.0 - confidence) / 2.0
+    low, high = np.quantile(radii_arr, [tail, 1.0 - tail])
+    return {
+        "radius_std_m": float(np.std(radii_arr, ddof=1)),
+        "radius_ci_low_m": float(low),
+        "radius_ci_high_m": float(high),
+        "n_resamples_ok": len(radii),
     }
 
 
@@ -243,6 +386,7 @@ def evaluate_trajectory(
     min_unique_angles: int = 6,
     max_gap_deg: float = 90.0,
     mad_threshold: float = 3.5,
+    bootstrap_resamples: int = 250,
 ) -> dict[str, Any]:
     """Fit RGB/depth trajectories and decide whether a radius is publishable."""
     reasons: list[str] = []
@@ -272,6 +416,26 @@ def evaluate_trajectory(
             "rgb_fit": None,
             "depth_fit": None,
         }
+
+    for fit, fit_points in ((rgb_fit, rgb_points), (depth_fit, depth_points)):
+        try:
+            fit.update(
+                bootstrap_radius_ci(
+                    fit_points,
+                    n_resamples=bootstrap_resamples,
+                    mad_threshold=mad_threshold,
+                )
+            )
+        except (ValueError, np.linalg.LinAlgError):
+            fit.update(
+                {
+                    "radius_std_m": None,
+                    "radius_ci_low_m": None,
+                    "radius_ci_high_m": None,
+                    "n_resamples_ok": 0,
+                }
+            )
+
     depth_inliers = np.asarray(depth_fit["inlier_mask"], dtype=bool)
     inlier_angles = [
         float(sample["angle_deg"])

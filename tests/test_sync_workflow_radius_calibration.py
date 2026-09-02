@@ -16,9 +16,15 @@ SYNC_WORKFLOW_DIR = (
 )
 sys.path.insert(0, str(SYNC_WORKFLOW_DIR))
 
-from radius_calibration import (  # noqa: E402
+from calculating_radius.radius_calibration import (  # noqa: E402
+    _fit_circle_once,
+    _refine_circle_geometric,
+    bootstrap_radius_ci,
+    build_detector_parameters,
+    build_fit_samples,
     build_profile_marker_map,
     camera_center_world,
+    classify_pose,
     convert_world_to_color_to_world_to_depth,
     evaluate_trajectory,
     fit_orbit_circle,
@@ -26,7 +32,125 @@ from radius_calibration import (  # noqa: E402
     marker_normal,
     solve_profile_pose,
 )
-from generate_radius_markers import generate_marker_kit  # noqa: E402
+from calculating_radius.generate_radius_markers import generate_marker_kit  # noqa: E402
+
+
+class DetectorParameterTests(unittest.TestCase):
+    def test_enables_subpixel_corner_refinement(self):
+        params = build_detector_parameters()
+
+        self.assertEqual(
+            params.cornerRefinementMethod, cv2.aruco.CORNER_REFINE_SUBPIX
+        )
+        self.assertEqual(params.cornerRefinementWinSize, 5)
+        self.assertEqual(params.cornerRefinementMaxIterations, 50)
+        self.assertAlmostEqual(params.cornerRefinementMinAccuracy, 0.01)
+
+
+class ClassifyPoseTests(unittest.TestCase):
+    def test_accepts_multi_marker_pose_within_error_budget(self):
+        pose = {"ok": True, "used_ids": [0, 1], "reprojection_error_px": 0.5}
+
+        accepted, reason = classify_pose(
+            pose, max_reprojection_error_px=1.5, min_markers=2
+        )
+
+        self.assertTrue(accepted)
+        self.assertIsNone(reason)
+
+    def test_rejects_single_marker_pose_when_two_required(self):
+        pose = {"ok": True, "used_ids": [0], "reprojection_error_px": 0.2}
+
+        accepted, reason = classify_pose(
+            pose, max_reprojection_error_px=1.5, min_markers=2
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "fewer than 2 mapped markers in view")
+
+    def test_allows_single_marker_pose_when_one_permitted(self):
+        pose = {"ok": True, "used_ids": [0], "reprojection_error_px": 0.2}
+
+        accepted, reason = classify_pose(
+            pose, max_reprojection_error_px=1.5, min_markers=1
+        )
+
+        self.assertTrue(accepted)
+        self.assertIsNone(reason)
+
+    def test_rejects_high_reprojection_error(self):
+        pose = {"ok": True, "used_ids": [0, 1, 2], "reprojection_error_px": 3.0}
+
+        accepted, reason = classify_pose(
+            pose, max_reprojection_error_px=1.5, min_markers=2
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "reprojection error exceeds 1.50px")
+
+    def test_rejects_failed_pose_and_non_finite_error(self):
+        failed = {"ok": False, "used_ids": [], "reprojection_error_px": None}
+        self.assertEqual(
+            classify_pose(failed, max_reprojection_error_px=1.5),
+            (False, "no usable mapped marker pose"),
+        )
+
+        nan_error = {
+            "ok": True,
+            "used_ids": [0, 1],
+            "reprojection_error_px": float("nan"),
+        }
+        self.assertEqual(
+            classify_pose(nan_error, max_reprojection_error_px=1.5),
+            (False, "non-finite reprojection error"),
+        )
+
+
+class BuildFitSamplesTests(unittest.TestCase):
+    def _angle_results(self):
+        return [
+            {
+                "angle_deg": 0.0,
+                "pose_valid": True,
+                "rgb_camera_center_m": [0.11, 0.0, 0.0],
+                "depth_camera_center_m": [0.12, 0.0, 0.0],
+                "frames": [
+                    {
+                        "accepted": True,
+                        "rgb_camera_center_m": [0.10, 0.0, 0.0],
+                        "depth_camera_center_m": [0.11, 0.0, 0.0],
+                    },
+                    {"accepted": False},
+                    {
+                        "accepted": True,
+                        "rgb_camera_center_m": [0.12, 0.0, 0.0],
+                        "depth_camera_center_m": [0.13, 0.0, 0.0],
+                    },
+                ],
+            },
+            {"angle_deg": 45.0, "pose_valid": False, "frames": []},
+        ]
+
+    def test_expands_every_accepted_frame(self):
+        samples = build_fit_samples(self._angle_results(), use_all_frames=True)
+
+        self.assertEqual(len(samples), 2)
+        self.assertEqual([s["angle_deg"] for s in samples], [0.0, 0.0])
+        self.assertEqual(samples[0]["depth_camera_center_m"], [0.11, 0.0, 0.0])
+        self.assertEqual(samples[1]["depth_camera_center_m"], [0.13, 0.0, 0.0])
+
+    def test_median_mode_returns_one_sample_per_valid_angle(self):
+        samples = build_fit_samples(self._angle_results(), use_all_frames=False)
+
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0]["angle_deg"], 0.0)
+        self.assertEqual(samples[0]["depth_camera_center_m"], [0.12, 0.0, 0.0])
+
+    def test_skips_angles_that_are_not_pose_valid(self):
+        results = self._angle_results()
+        results[0]["pose_valid"] = False
+
+        self.assertEqual(build_fit_samples(results, use_all_frames=True), [])
 
 
 class ProfileMarkerMapTests(unittest.TestCase):
@@ -75,6 +199,20 @@ class ProfileMarkerMapTests(unittest.TestCase):
             np.testing.assert_allclose(
                 marker_normal(corners), expected_normals[marker["face"]], atol=1e-12
             )
+
+    def test_marker_canonical_top_edge_points_toward_the_printed_strip_top(self):
+        marker_map = build_profile_marker_map()
+
+        self.assertEqual(
+            marker_map["world_frame"]["z_axis"],
+            "along the printed strip top-edge direction",
+        )
+        for marker in marker_map["markers"]:
+            corners = np.asarray(marker["corners_m"])
+            center_z = float(marker["center_m"][2])
+            self.assertTrue(np.all(corners[:2, 2] > center_z))
+            self.assertTrue(np.all(corners[2:, 2] < center_z))
+            self.assertEqual(marker["bar_up"], [0.0, 0.0, 1.0])
 
     def test_print_kit_contains_exact_continuous_wrap_and_fold_geometry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -245,6 +383,103 @@ class OrbitFitTests(unittest.TestCase):
         self.assertEqual(result["quality_status"], "invalid")
         self.assertIsNone(result["recommended_radius_m"])
         self.assertIn("fit failed", " ".join(result["quality_reasons"]))
+
+    def test_geometric_refinement_recovers_an_exact_partial_arc(self):
+        radius = 0.1175
+        angles = np.deg2rad(np.linspace(0.0, 170.0, 10))
+        points = np.column_stack(
+            (radius * np.cos(angles), radius * np.sin(angles), np.zeros_like(angles))
+        )
+
+        result = fit_orbit_circle(points)
+
+        self.assertAlmostEqual(result["radius_m"], radius, places=7)
+
+    def test_geometric_refinement_lowers_radius_bias_on_short_noisy_arcs(self):
+        # The algebraic (Kasa) fit systematically under-estimates the radius of a
+        # short, noisy arc; the geometric refinement removes most of that bias.
+        rng = np.random.default_rng(1234)
+        radius = 0.1175
+        angles = np.deg2rad(np.linspace(0.0, 100.0, 12))
+        clean = np.column_stack(
+            (radius * np.cos(angles), radius * np.sin(angles), np.zeros_like(angles))
+        )
+
+        algebraic_signed = []
+        refined_signed = []
+        for _ in range(300):
+            noisy = clean + rng.normal(scale=0.0012, size=clean.shape)
+            algebraic = _fit_circle_once(noisy)
+            algebraic_signed.append(algebraic["radius"] - radius)
+            refined = _refine_circle_geometric(
+                noisy, algebraic["center"], algebraic["axis"], algebraic["radius"]
+            )
+            refined_signed.append(refined["radius"] - radius)
+
+        self.assertLess(
+            abs(np.mean(refined_signed)), abs(np.mean(algebraic_signed))
+        )
+        self.assertLess(abs(np.mean(refined_signed)), 0.5 * abs(np.mean(algebraic_signed)))
+
+    def test_refine_circle_geometric_rejects_missing_scipy(self):
+        # Sanity: the helper returns a plausible circle for well-posed input.
+        radius = 0.1175
+        angles = np.deg2rad(np.arange(0.0, 360.0, 30.0))
+        points = np.column_stack(
+            (radius * np.cos(angles), radius * np.sin(angles), np.zeros_like(angles))
+        )
+
+        refined = _refine_circle_geometric(
+            points, np.array([0.01, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]), 0.10
+        )
+
+        self.assertAlmostEqual(refined["radius"], radius, places=6)
+        np.testing.assert_allclose(refined["center"], [0.0, 0.0, 0.0], atol=1e-6)
+
+    def test_bootstrap_ci_brackets_the_true_radius(self):
+        rng = np.random.default_rng(7)
+        radius = 0.1175
+        angles = np.deg2rad(np.arange(0.0, 360.0, 20.0))
+        clean = np.column_stack(
+            (radius * np.cos(angles), radius * np.sin(angles), np.zeros_like(angles))
+        )
+        noisy = clean + rng.normal(scale=0.0005, size=clean.shape)
+
+        ci = bootstrap_radius_ci(noisy, n_resamples=200, seed=3)
+
+        self.assertIsNotNone(ci["radius_std_m"])
+        self.assertGreater(ci["radius_std_m"], 0.0)
+        self.assertLess(ci["radius_ci_low_m"], radius)
+        self.assertGreater(ci["radius_ci_high_m"], radius)
+        self.assertGreaterEqual(ci["n_resamples_ok"], 180)
+
+    def test_bootstrap_ci_rejects_too_few_points(self):
+        with self.assertRaises(ValueError):
+            bootstrap_radius_ci(np.zeros((2, 3)))
+
+    def test_evaluate_trajectory_attaches_radius_confidence_interval(self):
+        samples = []
+        for angle in range(0, 360, 30):
+            radians = np.deg2rad(angle)
+            center = [0.1175 * np.cos(radians), 0.1175 * np.sin(radians), 0.0]
+            samples.append(
+                {
+                    "angle_deg": angle,
+                    "rgb_camera_center_m": center,
+                    "depth_camera_center_m": center,
+                }
+            )
+
+        result = evaluate_trajectory(samples, bootstrap_resamples=80)
+
+        for key in (
+            "radius_std_m",
+            "radius_ci_low_m",
+            "radius_ci_high_m",
+            "n_resamples_ok",
+        ):
+            self.assertIn(key, result["depth_fit"])
+            self.assertIn(key, result["rgb_fit"])
 
 
 class CameraExtrinsicTests(unittest.TestCase):
