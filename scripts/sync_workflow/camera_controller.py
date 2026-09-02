@@ -52,6 +52,7 @@ try:
         AlignFilter,
         Config,
         Context,
+        FrameSet,
         OBAlignMode,
         OBFormat,
         OBFrameAggregateOutputMode,
@@ -65,6 +66,7 @@ except ImportError:
     # Provide dummy classes for type hinting / offline development
     Pipeline = type('Pipeline', (), {})
     AlignFilter = type('AlignFilter', (), {})
+    FrameSet = type('FrameSet', (), {})
     OBPropertyID = type(
         'OBPropertyID',
         (),
@@ -251,6 +253,21 @@ class CameraController:
     def capture_aligned_rgbd(self, timeout_ms: int = 1000) -> Tuple[Optional[object], Optional[object]]:
         """
         Wait for a frame and return aligned (color_frame, depth_frame).
+
+        Depth filters must run on the raw, unaligned depth frame: the
+        recommended chain (DisparityTransform, then the spatial/temporal/
+        noise filters) assumes the native sensor neighbourhood and disparity
+        domain, not depth that has already been resampled onto the colour
+        grid by D2C alignment. So this filters the raw depth frame first,
+        assembles a new frame set from the filtered depth plus the original
+        colour frame, and only then runs D2C alignment on that frame set.
+
+        If the reassemble-and-align path is unavailable (e.g. some
+        firmware doesn't support building a frame set in software), this
+        falls back to the previous align-then-filter order and logs a
+        warning so the active path is visible at the rig. Capture must
+        never fail just because the reassembly path is unavailable.
+
         Returns (None, None) if a frame pair couldn't be captured.
         """
         if not self.pipeline:
@@ -264,7 +281,7 @@ class CameraController:
             if old_frames is None:
                 break
             flushed_count += 1
-            
+
         logger.debug(f"Flushed {flushed_count} stale frames from camera queue.")
 
         frames = self.pipeline.wait_for_frames(timeout_ms)
@@ -272,11 +289,44 @@ class CameraController:
             logger.warning("Timeout waiting for fresh frames.")
             return None, None
 
+        already_filtered = False
         if self.align_filter is not None:
-            aligned = self.align_filter.process(frames)
+            aligned = None
+            try:
+                raw_color_frame = frames.get_color_frame()
+                raw_depth_frame = frames.get_depth_frame()
+                if raw_color_frame is None or raw_depth_frame is None:
+                    raise RuntimeError("Incomplete raw frame pair.")
+
+                # Build the container first: if frame-set assembly is not
+                # supported on this firmware, fail here before doing any
+                # (wasted) filtering work.
+                filter_frames = FrameSet.create_frame_set()
+
+                filtered_depth_frame = apply_depth_filters(raw_depth_frame, self.depth_filters)
+
+                filter_frames.push_frame(filtered_depth_frame)
+                filter_frames.push_frame(raw_color_frame)
+
+                aligned = self.align_filter.process(filter_frames)
+                if aligned is None:
+                    raise RuntimeError("AlignFilter returned None for the filtered frame set.")
+                already_filtered = True
+            except Exception as e:
+                logger.warning(
+                    "Filter-before-align path unavailable (%s); falling back "
+                    "to align-then-filter for this frame.",
+                    e,
+                )
+                aligned = None
+                already_filtered = False
+
             if aligned is None:
-                logger.warning("Depth-to-color alignment failed.")
-                return None, None
+                aligned = self.align_filter.process(frames)
+                if aligned is None:
+                    logger.warning("Depth-to-color alignment failed.")
+                    return None, None
+
             frames = aligned.as_frame_set() if hasattr(aligned, "as_frame_set") else aligned
 
         color_frame = frames.get_color_frame()
@@ -286,10 +336,8 @@ class CameraController:
             logger.warning("Incomplete frame pair.")
             return None, None
 
-        if self.depth_filters:
-            filtered = apply_depth_filters(depth_frame, self.depth_filters)
-            if filtered is not None:
-                depth_frame = filtered
+        if not already_filtered and self.depth_filters:
+            depth_frame = apply_depth_filters(depth_frame, self.depth_filters)
 
         return color_frame, depth_frame
 
