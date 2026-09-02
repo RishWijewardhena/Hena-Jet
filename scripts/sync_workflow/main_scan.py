@@ -18,6 +18,7 @@ from pathlib import Path
 
 from motor_controller import MotorController
 from camera_controller import CameraController
+from pointcloud_export import backproject_to_points
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -233,26 +234,12 @@ def save_frame_as_ply(
     """Create a colored point cloud from RGBD and save as PLY."""
     import open3d as o3d
 
-    color_o3d = o3d.geometry.Image(color_rgb.astype(np.uint8))
-    depth_o3d = o3d.geometry.Image((depth_m * 1000.0).astype(np.uint16))
-
-    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-        color_o3d, depth_o3d,
-        depth_scale=1000.0,
-        depth_trunc=depth_trunc_m,
-        convert_rgb_to_intensity=False,
+    points, colors = backproject_to_points(
+        depth_m, color_rgb, intrinsics, depth_trunc_m=depth_trunc_m
     )
-
-    intrinsic_o3d = o3d.camera.PinholeCameraIntrinsic(
-        width=intrinsics["width"],
-        height=intrinsics["height"],
-        fx=intrinsics["fx"],
-        fy=intrinsics["fy"],
-        cx=intrinsics["cx"],
-        cy=intrinsics["cy"],
-    )
-
-    pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic_o3d)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
 
     out_path = output_dir / (filename or f"frame_{angle_deg:.1f}.ply")
     o3d.io.write_point_cloud(str(out_path), pcd)
