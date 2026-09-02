@@ -192,6 +192,57 @@ coordinate frame used to create the PLY files:
 The current camera wrapper normally reports `coordinate_frame: "color"`, so
 the recommended `--radius-m` normally corresponds to the RGB optical center.
 
+## Measured orbit geometry for reconstruction
+
+A valid calibration with an accepted zero-degree reference pose contains a
+top-level `orbit_geometry` block in `radius_calibration.json`:
+
+```json
+{
+  "orbit_geometry": {
+    "pivot_m": [0.0012, -0.0008, 0.1171],
+    "axis": [0.9998, 0.0180, -0.0060]
+  }
+}
+```
+
+The example values only illustrate the JSON shape; use the values produced by
+your own calibration. Both fields are expressed in the point-cloud camera
+coordinate system at the zero-degree reference capture:
+
+- `pivot_m` is the fitted 3D orbit center, in metres;
+- `axis` is the fitted unit rotation-axis direction.
+
+The circle fit initially produces its center and axis in the fixed profile
+frame. The accepted zero-degree `world_to_color` or `world_to_depth` pose then
+transforms the center as a point and the axis as a direction into the matching
+reference camera frame. Translation affects `pivot_m`; it must never be added
+to `axis`.
+
+Use the complete calibration report for reconstruction:
+
+```bash
+python scripts/sync_workflow/reconstruct_pipeline.py \
+  --input-dir outputs/<scan-directory> \
+  --orbit-geometry outputs/test_radius/radius_calibration.json \
+  --registration-mode motor
+```
+
+This should be preferred over passing only `--orbit-radius-m`. A scalar radius
+cannot describe an offset rotation center or a tilted axis, so the fallback
+geometry assumes `pivot = [0, 0, R]` and `axis = [1, 0, 0]` unless separate
+overrides are provided. That idealized pivot produced a measured 2.2 mm
+rotation-center error on this rig. Since opposite-view displacement error is
+approximately `2 * offset * sin(angle / 2)`, even a small center offset can
+create millimetre-scale doubled surfaces near 180 degrees.
+
+If `--pivot X Y Z` is passed together with `--orbit-geometry`, the explicit
+pivot overrides `orbit_geometry.pivot_m`; the measured `orbit_geometry.axis`
+is still used. The calibration file must contain a valid `orbit_geometry`
+block—older reports, invalid reports, or runs without an accepted zero-degree
+reference pose should be regenerated rather than silently falling back to
+scalar geometry.
+
 ## Step 5: Fit the orbit plane
 
 Real hardware can be tilted, so the implementation does not assume that the
@@ -322,7 +373,7 @@ The output directory contains:
 
 | Output | Meaning |
 |---|---|
-| `radius_calibration.json` | Complete result, quality decision, marker geometry, camera calibration, frame poses, RGB/depth circle fits (with `radius_std_m` / `radius_ci_low_m` / `radius_ci_high_m`), residuals, and recommended radius. |
+| `radius_calibration.json` | Complete result, quality decision, marker geometry, camera calibration, frame poses, RGB/depth circle fits (with `radius_std_m` / `radius_ci_low_m` / `radius_ci_high_m`), residuals, recommended radius, and—when the zero-degree reference pose is accepted—the reference-camera `orbit_geometry` (`pivot_m` and `axis`). |
 | `radius_angle_summary.csv` | Accepted depth-camera centers, inlier flags, and circle residuals by angle. |
 | `depth_camera_trajectory.ply` | Camera-center samples; green points are fit inliers and red points are rejected outliers. |
 | `pose_diagnostics/` | Annotated RGB frames showing detected IDs, pose axes, acceptance, and reprojection error. |
@@ -368,4 +419,3 @@ marker-map problem and repeat the complete calibration.
 - The camera centers approximately follow one planar circle.
 - Human/object depth points do not determine the radius; ArUco camera poses do.
 - The method estimates a best-fit radius and cannot make a non-circular orbit circular.
-
