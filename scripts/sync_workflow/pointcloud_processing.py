@@ -316,6 +316,36 @@ def _validate_final_artifact(o3d, trimesh, output_path: Path) -> dict:
     }
 
 
+def largest_component_indices(
+    o3d,
+    cloud,
+    *,
+    eps_m: float,
+    min_points: int,
+    min_fraction: float,
+) -> np.ndarray:
+    """Indices of connected components at least ``min_fraction`` of the largest.
+
+    Statistical outlier removal judges a point by its own neighbourhood, so a
+    compact blob of noise floating clear of the object looks entirely healthy
+    from the inside and survives. Connectivity separates them: the object is one
+    body, and detached debris is not attached to it at any distance.
+
+    Points DBSCAN assigns to no cluster belong to no component and are dropped
+    with the undersized ones. A ``min_fraction`` at or below zero disables the
+    filter and keeps every point.
+    """
+    if min_fraction <= 0.0:
+        return np.arange(len(cloud.points))
+    labels = np.asarray(cloud.cluster_dbscan(eps=eps_m, min_points=min_points))
+    if labels.size == 0 or labels.max() < 0:
+        return np.arange(len(cloud.points))
+    counts = np.bincount(labels[labels >= 0])
+    threshold = max(1.0, float(counts.max()) * float(min_fraction))
+    keep_labels = {int(label) for label, n in enumerate(counts) if n >= threshold}
+    return np.flatnonzero(np.isin(labels, list(keep_labels)))
+
+
 def merge_and_finalize_clouds(
     transformed_paths: Sequence[Path],
     output_path: Path,
@@ -328,6 +358,9 @@ def merge_and_finalize_clouds(
     normal_radius_m: float,
     normal_max_neighbors: int,
     normal_mst_neighbors: int,
+    component_eps_m: float = 0.003,
+    component_min_points: int = 10,
+    component_min_fraction: float = 0.01,
 ) -> dict:
     """Merge transformed scans, clean them, orient normals, and validate PLY."""
     o3d, trimesh = _geometry_libraries()
@@ -364,6 +397,19 @@ def merge_and_finalize_clouds(
             nb_neighbors=sor_neighbors,
             std_ratio=sor_sigma,
         )
+    sor_filtered_points = len(merged.points)
+
+    if component_min_fraction > 0.0 and len(merged.points) > component_min_points:
+        keep = largest_component_indices(
+            o3d,
+            merged,
+            eps_m=component_eps_m,
+            min_points=component_min_points,
+            min_fraction=component_min_fraction,
+        )
+        if len(keep) >= 3:
+            merged = merged.select_by_index(keep.tolist())
+
     if len(merged.points) < 3:
         raise RuntimeError("Final cleanup left too few points to estimate normals")
     filtered_points = len(merged.points)
@@ -398,6 +444,8 @@ def merge_and_finalize_clouds(
         "voxel_points": voxel_points,
         "spatially_separated_points": spatially_separated_points,
         "deduplicated_points": deduplicated_points,
+        "sor_filtered_points": sor_filtered_points,
+        "component_filtered_points": filtered_points,
         "filtered_points": filtered_points,
         "elapsed_seconds": time.perf_counter() - started,
         **validation,

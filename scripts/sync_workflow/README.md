@@ -505,6 +505,7 @@ Per-scan SOR uses 10 neighbors and sigma 2.0 unless `--skip-per-scan-sor` is set
 The transformed scans are merged, then processed with:
 
 - 1 mm spatial subsampling;
+- connected-component filtering, discarding any cluster smaller than 1 percent of the largest;
 - Trimesh quantized duplicate grouping at 0.1 mm;
 - final SOR with 20 neighbors and sigma 1.5;
 - normal estimation in a 4 mm neighborhood;

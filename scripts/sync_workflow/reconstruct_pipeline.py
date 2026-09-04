@@ -75,6 +75,9 @@ SPATIAL_SUBSAMPLE_M = 0.001
 NORMAL_RADIUS_M = 0.0040
 NORMAL_MAX_NEIGHBORS = 50
 NORMAL_MST_NEIGHBORS = 12
+FINAL_COMPONENT_EPS_M = 0.003
+FINAL_COMPONENT_MIN_POINTS = 10
+FINAL_COMPONENT_MIN_FRACTION = 0.01
 PROCESSING_MAX_WORKERS = 4
 
 # ===================================================================
@@ -1019,6 +1022,14 @@ def parse_args(argv=None):
         ),
     )
 
+    parser.add_argument(
+        "--keep-all-components",
+        action="store_true",
+        help="Keep detached point clusters in the merged cloud; by default a "
+             "component smaller than 1 percent of the largest is discarded, "
+             "since statistical outlier removal cannot see a compact blob of "
+             "noise that floats clear of the object",
+    )
     parser.add_argument("--skip-per-scan-sor", action="store_true",
                         help="Skip per-scan SOR (much faster; final SOR still runs)")
     return parser.parse_args(argv)
@@ -1368,6 +1379,10 @@ def main(argv=None):
             "normal_radius_m": NORMAL_RADIUS_M,
             "normal_max_neighbors": NORMAL_MAX_NEIGHBORS,
             "normal_mst_neighbors": NORMAL_MST_NEIGHBORS,
+            "component_eps_m": FINAL_COMPONENT_EPS_M,
+            "component_min_fraction": (
+                0.0 if args.keep_all_components else FINAL_COMPONENT_MIN_FRACTION
+            ),
         },
     }
     save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
@@ -1405,6 +1420,11 @@ def main(argv=None):
         normal_radius_m=NORMAL_RADIUS_M,
         normal_max_neighbors=NORMAL_MAX_NEIGHBORS,
         normal_mst_neighbors=NORMAL_MST_NEIGHBORS,
+        component_eps_m=FINAL_COMPONENT_EPS_M,
+        component_min_points=FINAL_COMPONENT_MIN_POINTS,
+        component_min_fraction=(
+            0.0 if args.keep_all_components else FINAL_COMPONENT_MIN_FRACTION
+        ),
     )
     settings["processing"] = {
         "transformed_frames": transform_stats,

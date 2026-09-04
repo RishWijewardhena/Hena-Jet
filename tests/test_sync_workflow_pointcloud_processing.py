@@ -274,3 +274,53 @@ class CylinderCropTests(unittest.TestCase):
             np.testing.assert_allclose(
                 np.sort(kept[:, 0]), [0.0, 0.13], atol=1e-6,
             )
+
+
+class LargestComponentTests(unittest.TestCase):
+    """SOR cannot see a compact blob that floats clear of the object."""
+
+    @staticmethod
+    def _cloud(points):
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=float))
+        return cloud
+
+    @staticmethod
+    def _patch(origin, size_m, spacing_m=0.001):
+        """A dense surface patch, at the ~1 mm spacing a real merged scan has."""
+        n = int(size_m / spacing_m)
+        grid = np.arange(n) * spacing_m
+        xs, ys = np.meshgrid(grid, grid)
+        points = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+        return points + np.asarray(origin, dtype=float)
+
+    def test_a_detached_blob_is_discarded(self):
+        # 2500-point body, 16-point blob: below the 1 percent (25 point) bar.
+        body = self._patch([0.0, 0.0, 0.14], 0.05)
+        debris = self._patch([0.09, 0.0, 0.14], 0.004)
+        cloud = self._cloud(np.vstack([body, debris]))
+        keep = pointcloud_processing.largest_component_indices(
+            o3d, cloud, eps_m=0.003, min_points=10, min_fraction=0.01,
+        )
+        self.assertEqual(len(keep), len(body))
+        self.assertLess(np.asarray(cloud.points)[keep][:, 0].max(), 0.06)
+
+    def test_a_large_detached_region_is_kept(self):
+        """A real disconnected part of the object must survive."""
+        body = self._patch([0.0, 0.0, 0.14], 0.05)
+        second = self._patch([0.09, 0.0, 0.14], 0.04)
+        cloud = self._cloud(np.vstack([body, second]))
+        keep = pointcloud_processing.largest_component_indices(
+            o3d, cloud, eps_m=0.003, min_points=10, min_fraction=0.01,
+        )
+        self.assertEqual(len(keep), len(body) + len(second))
+
+    def test_a_zero_fraction_keeps_everything(self):
+        cloud = self._cloud(np.vstack([
+            self._patch([0.0, 0.0, 0.14], 0.02),
+            self._patch([0.09, 0.0, 0.14], 0.003),
+        ]))
+        keep = pointcloud_processing.largest_component_indices(
+            o3d, cloud, eps_m=0.003, min_points=10, min_fraction=0.0,
+        )
+        self.assertEqual(len(keep), len(cloud.points))
