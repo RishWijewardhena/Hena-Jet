@@ -78,10 +78,18 @@ def parse_args(argv=None):
     parser.add_argument(
         "--min-markers-per-pose",
         type=int,
-        default=2,
+        default=1,
         help="Minimum mapped ArUco markers a frame pose must use to enter the radius "
-        "fit (lower to 1 only if angular coverage fails; single-marker planar pose "
-        "is ambiguous out of plane and biases the orbit fit)",
+        "fit; the four-face profile shows a second marker only near corner-on views, "
+        "so ambiguity is gated by --min-ippe-error-ratio instead",
+    )
+    parser.add_argument(
+        "--min-ippe-error-ratio",
+        type=float,
+        default=DEFAULT_MIN_IPPE_ERROR_RATIO,
+        help="Reject a single-marker pose unless the discarded IPPE solution fits at "
+        "least this many times worse, since two near-equal solutions differ mostly "
+        "out of plane",
     )
     parser.add_argument(
         "--max-fit-rmse-mm",

@@ -35,6 +35,7 @@ from calculating_radius.radius_calibration import (  # noqa: E402
 )
 from calculating_radius.generate_radius_markers import generate_marker_kit  # noqa: E402
 from calculating_radius import radius_calibration  # noqa: E402
+from calculating_radius import test_radius  # noqa: E402
 
 
 class DetectorParameterTests(unittest.TestCase):
@@ -741,3 +742,38 @@ class IppeAmbiguityGateTests(unittest.TestCase):
         """The four-face profile cannot show two markers at most angles."""
         accepted, reason = self._classify(ippe_error_ratio=6.0)
         self.assertTrue(accepted, reason)
+
+
+class TestRadiusArgumentsTests(unittest.TestCase):
+    """Every gate validate_args reads must exist on the parser."""
+
+    def test_defaults_parse_and_validate(self):
+        args = test_radius.parse_args([])
+        self.assertEqual(args.min_markers_per_pose, 1)
+        self.assertEqual(
+            args.min_ippe_error_ratio,
+            radius_calibration.DEFAULT_MIN_IPPE_ERROR_RATIO,
+        )
+        self.assertEqual(
+            args.max_fit_rmse_mm, radius_calibration.DEFAULT_MAX_FIT_RMSE_M * 1000.0,
+        )
+        test_radius.validate_args(args)
+
+    def test_the_ambiguity_ratio_is_overridable_and_bounded(self):
+        args = test_radius.parse_args(["--min-ippe-error-ratio", "1.5"])
+        self.assertEqual(args.min_ippe_error_ratio, 1.5)
+        test_radius.validate_args(args)
+
+        with self.assertRaises(ValueError):
+            test_radius.validate_args(
+                test_radius.parse_args(["--min-ippe-error-ratio", "0.5"])
+            )
+
+    def test_the_fit_gates_are_overridable_and_bounded(self):
+        args = test_radius.parse_args(
+            ["--max-fit-rmse-mm", "3", "--max-fit-residual-mm", "7"]
+        )
+        test_radius.validate_args(args)
+        for flag in ("--max-fit-rmse-mm", "--max-fit-residual-mm"):
+            with self.assertRaises(ValueError):
+                test_radius.validate_args(test_radius.parse_args([flag, "0"]))
