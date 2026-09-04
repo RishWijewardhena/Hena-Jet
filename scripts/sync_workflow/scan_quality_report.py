@@ -34,6 +34,11 @@ def parse_args(argv=None):
                         help="Keep every Nth point when loading PLY files (default 4)")
     parser.add_argument("--separations-deg", type=float, nargs="+",
                         default=[10.0, 30.0, 90.0, 180.0])
+    parser.add_argument("--compare-merged", type=Path, default=None,
+                        help="Second merged cloud of the same rigid object; adds a "
+                             "repeatability section comparing it with --merged")
+    parser.add_argument("--repeatability-max-distance-m", type=float, default=0.008,
+                        help="Correspondence limit for the repeatability comparison")
     parser.add_argument("--output", type=Path, default=None,
                         help="Write the metrics as JSON to this path")
     return parser.parse_args(argv)
@@ -48,6 +53,80 @@ def patch_near(points: np.ndarray, centre: np.ndarray, half_extent_m: float) -> 
     offsets = np.abs(points - centre)
     inside = np.all(offsets < half_extent_m, axis=1)
     return points[inside]
+
+
+def nearest_neighbour_stats(
+    source: np.ndarray,
+    target: np.ndarray,
+    *,
+    max_distance_m: float,
+) -> dict:
+    """Distance statistics from every source point to its nearest target point."""
+    from scipy.spatial import cKDTree
+
+    distances, _ = cKDTree(target).query(source, k=1)
+    paired = distances[distances <= max_distance_m]
+    if len(paired) == 0:
+        raise RuntimeError(
+            "No point pairs within the correspondence limit; the clouds do not "
+            "overlap, or they are not in the same coordinate frame."
+        )
+    return {
+        "paired_fraction": float(len(paired) / len(distances)),
+        "median_m": float(np.median(paired)),
+        "rms_m": float(np.sqrt(np.mean(paired**2))),
+        "p95_m": float(np.percentile(paired, 95)),
+        "max_m": float(paired.max()),
+    }
+
+
+def repeatability_report(
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+    *,
+    max_distance_m: float,
+) -> dict:
+    """Compare two scans of the same rigid object.
+
+    Two numbers, because they answer different questions. `as_reconstructed`
+    compares the clouds where the pipeline actually put them, so it carries
+    both shape error and any drift in the reconstructed frame; that is what a
+    downstream nozzle trajectory would see. `after_rigid_alignment` re-registers
+    the pair first, so it isolates how reproducible the measured *shape* is.
+    A large gap between the two means the shape repeats but the frame does not,
+    which points at the orbit calibration rather than the sensor.
+    """
+    raw = nearest_neighbour_stats(points_a, points_b, max_distance_m=max_distance_m)
+
+    cloud_a = o3d.geometry.PointCloud()
+    cloud_a.points = o3d.utility.Vector3dVector(points_a)
+    cloud_b = o3d.geometry.PointCloud()
+    cloud_b.points = o3d.utility.Vector3dVector(points_b)
+    result = o3d.pipelines.registration.registration_icp(
+        cloud_a,
+        cloud_b,
+        max_distance_m,
+        np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+    )
+    transform = np.asarray(result.transformation, dtype=float)
+    aligned = nearest_neighbour_stats(
+        points_a @ transform[:3, :3].T + transform[:3, 3],
+        points_b,
+        max_distance_m=max_distance_m,
+    )
+    rotation_deg = float(
+        np.degrees(
+            np.arccos(np.clip((np.trace(transform[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))
+        )
+    )
+    return {
+        "as_reconstructed": raw,
+        "after_rigid_alignment": aligned,
+        "alignment_translation_m": float(np.linalg.norm(transform[:3, 3])),
+        "alignment_rotation_deg": rotation_deg,
+        "icp_fitness": float(result.fitness),
+    }
 
 
 def resolve_pivot(args) -> np.ndarray:
@@ -128,6 +207,31 @@ def main(argv=None):
             logger.info("Cross-view residual at %5.1f deg: %.3f mm",
                         separation, separations[str(separation)] * 1000.0)
     report["cross_view_residual_m"] = separations
+
+    if args.compare_merged is not None:
+        if not merged_path.is_file():
+            raise RuntimeError(f"--compare-merged needs a readable {merged_path}")
+        repeatability = repeatability_report(
+            load_points(merged_path)[::args.subsample],
+            load_points(args.compare_merged)[::args.subsample],
+            max_distance_m=args.repeatability_max_distance_m,
+        )
+        repeatability["compared_with"] = str(args.compare_merged)
+        report["repeatability"] = repeatability
+        logger.info(
+            "Repeatability as reconstructed: %.3f mm median, %.3f mm RMS, %.3f mm p95",
+            repeatability["as_reconstructed"]["median_m"] * 1000.0,
+            repeatability["as_reconstructed"]["rms_m"] * 1000.0,
+            repeatability["as_reconstructed"]["p95_m"] * 1000.0,
+        )
+        logger.info(
+            "Repeatability after rigid alignment: %.3f mm median, %.3f mm RMS "
+            "(alignment moved %.3f mm / %.3f deg)",
+            repeatability["after_rigid_alignment"]["median_m"] * 1000.0,
+            repeatability["after_rigid_alignment"]["rms_m"] * 1000.0,
+            repeatability["alignment_translation_m"] * 1000.0,
+            repeatability["alignment_rotation_deg"],
+        )
 
     if args.output:
         args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
