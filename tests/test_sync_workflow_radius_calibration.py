@@ -691,3 +691,53 @@ class CircleFitResidualGateTests(unittest.TestCase):
             max_fit_residual_m=0.02,
         )
         self.assertEqual(relaxed["quality_status"], "valid")
+
+
+class IppeAmbiguityGateTests(unittest.TestCase):
+    """A square marker admits two IPPE poses; near-equal ones must be rejected."""
+
+    BASE = {
+        "ok": True,
+        "used_ids": [1],
+        "reprojection_error_px": 0.4,
+    }
+
+    def _classify(self, **overrides):
+        pose = dict(self.BASE)
+        pose.update(overrides)
+        return radius_calibration.classify_pose(
+            pose, max_reprojection_error_px=1.5,
+        )
+
+    def test_a_decisive_solution_is_accepted(self):
+        accepted, reason = self._classify(ippe_error_ratio=6.0)
+        self.assertTrue(accepted, reason)
+        self.assertIsNone(reason)
+
+    def test_an_ambiguous_solution_is_rejected(self):
+        accepted, reason = self._classify(ippe_error_ratio=1.05)
+        self.assertFalse(accepted)
+        self.assertIn("ambiguous single-marker pose", reason)
+
+    def test_a_lone_solution_is_not_penalised(self):
+        """One surviving IPPE solution carries no ratio and stays acceptable."""
+        accepted, reason = self._classify(ippe_error_ratio=None)
+        self.assertTrue(accepted, reason)
+
+    def test_the_ratio_threshold_is_configurable(self):
+        pose = dict(self.BASE, ippe_error_ratio=1.5)
+        self.assertFalse(
+            radius_calibration.classify_pose(
+                pose, max_reprojection_error_px=1.5, min_ippe_error_ratio=2.0,
+            )[0]
+        )
+        self.assertTrue(
+            radius_calibration.classify_pose(
+                pose, max_reprojection_error_px=1.5, min_ippe_error_ratio=1.2,
+            )[0]
+        )
+
+    def test_a_single_marker_is_allowed_by_default(self):
+        """The four-face profile cannot show two markers at most angles."""
+        accepted, reason = self._classify(ippe_error_ratio=6.0)
+        self.assertTrue(accepted, reason)

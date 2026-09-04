@@ -13,6 +13,7 @@ DEFAULT_MARKER_SIZES_M = (0.018, 0.014, 0.018, 0.014)
 DEFAULT_PROFILE_WIDTH_M = 0.040
 DEFAULT_PROFILE_DEPTH_M = 0.020
 DEFAULT_CARRIER_OFFSET_M = 0.0001
+DEFAULT_MIN_IPPE_ERROR_RATIO = 2.0
 DEFAULT_AXIAL_OFFSETS_M = (0.0, 0.0, 0.0, 0.0)
 
 
@@ -180,7 +181,8 @@ def classify_pose(
     pose: dict[str, Any],
     *,
     max_reprojection_error_px: float,
-    min_markers: int = 2,
+    min_markers: int = 1,
+    min_ippe_error_ratio: float = DEFAULT_MIN_IPPE_ERROR_RATIO,
 ) -> tuple[bool, str | None]:
     """Decide whether a solved profile pose may feed the orbit-radius fit."""
     if not pose.get("ok"):
@@ -192,6 +194,12 @@ def classify_pose(
         return False, f"fewer than {min_markers} mapped markers in view"
     if error > max_reprojection_error_px:
         return False, f"reprojection error exceeds {max_reprojection_error_px:.2f}px"
+    ratio = pose.get("ippe_error_ratio")
+    if ratio is not None and np.isfinite(ratio) and ratio < min_ippe_error_ratio:
+        return False, (
+            f"ambiguous single-marker pose: the rejected IPPE solution fits "
+            f"{ratio:.2f}x as well, below {min_ippe_error_ratio:.2f}x"
+        )
     return True, None
 
 
@@ -714,9 +722,20 @@ def solve_profile_pose(
     if not candidates:
         return empty_result
 
-    error, world_to_camera, rvec, tvec, method = min(
-        candidates, key=lambda item: item[0]
-    )
+    candidates.sort(key=lambda item: item[0])
+    error, world_to_camera, rvec, tvec, method = candidates[0]
+    # A square marker admits two IPPE poses that mirror each other about the
+    # image plane. When both survive cheirality and the outward-normal test and
+    # fit nearly as well, choosing the lower reprojection error is a coin flip
+    # between poses that differ mostly out of plane, which is the one direction
+    # the orbit fit depends on. Report how much better the winner actually was
+    # so an ambiguous pose can be rejected rather than silently believed.
+    ippe_error_ratio = None
+    if len(candidates) > 1:
+        runner_up = candidates[1][0]
+        ippe_error_ratio = (
+            float("inf") if error <= 0.0 else float(runner_up / error)
+        )
     return {
         "ok": True,
         "method": method,
@@ -725,4 +744,5 @@ def solve_profile_pose(
         "rvec": rvec,
         "tvec": tvec,
         "reprojection_error_px": error,
+        "ippe_error_ratio": ippe_error_ratio,
     }

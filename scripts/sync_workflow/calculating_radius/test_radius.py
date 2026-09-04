@@ -36,6 +36,7 @@ from calculating_radius.radius_calibration import (
     convert_world_to_color_to_world_to_depth,
     DEFAULT_MAX_FIT_RESIDUAL_M,
     DEFAULT_MAX_FIT_RMSE_M,
+    DEFAULT_MIN_IPPE_ERROR_RATIO,
     evaluate_trajectory,
     orbit_geometry_in_camera_frame,
     orbbec_extrinsic_to_matrix,
@@ -194,7 +195,8 @@ def estimate_frame_pose(
     dist_coeffs,
     depth_to_color,
     max_reprojection_error_px,
-    min_markers=2,
+    min_markers=1,
+    min_ippe_error_ratio=DEFAULT_MIN_IPPE_ERROR_RATIO,
 ):
     gray = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
@@ -206,6 +208,7 @@ def estimate_frame_pose(
         pose,
         max_reprojection_error_px=max_reprojection_error_px,
         min_markers=min_markers,
+        min_ippe_error_ratio=min_ippe_error_ratio,
     )
     pose["accepted"] = accepted
     pose["rejection_reason"] = rejection_reason
@@ -307,6 +310,7 @@ def capture_and_save(camera, angle, args, calibration):
             calibration["depth_to_color"],
             args.max_reprojection_error_px,
             min_markers=args.min_markers_per_pose,
+            min_ippe_error_ratio=args.min_ippe_error_ratio,
         )
         overlay = _draw_detection_overlay(
             pose_color,
@@ -412,6 +416,8 @@ def validate_args(args) -> None:
         raise ValueError("Depth range must satisfy 0 <= min < max.")
     if args.max_reprojection_error_px <= 0.0:
         raise ValueError("--max-reprojection-error-px must be positive.")
+    if args.min_ippe_error_ratio < 1.0:
+        raise ValueError("--min-ippe-error-ratio must be at least 1.0.")
     if args.max_fit_rmse_mm <= 0.0:
         raise ValueError("--max-fit-rmse-mm must be positive.")
     if args.max_fit_residual_mm <= 0.0:
@@ -532,6 +538,7 @@ def main():
         "acceptance": {
             "max_reprojection_error_px": args.max_reprojection_error_px,
             "min_markers_per_pose": args.min_markers_per_pose,
+            "min_ippe_error_ratio": args.min_ippe_error_ratio,
             "per_angle_median": bool(args.per_angle_median),
             "min_valid_poses_per_angle": args.min_valid_poses_per_angle,
             "min_unique_angles": args.min_unique_angles,
