@@ -853,3 +853,40 @@ class HighDriftFrameExclusionTests(unittest.TestCase):
         ]
 
         self.assertEqual(reconstruct_pipeline.high_drift_frame_ids(edges), set())
+
+
+class CalibrationStationValidationTests(unittest.TestCase):
+    @staticmethod
+    def _captures(x_position_mm: float):
+        return [
+            reconstruct_pipeline.CaptureRecord(
+                path=Path(f"frame_s00_x{x_position_mm}_y+000.0.ply"),
+                angle_deg=0.0,
+                station_index=0,
+                x_position_mm=x_position_mm,
+                x_offset_m=0.0,
+            )
+        ]
+
+    def test_a_matching_station_is_accepted(self):
+        reconstruct_pipeline.validate_calibration_station(
+            {"motor": {"x_position_mm": 50.0}},
+            self._captures(50.0),
+            Path("radius_calibration.json"),
+        )
+
+    def test_a_mismatched_station_is_rejected(self):
+        with self.assertRaises(ValueError) as raised:
+            reconstruct_pipeline.validate_calibration_station(
+                {"motor": {"x_position_mm": 100.0}},
+                self._captures(50.0),
+                Path("radius_calibration.json"),
+            )
+        self.assertIn("X=100.0", str(raised.exception))
+        self.assertIn("X=50.0", str(raised.exception))
+
+    def test_a_calibration_without_a_station_only_warns(self):
+        with self.assertLogs(reconstruct_pipeline.logger, level="WARNING"):
+            reconstruct_pipeline.validate_calibration_station(
+                {}, self._captures(50.0), Path("radius_calibration.json"),
+            )

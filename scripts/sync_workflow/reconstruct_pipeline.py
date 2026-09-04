@@ -367,6 +367,42 @@ def resolve_crop_radii(
     return final_crop_m, registration_crop_m
 
 
+def validate_calibration_station(
+    calibration: dict,
+    captures: list,
+    source: Path,
+) -> None:
+    """Reject an orbit calibration measured at a different X station.
+
+    The measured pivot is a point in the reference camera frame at the
+    calibration station. Sliding it along the orbit axis leaves the pose
+    priors alone, but it is also the crop centre, so a station mismatch
+    silently displaces every crop cube by the station offset.
+    """
+    motor = calibration.get("motor")
+    if not isinstance(motor, dict) or motor.get("x_position_mm") is None:
+        logger.warning(
+            "%s records no motor X station; cannot verify it matches the scan.",
+            source,
+        )
+        return
+    calibration_x_mm = float(motor["x_position_mm"])
+    mismatched = sorted(
+        {
+            float(capture.x_position_mm)
+            for capture in captures
+            if not np.isclose(capture.x_position_mm, calibration_x_mm, atol=0.05)
+        }
+    )
+    if mismatched:
+        raise ValueError(
+            f"{source} was captured at X={calibration_x_mm:.1f} mm, but the scan "
+            f"contains X={mismatched[0]:.1f} mm. Its pivot is the crop centre, so "
+            "reusing it across stations displaces every crop. Re-run the radius "
+            "calibration at the scan's X station, or pass an explicit --pivot."
+        )
+
+
 def resolve_crop_axial_half_length(
     cli_axial_half_length_m: Optional[float],
     reconstruction_metadata: dict,
@@ -1066,6 +1102,8 @@ def main(argv=None):
                 "radius calibration with a valid full-orbit result."
             )
         orbit_axis = np.asarray(measured_geometry["axis"], dtype=float)
+        if not args.pivot:
+            validate_calibration_station(calibration, captures, args.orbit_geometry)
 
     if args.pivot:
         pivot = np.array(args.pivot, dtype=float)
