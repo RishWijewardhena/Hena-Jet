@@ -863,3 +863,67 @@ class PreferMultiMarkerTests(unittest.TestCase):
             [self._angle(1, 2, 2)], prefer_multi_marker=False,
         )
         self.assertEqual(len(samples), 3)
+
+
+class ClusterBootstrapTests(unittest.TestCase):
+    """Frames from one angle are correlated and must resample as a unit."""
+
+    @staticmethod
+    def _burst_orbit(radius_m=0.1427, angles=24, frames=10, angle_bias_m=0.004, seed=1):
+        """An orbit whose error is per-angle, not per-frame, as the rig's is."""
+        rng = np.random.default_rng(seed)
+        points, labels = [], []
+        for angle in np.linspace(0.0, 360.0, angles, endpoint=False):
+            theta = np.radians(angle)
+            # One systematic offset for the whole burst, tiny scatter within it.
+            biased = radius_m + rng.normal(scale=angle_bias_m)
+            for _ in range(frames):
+                r = biased + rng.normal(scale=1e-5)
+                points.append([0.0, r * np.cos(theta), r * np.sin(theta)])
+                labels.append(round(float(angle), 6))
+        return np.asarray(points), labels
+
+    def test_per_frame_resampling_understates_the_spread(self):
+        points, labels = self._burst_orbit()
+        naive = radius_calibration.bootstrap_radius_ci(points, n_resamples=200)
+        clustered = radius_calibration.bootstrap_radius_ci(
+            points, n_resamples=200, cluster_labels=labels,
+        )
+        self.assertLess(naive["radius_std_m"], clustered["radius_std_m"])
+        self.assertGreater(
+            clustered["radius_std_m"] / naive["radius_std_m"], 1.5,
+        )
+
+    def test_labels_must_match_the_points(self):
+        points, labels = self._burst_orbit(angles=4, frames=2)
+        with self.assertRaises(ValueError):
+            radius_calibration.bootstrap_radius_ci(
+                points, cluster_labels=labels[:-1],
+            )
+
+    def test_too_few_clusters_is_an_error(self):
+        points, _ = self._burst_orbit(angles=2, frames=10)
+        with self.assertRaises(ValueError):
+            radius_calibration.bootstrap_radius_ci(
+                points, cluster_labels=[0] * 10 + [1] * 10,
+            )
+
+    def test_evaluate_trajectory_clusters_by_angle(self):
+        """Bursts at one angle must not buy the fit false precision."""
+        points, labels = self._burst_orbit(angles=12, frames=10)
+        samples = [
+            {
+                "angle_deg": label,
+                "rgb_camera_center_m": list(point),
+                "depth_camera_center_m": list(point),
+            }
+            for point, label in zip(points, labels)
+        ]
+        result = radius_calibration.evaluate_trajectory(
+            samples, bootstrap_resamples=200,
+        )
+        self.assertEqual(result["quality_status"], "invalid")
+        self.assertTrue(
+            any("radius uncertainty" in r for r in result["quality_reasons"]),
+            result["quality_reasons"],
+        )
