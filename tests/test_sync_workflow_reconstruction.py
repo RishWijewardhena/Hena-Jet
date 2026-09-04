@@ -711,3 +711,145 @@ class ReconstructionEndToEndTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CylinderCropRegionTests(unittest.TestCase):
+    def test_crop_bounds_around_defaults_to_a_cube(self):
+        bounds = reconstruct_pipeline.crop_bounds_around(
+            np.array([0.0, 0.0, 0.1]), 0.15,
+        )
+        np.testing.assert_allclose(
+            bounds, (-0.15, -0.15, -0.05, 0.15, 0.15, 0.25), atol=1e-12,
+        )
+
+    def test_crop_bounds_around_builds_a_cylinder_when_given_an_axis(self):
+        crop = reconstruct_pipeline.crop_bounds_around(
+            np.array([0.0, 0.0, 0.1]),
+            0.08,
+            axis=np.array([1.0, 0.0, 0.0]),
+            axial_half_length_m=0.15,
+        )
+        self.assertEqual(crop.radius_m, 0.08)
+        self.assertEqual(crop.axial_half_length_m, 0.15)
+        self.assertEqual(crop.center, (0.0, 0.0, 0.1))
+
+    def test_a_cylinder_drops_the_enclosure_ring_a_cube_keeps(self):
+        pivot = np.array([0.0, 0.0, 0.1])
+        axis = np.array([1.0, 0.0, 0.0])
+        # A forearm point 130 mm along the axis, and a ring point at the
+        # orbit radius that a cube large enough to keep it would also keep.
+        points = np.array([
+            [0.130, 0.000, 0.100],
+            [0.000, 0.070, 0.170],
+        ])
+        cube = reconstruct_pipeline.crop_bounds_around(pivot, 0.15)
+        cylinder = reconstruct_pipeline.crop_bounds_around(
+            pivot, 0.08, axis=axis, axial_half_length_m=0.15,
+        )
+        self.assertEqual(
+            reconstruct_pipeline.points_inside_crop(points, cube).tolist(),
+            [True, True],
+        )
+        self.assertEqual(
+            reconstruct_pipeline.points_inside_crop(points, cylinder).tolist(),
+            [True, False],
+        )
+
+    def test_axial_half_length_resolution_order(self):
+        self.assertEqual(
+            reconstruct_pipeline.resolve_crop_axial_half_length(0.2, {}), 0.2,
+        )
+        self.assertEqual(
+            reconstruct_pipeline.resolve_crop_axial_half_length(
+                None, {"crop_axial_half_length_m": 0.18},
+            ),
+            0.18,
+        )
+        self.assertEqual(
+            reconstruct_pipeline.resolve_crop_axial_half_length(None, {}), 0.15,
+        )
+        with self.assertRaises(ValueError):
+            reconstruct_pipeline.resolve_crop_axial_half_length(-0.1, {})
+
+    def test_crop_shape_defaults_to_cube_and_accepts_cylinder(self):
+        args = reconstruct_pipeline.parse_args(["--input-dir", "scan"])
+        self.assertEqual(args.crop_shape, "cube")
+        args = reconstruct_pipeline.parse_args(
+            ["--input-dir", "scan", "--crop-shape", "cylinder",
+             "--crop-axial-half-length-m", "0.16"],
+        )
+        self.assertEqual(args.crop_shape, "cylinder")
+        self.assertEqual(args.crop_axial_half_length_m, 0.16)
+
+
+class HighDriftFrameExclusionTests(unittest.TestCase):
+    @staticmethod
+    def edge(
+        *,
+        target_id=1,
+        kind="sequential",
+        correction_m=0.0,
+        correction_deg=0.0,
+        accepted=False,
+    ):
+        return reconstruct_pipeline.RegistrationEdge(
+            source_id=target_id - 1,
+            target_id=target_id,
+            kind=kind,
+            transform=np.eye(4),
+            information=np.eye(6),
+            accepted=accepted,
+            reason="test edge",
+            fitness=0.5,
+            rmse_m=0.001,
+            correction_m=correction_m,
+            correction_deg=correction_deg,
+        )
+
+    def test_filter_is_opt_in(self):
+        args = reconstruct_pipeline.parse_args(["--input-dir", "scan"])
+        self.assertFalse(args.exclude_high_drift_frames)
+
+        args = reconstruct_pipeline.parse_args(
+            ["--input-dir", "scan", "--exclude-high-drift-frames"]
+        )
+        self.assertTrue(args.exclude_high_drift_frames)
+
+    def test_excludes_sequential_target_above_translation_limit(self):
+        edge = self.edge(
+            target_id=2,
+            correction_m=reconstruct_pipeline.ICP_MAX_CORRECTION_M + 0.001,
+        )
+
+        self.assertEqual(
+            reconstruct_pipeline.high_drift_frame_ids([edge]),
+            {2},
+        )
+
+    def test_excludes_sequential_target_above_rotation_limit(self):
+        edge = self.edge(
+            target_id=3,
+            correction_deg=reconstruct_pipeline.ICP_MAX_CORRECTION_DEG + 0.1,
+        )
+
+        self.assertEqual(
+            reconstruct_pipeline.high_drift_frame_ids([edge]),
+            {3},
+        )
+
+    def test_does_not_exclude_for_non_sequential_or_ordinary_rejection(self):
+        edges = [
+            self.edge(target_id=1, correction_m=0.001),
+            self.edge(
+                target_id=2,
+                kind="loop",
+                correction_m=reconstruct_pipeline.ICP_MAX_CORRECTION_M + 0.001,
+            ),
+            self.edge(
+                target_id=3,
+                kind="station",
+                correction_deg=reconstruct_pipeline.ICP_MAX_CORRECTION_DEG + 0.1,
+            ),
+        ]
+
+        self.assertEqual(reconstruct_pipeline.high_drift_frame_ids(edges), set())

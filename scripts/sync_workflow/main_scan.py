@@ -47,6 +47,14 @@ def parse_args(argv=None):
                         help="Orbit axis in camera coordinates (default: 1 0 0)")
     parser.add_argument("--registration-mode", choices=("motor", "guarded-icp"),
                         default="motor", help="Reconstruction pose source (default: motor)")
+    parser.add_argument(
+        "--exclude-high-drift-frames",
+        action="store_true",
+        help=(
+            "When auto-reconstructing with guarded ICP, omit sequential frames "
+            "whose ICP correction exceeds the pose guards"
+        ),
+    )
     parser.add_argument("--frames-per-angle", type=int, default=15,
                         help="Fresh RGB-D frames to median-combine at each angle")
     parser.add_argument("--min-valid-samples", type=int, default=3,
@@ -67,6 +75,22 @@ def parse_args(argv=None):
             "Tighter crop-cube half-extent used only by guarded ICP "
             "(default: min(final crop, 0.10 m))"
         ),
+    )
+    parser.add_argument(
+        "--crop-shape",
+        choices=("cube", "cylinder"),
+        default="cube",
+        help=(
+            "Reconstruction crop geometry: 'cylinder' reads the crop radii as "
+            "radial limits around the orbit axis, which drops the enclosure "
+            "ring without clipping the object along the axis (default: cube)"
+        ),
+    )
+    parser.add_argument(
+        "--crop-axial-half-length-m",
+        type=float,
+        default=0.15,
+        help="Half-length along the orbit axis for --crop-shape cylinder",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/scan"), help="Output directory for PLY files")
     parser.add_argument("--dry-run", action="store_true", help="Print sequence without moving or capturing")
@@ -225,6 +249,7 @@ def build_scan_metadata(args, *, active_disparity, captured_angles, captures=Non
         "orbit_axis": [float(value) for value in args.orbit_axis],
         "step_deg": float(args.step_deg),
         "registration_mode": args.registration_mode,
+        "exclude_high_drift_frames": bool(args.exclude_high_drift_frames),
         "capture": {
             "width": int(args.width),
             "height": int(args.height),
@@ -238,6 +263,8 @@ def build_scan_metadata(args, *, active_disparity, captured_angles, captures=Non
         "reconstruction": {
             "crop_radius_m": float(args.crop_radius_m),
             "registration_crop_radius_m": float(args.registration_crop_radius_m),
+            "crop_shape": args.crop_shape,
+            "crop_axial_half_length_m": float(args.crop_axial_half_length_m),
         },
         "x_stage": {
             "positions_mm": [float(value) for value in args.x_positions_mm],
@@ -295,6 +322,11 @@ def main():
         or args.registration_crop_radius_m <= 0.0
     ):
         raise ValueError("--registration-crop-radius-m must be finite and positive.")
+    if (
+        not np.isfinite(args.crop_axial_half_length_m)
+        or args.crop_axial_half_length_m <= 0.0
+    ):
+        raise ValueError("--crop-axial-half-length-m must be finite and positive.")
     if not args.x_positions_mm or not all(np.isfinite(args.x_positions_mm)):
         raise ValueError("--x-positions-mm must contain finite positions.")
     if len(set(args.x_positions_mm)) != len(args.x_positions_mm):
@@ -467,7 +499,11 @@ def main():
             "--orbit-axis", *(str(value) for value in args.orbit_axis),
             "--crop-radius-m", str(args.crop_radius_m),
             "--registration-crop-radius-m", str(args.registration_crop_radius_m),
+            "--crop-shape", args.crop_shape,
+            "--crop-axial-half-length-m", str(args.crop_axial_half_length_m),
         ]
+        if args.exclude_high_drift_frames:
+            cmd.append("--exclude-high-drift-frames")
 
         logger.info("$ %s", " ".join(cmd))
         subprocess.run(cmd, check=True)

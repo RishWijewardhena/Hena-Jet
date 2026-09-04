@@ -197,3 +197,80 @@ class MergeAndFinalizeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CylinderCropTests(unittest.TestCase):
+    def test_keeps_points_inside_the_radius_and_axial_bounds(self):
+        crop = pointcloud_processing.CylinderCrop(
+            center=(0.0, 0.0, 0.1),
+            axis=(1.0, 0.0, 0.0),
+            radius_m=0.08,
+            axial_half_length_m=0.15,
+        )
+        points = np.array([
+            [0.000, 0.00, 0.100],   # on the axis
+            [0.140, 0.00, 0.100],   # far along the axis, inside the axial bound
+            [0.000, 0.05, 0.100],   # radial 0.05, inside
+            [0.000, 0.10, 0.100],   # radial 0.10, outside
+            [0.160, 0.00, 0.100],   # beyond the axial bound
+            [0.000, 0.07, 0.170],   # radial 0.099 on the ring, outside
+        ])
+        self.assertEqual(
+            crop.mask(points).tolist(),
+            [True, True, True, False, False, False],
+        )
+
+    def test_normalizes_an_unnormalized_axis(self):
+        crop = pointcloud_processing.CylinderCrop(
+            center=(0.0, 0.0, 0.0),
+            axis=(3.0, 0.0, 0.0),
+            radius_m=0.05,
+            axial_half_length_m=0.10,
+        )
+        points = np.array([[0.09, 0.0, 0.0], [0.11, 0.0, 0.0]])
+        self.assertEqual(crop.mask(points).tolist(), [True, False])
+
+    def test_rejects_degenerate_geometry(self):
+        for kwargs in (
+            {"axis": (0.0, 0.0, 0.0), "radius_m": 0.05, "axial_half_length_m": 0.1},
+            {"axis": (1.0, 0.0, 0.0), "radius_m": 0.0, "axial_half_length_m": 0.1},
+            {"axis": (1.0, 0.0, 0.0), "radius_m": 0.05, "axial_half_length_m": -0.1},
+        ):
+            with self.assertRaises(ValueError):
+                pointcloud_processing.CylinderCrop(center=(0.0, 0.0, 0.0), **kwargs)
+
+    def test_transform_and_clean_applies_a_cylinder_crop(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            source = root / "frame.ply"
+            # Two points near the axis and two on the enclosure ring; a cube
+            # crop wide enough for the axial spread would keep the ring points.
+            points = np.array([
+                [0.000, 0.00, 0.00],
+                [0.130, 0.00, 0.00],
+                [0.000, 0.10, 0.00],
+                [0.130, 0.00, 0.10],
+            ])
+            write_cloud(source, points, np.tile([0.5, 0.5, 0.5], (len(points), 1)))
+
+            outputs, stats = pointcloud_processing.transform_and_clean_clouds(
+                [source],
+                [np.eye(4)],
+                root / "transformed",
+                root / "matrices",
+                crop_bounds=pointcloud_processing.CylinderCrop(
+                    center=(0.0, 0.0, 0.0),
+                    axis=(1.0, 0.0, 0.0),
+                    radius_m=0.08,
+                    axial_half_length_m=0.15,
+                ),
+                skip_sor=True,
+                sor_neighbors=10,
+                sor_sigma=2.0,
+            )
+
+            kept = np.asarray(o3d.io.read_point_cloud(str(outputs[0])).points)
+            self.assertEqual(stats[0]["cropped_points"], 2)
+            np.testing.assert_allclose(
+                np.sort(kept[:, 0]), [0.0, 0.13], atol=1e-6,
+            )

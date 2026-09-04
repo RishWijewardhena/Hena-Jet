@@ -28,6 +28,7 @@ import numpy as np
 
 from calculating_radius.orbit_pose_map import camera_poses_in_reference
 from pointcloud_processing import (
+    CylinderCrop,
     merge_and_finalize_clouds,
     transform_and_clean_clouds,
 )
@@ -60,6 +61,7 @@ PRE_ICP_SOR_SIGMA = 1.5
 
 DEFAULT_FINAL_CROP_RADIUS_M = 0.15
 DEFAULT_REGISTRATION_CROP_RADIUS_M = 0.10
+DEFAULT_CROP_AXIAL_HALF_LENGTH_M = 0.15
 
 # Full-resolution per-scan cleanup after pose estimation
 PER_SCAN_SOR_NEIGHBORS = 10
@@ -365,6 +367,24 @@ def resolve_crop_radii(
     return final_crop_m, registration_crop_m
 
 
+def resolve_crop_axial_half_length(
+    cli_axial_half_length_m: Optional[float],
+    reconstruction_metadata: dict,
+) -> float:
+    """Resolve the along-axis half-length used by the cylindrical crop."""
+    value = cli_axial_half_length_m
+    if value is None:
+        value = reconstruction_metadata.get("crop_axial_half_length_m")
+    if value is None:
+        value = DEFAULT_CROP_AXIAL_HALF_LENGTH_M
+    value = float(value)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            "Crop axial half-length must be a finite positive number of metres."
+        )
+    return value
+
+
 def calculate_auto_radius(o3d, ply_files: list[Path]) -> float:
     """Read frame_0.0.ply (or first frame), find the hand, and return its Z depth."""
     target = next(
@@ -454,14 +474,44 @@ def build_measured_pose_priors(
     )
 
 
-def crop_bounds_around(center: np.ndarray, half_extent_m: float):
-    """Return an axis-aligned crop cube around a station's orbit pivot."""
+def crop_bounds_around(
+    center: np.ndarray,
+    half_extent_m: float,
+    *,
+    axis: Optional[np.ndarray] = None,
+    axial_half_length_m: Optional[float] = None,
+):
+    """Return a crop region around a station's orbit pivot.
+
+    Without ``axis`` this is the historical axis-aligned cube, where
+    ``half_extent_m`` bounds all three axes. With ``axis`` it is a cylinder
+    around the orbit axis, where ``half_extent_m`` is the radial limit and
+    ``axial_half_length_m`` the extent along the axis.
+    """
     if half_extent_m <= 0.0:
         return None
     center = np.asarray(center, dtype=float)
+    if axis is not None:
+        return CylinderCrop(
+            center=tuple(center.tolist()),
+            axis=tuple(np.asarray(axis, dtype=float).tolist()),
+            radius_m=float(half_extent_m),
+            axial_half_length_m=float(
+                axial_half_length_m
+                if axial_half_length_m is not None
+                else DEFAULT_CROP_AXIAL_HALF_LENGTH_M
+            ),
+        )
     lower = center - half_extent_m
     upper = center + half_extent_m
     return (*lower.tolist(), *upper.tolist())
+
+
+def points_inside_crop(points: np.ndarray, crop) -> np.ndarray:
+    """Return a boolean mask for either crop-region representation."""
+    if isinstance(crop, CylinderCrop):
+        return crop.mask(points)
+    return points_inside_bounds(points, crop)
 
 
 # ===================================================================
@@ -481,7 +531,7 @@ def prepare_registration_cloud(o3d, cloud, initial_pose, voxel_size=None, crop_b
 
     if crop_bounds is not None:
         points_in_reference = transformed_points(points, initial_pose)
-        within_crop = points_inside_bounds(points_in_reference, crop_bounds)
+        within_crop = points_inside_crop(points_in_reference, crop_bounds)
         keep = finite & within_crop
 
     selected_indices = np.flatnonzero(keep)
@@ -532,6 +582,24 @@ def registration_result_is_acceptable(
         if not fitness_not_worse or not (fitness_improved or rmse_improved):
             return False, "ICP did not improve the pose prior", correction_m, correction_deg
     return True, "accepted", correction_m, correction_deg
+
+
+def high_drift_frame_ids(edges: list[RegistrationEdge]) -> set[int]:
+    """Return incoming sequential frames whose ICP candidate exceeded a pose guard.
+
+    Only sequential edges identify one newly arriving capture. Loop-closure and
+    cross-station edges constrain two already accepted trajectories, so a large
+    correction on either of those edges must not arbitrarily discard a frame.
+    """
+    return {
+        edge.target_id
+        for edge in edges
+        if edge.kind == "sequential"
+        and (
+            edge.correction_m > ICP_MAX_CORRECTION_M
+            or edge.correction_deg > ICP_MAX_CORRECTION_DEG
+        )
+    }
 
 
 def information_matrix(o3d, source, target, transform):
@@ -885,6 +953,35 @@ def parse_args(argv=None):
             "scan metadata or min(final crop, 0.10m); set <= 0 to disable"
         ),
     )
+    parser.add_argument(
+        "--crop-shape",
+        choices=("cube", "cylinder"),
+        default="cube",
+        help=(
+            "Crop geometry around the pivot. 'cylinder' treats the crop radii "
+            "as radial limits around the orbit axis and bounds the axis "
+            "separately, which removes the enclosure ring without clipping the "
+            "object along the axis (default: cube)"
+        ),
+    )
+    parser.add_argument(
+        "--crop-axial-half-length-m",
+        type=float,
+        default=None,
+        help=(
+            "Half-length along the orbit axis for --crop-shape cylinder "
+            f"(default: {DEFAULT_CROP_AXIAL_HALF_LENGTH_M} m)"
+        ),
+    )
+    parser.add_argument(
+        "--exclude-high-drift-frames",
+        action="store_true",
+        help=(
+            "Do not include an incoming frame in the final merge when its "
+            "sequential ICP candidate exceeds the translation or rotation "
+            "correction guard (guarded ICP modes only)"
+        ),
+    )
 
     parser.add_argument("--skip-per-scan-sor", action="store_true",
                         help="Skip per-scan SOR (much faster; final SOR still runs)")
@@ -895,6 +992,15 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     args = parse_args(argv)
+
+    guarded_icp_mode = args.registration_mode in (
+        "guarded-icp", "aruco-guarded-icp",
+    )
+    if args.exclude_high_drift_frames and not guarded_icp_mode:
+        raise ValueError(
+            "--exclude-high-drift-frames requires --registration-mode "
+            "guarded-icp or aruco-guarded-icp"
+        )
 
     input_dir = args.input_dir
     output_dir = args.output_dir or (input_dir / "reconstruction")
@@ -979,6 +1085,10 @@ def main(argv=None):
         args.registration_crop_radius_m,
         reconstruction_metadata,
     )
+    crop_axial_half_length_m = resolve_crop_axial_half_length(
+        args.crop_axial_half_length_m,
+        reconstruction_metadata,
+    )
 
     merged_cloud_path = output_dir / "merged_cloud.ply"
 
@@ -1028,25 +1138,39 @@ def main(argv=None):
         )
         for frame in frames
     ]
+    crop_axis = orbit_axis if args.crop_shape == "cylinder" else None
     registration_crop_bounds = [
-        crop_bounds_around(center, registration_crop_radius_m)
+        crop_bounds_around(
+            center,
+            registration_crop_radius_m,
+            axis=crop_axis,
+            axial_half_length_m=crop_axial_half_length_m,
+        )
         for center in frame_crop_centers
     ]
     final_crop_bounds = [
         crop_bounds_around(
             center,
             crop_radius_m,
+            axis=crop_axis,
+            axial_half_length_m=crop_axial_half_length_m,
         )
         for center in frame_crop_centers
     ]
     logger.info(
-        "Crop half-extents: registration=%s, final=%s",
+        "Crop shape: %s, half-extents: registration=%s, final=%s%s",
+        args.crop_shape,
         (
             "disabled"
             if registration_crop_radius_m <= 0.0
             else f"{registration_crop_radius_m:.3f} m"
         ),
         "disabled" if crop_radius_m <= 0.0 else f"{crop_radius_m:.3f} m",
+        (
+            f", axial half-length={crop_axial_half_length_m:.3f} m"
+            if crop_axis is not None
+            else ""
+        ),
     )
 
     if args.registration_mode in ("motor", "aruco"):
@@ -1082,6 +1206,41 @@ def main(argv=None):
         graph, edges = build_pose_graph(o3d, frames)
         optimized_poses = optimize_pose_graph(o3d, graph)
 
+    excluded_frame_ids = (
+        high_drift_frame_ids(edges) if args.exclude_high_drift_frames else set()
+    )
+    merge_frame_ids = [
+        frame_id for frame_id in range(len(frames))
+        if frame_id not in excluded_frame_ids
+    ]
+    excluded_frames = []
+    for edge in sorted(edges, key=lambda item: item.target_id):
+        if edge.kind != "sequential" or edge.target_id not in excluded_frame_ids:
+            continue
+        frame = frames[edge.target_id]
+        excluded_frames.append({
+            "frame_id": edge.target_id,
+            "filename": frame.path.name,
+            "angle_deg": frame.angle_deg,
+            "station_index": frame.station_index,
+            "x_position_mm": frame.x_position_mm,
+            "correction_m": edge.correction_m,
+            "correction_deg": edge.correction_deg,
+            "reason": edge.reason,
+        })
+        logger.warning(
+            "Excluded %s from merge: sequential ICP requested %.3f mm / %.2f deg",
+            frame.path.name,
+            edge.correction_m * 1000.0,
+            edge.correction_deg,
+        )
+    if args.exclude_high_drift_frames:
+        logger.info(
+            "High-drift frame filter retained %d/%d captures.",
+            len(merge_frame_ids),
+            len(frames),
+        )
+
     # Save pose matrices
     np.save(output_dir / "optimized_poses.npy", np.stack(optimized_poses))
     for frame, opt_pose in zip(frames, optimized_poses):
@@ -1115,6 +1274,10 @@ def main(argv=None):
         "angle_sign": args.angle_sign,
         "crop_radius_m": crop_radius_m,
         "registration_crop_radius_m": registration_crop_radius_m,
+        "crop_shape": args.crop_shape,
+        "crop_axial_half_length_m": (
+            crop_axial_half_length_m if args.crop_shape == "cylinder" else None
+        ),
         "x_stations": [
             {
                 "station_index": station_index,
@@ -1130,6 +1293,13 @@ def main(argv=None):
             for station_index in sorted({frame.station_index for frame in frames})
         ],
         "per_scan_sor_enabled": not args.skip_per_scan_sor,
+        "high_drift_frame_exclusion": {
+            "enabled": args.exclude_high_drift_frames,
+            "translation_limit_m": ICP_MAX_CORRECTION_M,
+            "rotation_limit_deg": ICP_MAX_CORRECTION_DEG,
+            "excluded_count": len(excluded_frames),
+            "excluded_frames": excluded_frames,
+        },
         "registration_parameters": {
             "voxel_m": REGISTRATION_VOXEL_M,
             "normal_radius_m": REGISTRATION_NORMAL_RADIUS_M,
@@ -1166,12 +1336,14 @@ def main(argv=None):
 
     logger.info("Stage 3/4: Open3D full-resolution transform and cleanup...")
     transformed_paths, transform_stats = transform_and_clean_clouds(
-        [frame.path for frame in frames],
-        optimized_poses,
+        [frames[frame_id].path for frame_id in merge_frame_ids],
+        [optimized_poses[frame_id] for frame_id in merge_frame_ids],
         output_dir / "01_transformed",
         matrix_dir,
         crop_bounds=None,
-        crop_bounds_by_cloud=final_crop_bounds,
+        crop_bounds_by_cloud=[
+            final_crop_bounds[frame_id] for frame_id in merge_frame_ids
+        ],
         skip_sor=args.skip_per_scan_sor,
         sor_neighbors=PER_SCAN_SOR_NEIGHBORS,
         sor_sigma=PER_SCAN_SOR_SIGMA,

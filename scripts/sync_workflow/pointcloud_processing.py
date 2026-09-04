@@ -6,13 +6,65 @@ import concurrent.futures
 import logging
 import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import numpy as np
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CylinderCrop:
+    """Cylindrical crop around the orbit axis, in reference-frame coordinates.
+
+    The scanner encloses the object in a ring at roughly the orbit radius, so a
+    cube centred on the pivot cannot separate object from enclosure: shrinking
+    it enough to drop the ring also clips the object along the axis. A cylinder
+    cuts radially and axially independently.
+    """
+
+    center: tuple[float, float, float]
+    axis: tuple[float, float, float]
+    radius_m: float
+    axial_half_length_m: float
+
+    def __post_init__(self) -> None:
+        center = np.asarray(self.center, dtype=float)
+        axis = np.asarray(self.axis, dtype=float)
+        if center.shape != (3,) or not np.isfinite(center).all():
+            raise ValueError("Cylinder crop center must be three finite values")
+        if axis.shape != (3,) or not np.isfinite(axis).all():
+            raise ValueError("Cylinder crop axis must be three finite values")
+        if not np.isfinite(np.linalg.norm(axis)) or np.linalg.norm(axis) <= 0.0:
+            raise ValueError("Cylinder crop axis must have non-zero length")
+        if not np.isfinite(self.radius_m) or self.radius_m <= 0.0:
+            raise ValueError("Cylinder crop radius must be finite and positive")
+        if (
+            not np.isfinite(self.axial_half_length_m)
+            or self.axial_half_length_m <= 0.0
+        ):
+            raise ValueError(
+                "Cylinder crop axial half-length must be finite and positive"
+            )
+
+    def mask(self, points: np.ndarray) -> np.ndarray:
+        """Return a boolean mask of the points inside the cylinder."""
+        points = np.asarray(points, dtype=float)
+        if points.size == 0:
+            return np.zeros(len(points), dtype=bool)
+        center = np.asarray(self.center, dtype=float)
+        axis = np.asarray(self.axis, dtype=float)
+        axis = axis / np.linalg.norm(axis)
+        offsets = points - center
+        along = offsets @ axis
+        radial = np.linalg.norm(offsets - np.outer(along, axis), axis=1)
+        return (radial <= self.radius_m) & (np.abs(along) <= self.axial_half_length_m)
+
+
+CropRegion = Union[tuple[float, float, float, float, float, float], CylinderCrop]
 
 
 def _geometry_libraries():
@@ -61,7 +113,7 @@ def _transform_one_cloud(
     transformed_dir: Path,
     matrix_dir: Path,
     *,
-    crop_bounds: Optional[tuple[float, float, float, float, float, float]],
+    crop_bounds: Optional[CropRegion],
     skip_sor: bool,
     sor_neighbors: int,
     sor_sigma: float,
@@ -76,7 +128,10 @@ def _transform_one_cloud(
     input_points = len(cloud.points)
     cloud.transform(pose)
 
-    if crop_bounds is not None:
+    if isinstance(crop_bounds, CylinderCrop):
+        kept = np.flatnonzero(crop_bounds.mask(np.asarray(cloud.points)))
+        cloud = cloud.select_by_index(kept.tolist())
+    elif crop_bounds is not None:
         bounds = np.asarray(crop_bounds, dtype=float)
         if bounds.shape != (6,) or not np.isfinite(bounds).all():
             raise ValueError("crop_bounds must contain six finite values")
@@ -126,10 +181,8 @@ def transform_and_clean_clouds(
     transformed_dir: Path,
     matrix_dir: Path,
     *,
-    crop_bounds: Optional[tuple[float, float, float, float, float, float]],
-    crop_bounds_by_cloud: Optional[
-        Sequence[Optional[tuple[float, float, float, float, float, float]]]
-    ] = None,
+    crop_bounds: Optional[CropRegion],
+    crop_bounds_by_cloud: Optional[Sequence[Optional[CropRegion]]] = None,
     skip_sor: bool,
     sor_neighbors: int,
     sor_sigma: float,
