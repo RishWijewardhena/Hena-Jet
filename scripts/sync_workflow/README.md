@@ -96,6 +96,19 @@ python scripts/sync_workflow/scan_quality_report.py \
   --output outputs/<scan-directory>/quality_report.json
 ```
 
+Pass `--compare-merged` a second merged cloud of the same rigid object to add a repeatability section. It reports the residual twice: `as_reconstructed` compares the clouds where the pipeline put them and therefore carries any drift in the reconstructed frame, while `after_rigid_alignment` re-registers the pair first and isolates how reproducible the measured shape is. A large gap between the two means the shape repeats but the frame does not, which points at the orbit calibration rather than the sensor.
+
+Every metric above is internal consistency: plane-RMS, cross-view residual, repeatability and ICP fitness all measure the pipeline against itself, and all stay happy around a systematically wrong orbit radius. Only a certified artifact detects that. `sphere_bar_report.py` fits both spheres of a two-sphere ball bar in a merged cloud and compares the centre-to-centre distance with the certified length:
+
+```bash
+python scripts/sync_workflow/sphere_bar_report.py \
+  --merged outputs/<scan-directory>/reconstruction/merged_cloud.ply \
+  --certified-distance-mm <certified> --sphere-diameter-mm <certified> \
+  --output outputs/<scan-directory>/sphere_bar_report.json
+```
+
+Sphere centres are recoverable far more accurately than the point noise, because thousands of points are fitted to one known radius, so the 1.5 mm single-frame noise still resolves a sub-millimetre length error. A proportional error in the measured length is a proportional error in the calibrated radius, reported as `implied_radius_correction_ratio`.
+
 `scan_quality_report.py` measures single-frame and merged-cloud surface plane-RMS and cross-view residual grouped by angular separation; it does not currently copy the capture-time fill rates into its JSON. Together, the logged fill rate and report measurements separate capture noise from multi-view pose error: plane-RMS describes local surface thickness, while cross-view residual shows how well different viewing angles coincide.
 
 The saved pre-change baseline is 1.513 mm single-frame plane-RMS, 4.915 mm merged plane-RMS, and 0.860 / 1.227 / 2.699 / 3.593 mm cross-view residual at 10 / 30 / 90 / 180 degrees. A post-change rig capture has not yet been recorded, so the accuracy changes must not be treated as physically validated until the same report is run on a fresh dataset and compared with that baseline.
@@ -386,6 +399,10 @@ For motor modes, orbit radius is resolved in this order:
 
 When `--orbit-geometry` points to a valid `radius_calibration.json`, its top-level `orbit_geometry` block supplies the measured axis and, unless `--pivot` is also passed, the measured pivot. An explicit `--pivot` takes precedence over the measured pivot. Prefer this measured geometry to a scalar radius: radius-only reconstruction has to assume `pivot = [0, 0, R]` and, unless separately overridden, `axis = [1, 0, 0]`.
 
+A calibration is only accepted when its own circle fit is good. Reprojection error reports how cleanly the marker corners were detected and says nothing about whether the fitted circle describes the machine, so `test_radius.py` gates the fit separately: `--max-fit-rmse-mm` (2 mm) and `--max-fit-residual-mm` (5 mm) apply to the inlier residuals, and `--min-markers-per-pose` defaults to 2 because single-marker planar pose is ambiguous out of plane in exactly the directions the orbit fit needs. `outputs/test_radius_x100/radius_calibration.json` predates these gates: it is stamped `valid` with a 6.370 mm inlier RMSE and a 19.188 mm maximum inlier residual, and it fails them.
+
+Reconstruction also refuses an `--orbit-geometry` calibration measured at a different X station than the scan, matching the check the ArUco pose-map path already performed. Pose priors survive a station mismatch, since rotation about a line is invariant to sliding the pivot along it, but the pivot is also the crop centre, so the crop is displaced by the whole station offset. An explicit `--pivot` overrides the check.
+
 `--auto-radius` is diagnostic, not physical calibration. It cannot reliably distinguish the object's visible surface from the mechanical rotation center. Explicit CLI axis and crop values similarly override recorded metadata and defaults. Legacy metadata without `registration_crop_radius_m` automatically uses the smaller of 0.10 m and the positive final crop, so existing datasets gain the safer ICP region without changing their final output extent.
 
 For ArUco modes, `--pose-map` supplies the complete pose matrices and a radius is not required. An explicit `--pivot` overrides the pose map's profile-origin crop center.
@@ -407,6 +424,8 @@ For ArUco modes, `--pose-map` supplies the complete pose matrices and a radius i
 | `--angle-sign` | Converts the recorded motor-angle direction to the reconstruction convention; use `1` or `-1`. |
 | `--crop-radius-m` | Final output crop-cube half-extent around the pivot; metadata or 0.15 m by default, and `<= 0` disables it. |
 | `--registration-crop-radius-m` | Crop-cube half-extent used only to construct ICP clouds; metadata or `min(final crop, 0.10 m)` by default, and `<= 0` disables it. |
+| `--crop-shape` | `cube` (default) or `cylinder`; the cylinder reads both crop radii as radial limits around the orbit axis. |
+| `--crop-axial-half-length-m` | Half-length along the orbit axis when `--crop-shape cylinder`; metadata or 0.15 m by default. |
 | `--skip-per-scan-sor` | Skip the per-frame outlier filter; final merged-cloud SOR still runs. |
 
 ### Stage 1: build pose priors
@@ -458,6 +477,10 @@ The pose graph produces `optimized_poses.npy` and per-frame `*_optimized.txt` ma
 ### Stage 3: transform full-resolution scans
 
 Registration uses reduced copies, but Open3D applies final matrices to the original PLYs. Four bounded workers transform, crop, optionally filter, and write the scans to `01_transformed/` in stable frame order.
+
+`--crop-shape` selects the crop geometry. With the default `cube`, both crop arguments are half-extents of axis-aligned cubes, not spherical radii. With `cylinder`, they become radial limits around the orbit axis and `--crop-axial-half-length-m` bounds the axis separately.
+
+Prefer the cylinder on this rig. The enclosure ring sits 90-115 mm from the orbit axis, the object stays inside 55 mm, and the object also runs +/-120 mm along the axis. Measured on `outputs/new_scan`, an 80 mm cylinder keeps 100% of the object and 0% of the ring, whereas every cube small enough to drop the ring (90 mm half-extent or less) clips 21-39% of the object, because shrinking a cube shortens it along the axis at the same time.
 
 Despite their historical `radius` names, both crop arguments are half-extents of axis-aligned cubes, not spherical radii. Each station receives station-adjusted crop cubes around its expected pivot. `--registration-crop-radius-m` affects only the reduced copies used to estimate ICP poses. `--crop-radius-m` affects the full-resolution clouds written to `01_transformed/` and therefore the final merge. Changing the registration crop does not remove additional points from `merged_cloud.ply`. A value at or below zero disables the corresponding crop when running reconstruction directly.
 
