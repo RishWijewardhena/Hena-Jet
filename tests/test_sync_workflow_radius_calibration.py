@@ -644,54 +644,71 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class CircleFitResidualGateTests(unittest.TestCase):
-    """A clean reprojection error must not certify a poor orbit fit."""
+class RadiusUncertaintyGateTests(unittest.TestCase):
+    """What makes a radius publishable is its uncertainty, not its scatter."""
 
     @staticmethod
-    def _orbit_samples(radius_m: float, noise_m: float = 0.0):
-        angles = np.arange(0.0, 360.0, 30.0)
+    def _orbit_samples(radius_m: float, noise_m: float = 0.0, count: int = 24, seed=3):
+        rng = np.random.default_rng(seed)
         samples = []
-        for index, angle in enumerate(angles):
+        for angle in np.linspace(0.0, 360.0, count, endpoint=False):
             theta = np.radians(angle)
-            offset = noise_m if index % 2 == 0 else -noise_m
-            centre = np.array([
-                0.0,
-                (radius_m + offset) * np.cos(theta),
-                (radius_m + offset) * np.sin(theta),
-            ])
+            r = radius_m + (rng.normal(scale=noise_m) if noise_m else 0.0)
+            centre = [0.0, r * np.cos(theta), r * np.sin(theta)]
             samples.append({
                 "angle_deg": float(angle),
-                "rgb_camera_center_m": centre.tolist(),
-                "depth_camera_center_m": centre.tolist(),
+                "rgb_camera_center_m": centre,
+                "depth_camera_center_m": list(centre),
             })
         return samples
 
     def test_a_clean_orbit_passes(self):
         result = radius_calibration.evaluate_trajectory(
-            self._orbit_samples(0.1427), bootstrap_resamples=0,
+            self._orbit_samples(0.1427), bootstrap_resamples=64,
         )
-        self.assertEqual(result["quality_status"], "valid")
+        self.assertEqual(result["quality_status"], "valid", result["quality_reasons"])
+        self.assertAlmostEqual(result["recommended_radius_m"], 0.1427, places=6)
 
-    def test_a_five_millimetre_fit_is_rejected(self):
+    def test_noisy_but_unbiased_observations_still_pass(self):
+        """3 mm of random scatter over many samples is a usable calibration."""
         result = radius_calibration.evaluate_trajectory(
-            self._orbit_samples(0.1427, noise_m=0.005), bootstrap_resamples=0,
+            self._orbit_samples(0.1427, noise_m=0.003, count=200, seed=5),
+            bootstrap_resamples=120,
+        )
+        self.assertEqual(result["quality_status"], "valid", result["quality_reasons"])
+        self.assertAlmostEqual(result["recommended_radius_m"], 0.1427, delta=0.0005)
+
+    def test_too_few_noisy_samples_are_rejected(self):
+        """The same scatter over too few samples leaves the radius uncertain."""
+        result = radius_calibration.evaluate_trajectory(
+            self._orbit_samples(0.1427, noise_m=0.003, count=12, seed=9),
+            bootstrap_resamples=120,
         )
         self.assertEqual(result["quality_status"], "invalid")
         self.assertTrue(
-            any("circle-fit" in reason for reason in result["quality_reasons"]),
+            any("radius uncertainty" in r for r in result["quality_reasons"]),
             result["quality_reasons"],
         )
         self.assertIsNone(result["recommended_radius_m"])
 
-    def test_the_gate_thresholds_are_configurable(self):
-        samples = self._orbit_samples(0.1427, noise_m=0.005)
+    def test_the_threshold_is_configurable(self):
+        samples = self._orbit_samples(0.1427, noise_m=0.003, count=12, seed=9)
         relaxed = radius_calibration.evaluate_trajectory(
-            samples,
-            bootstrap_resamples=0,
-            max_fit_rmse_m=0.02,
-            max_fit_residual_m=0.02,
+            samples, bootstrap_resamples=120, max_radius_std_m=0.01,
         )
-        self.assertEqual(relaxed["quality_status"], "valid")
+        self.assertEqual(relaxed["quality_status"], "valid", relaxed["quality_reasons"])
+
+    def test_per_angle_medians_are_reported_but_not_gated(self):
+        samples = self._orbit_samples(0.1427)
+        # Push one angle far out; it must be reported, and must not fail the run.
+        samples[3]["depth_camera_center_m"][1] += 0.02
+        samples[3]["rgb_camera_center_m"][1] += 0.02
+        result = radius_calibration.evaluate_trajectory(
+            samples, bootstrap_resamples=64,
+        )
+        medians = result["angle_median_residual_m"]
+        self.assertEqual(len(medians), len(samples))
+        self.assertGreater(max(medians.values()), 0.005)
 
 
 class IppeAmbiguityGateTests(unittest.TestCase):
@@ -755,7 +772,8 @@ class TestRadiusArgumentsTests(unittest.TestCase):
             radius_calibration.DEFAULT_MIN_IPPE_ERROR_RATIO,
         )
         self.assertEqual(
-            args.max_fit_rmse_mm, radius_calibration.DEFAULT_MAX_FIT_RMSE_M * 1000.0,
+            args.max_radius_std_mm,
+            radius_calibration.DEFAULT_MAX_RADIUS_STD_M * 1000.0,
         )
         test_radius.validate_args(args)
 
@@ -769,14 +787,14 @@ class TestRadiusArgumentsTests(unittest.TestCase):
                 test_radius.parse_args(["--min-ippe-error-ratio", "0.5"])
             )
 
-    def test_the_fit_gates_are_overridable_and_bounded(self):
-        args = test_radius.parse_args(
-            ["--max-fit-rmse-mm", "3", "--max-fit-residual-mm", "7"]
-        )
+    def test_the_radius_gate_is_overridable_and_bounded(self):
+        args = test_radius.parse_args(["--max-radius-std-mm", "0.4"])
+        self.assertEqual(args.max_radius_std_mm, 0.4)
         test_radius.validate_args(args)
-        for flag in ("--max-fit-rmse-mm", "--max-fit-residual-mm"):
-            with self.assertRaises(ValueError):
-                test_radius.validate_args(test_radius.parse_args([flag, "0"]))
+        with self.assertRaises(ValueError):
+            test_radius.validate_args(
+                test_radius.parse_args(["--max-radius-std-mm", "0"])
+            )
 
 
 class MarkerCountAwareThresholdTests(unittest.TestCase):

@@ -34,8 +34,7 @@ from calculating_radius.radius_calibration import (
     camera_center_world,
     classify_pose,
     convert_world_to_color_to_world_to_depth,
-    DEFAULT_MAX_FIT_RESIDUAL_M,
-    DEFAULT_MAX_FIT_RMSE_M,
+    DEFAULT_MAX_RADIUS_STD_M,
     DEFAULT_MAX_REPROJECTION_ERROR_PX,
     DEFAULT_MAX_SINGLE_MARKER_REPROJECTION_ERROR_PX,
     DEFAULT_MIN_IPPE_ERROR_RATIO,
@@ -115,16 +114,12 @@ def parse_args(argv=None):
         "out of plane",
     )
     parser.add_argument(
-        "--max-fit-rmse-mm",
+        "--max-radius-std-mm",
         type=float,
-        default=DEFAULT_MAX_FIT_RMSE_M * 1000.0,
-        help="Reject the calibration when the inlier circle-fit RMSE exceeds this",
-    )
-    parser.add_argument(
-        "--max-fit-residual-mm",
-        type=float,
-        default=DEFAULT_MAX_FIT_RESIDUAL_M * 1000.0,
-        help="Reject the calibration when any inlier circle-fit residual exceeds this",
+        default=DEFAULT_MAX_RADIUS_STD_M * 1000.0,
+        help="Reject the calibration when the bootstrap radius standard deviation "
+        "exceeds this; this, not the observation scatter, is what makes a radius "
+        "publishable",
     )
     parser.add_argument(
         "--per-angle-median",
@@ -465,10 +460,8 @@ def validate_args(args) -> None:
         )
     if args.min_ippe_error_ratio < 1.0:
         raise ValueError("--min-ippe-error-ratio must be at least 1.0.")
-    if args.max_fit_rmse_mm <= 0.0:
-        raise ValueError("--max-fit-rmse-mm must be positive.")
-    if args.max_fit_residual_mm <= 0.0:
-        raise ValueError("--max-fit-residual-mm must be positive.")
+    if args.max_radius_std_mm <= 0.0:
+        raise ValueError("--max-radius-std-mm must be positive.")
     if not 1 <= args.min_markers_per_pose <= 4:
         raise ValueError("--min-markers-per-pose must be within [1, 4].")
     if args.min_unique_angles < 3:
@@ -537,8 +530,7 @@ def main():
         valid_samples,
         min_unique_angles=args.min_unique_angles,
         max_gap_deg=args.max_angle_gap_deg,
-        max_fit_rmse_m=args.max_fit_rmse_mm / 1000.0,
-        max_fit_residual_m=args.max_fit_residual_mm / 1000.0,
+        max_radius_std_m=args.max_radius_std_mm / 1000.0,
     )
     pointcloud_fit_key = (
         "rgb_fit"
@@ -596,8 +588,7 @@ def main():
             "min_valid_poses_per_angle": args.min_valid_poses_per_angle,
             "min_unique_angles": args.min_unique_angles,
             "max_angle_gap_deg": args.max_angle_gap_deg,
-            "max_fit_rmse_m": args.max_fit_rmse_mm / 1000.0,
-            "max_fit_residual_m": args.max_fit_residual_mm / 1000.0,
+            "max_radius_std_m": args.max_radius_std_mm / 1000.0,
         },
         "camera": {
             "active_disparity": active_disparity,
