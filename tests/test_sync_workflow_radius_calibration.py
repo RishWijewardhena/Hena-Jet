@@ -89,7 +89,7 @@ class ClassifyPoseTests(unittest.TestCase):
         )
 
         self.assertFalse(accepted)
-        self.assertEqual(reason, "reprojection error exceeds 1.50px")
+        self.assertIn("reprojection error exceeds 1.50px", reason)
 
     def test_rejects_failed_pose_and_non_finite_error(self):
         failed = {"ok": False, "used_ids": [], "reprojection_error_px": None}
@@ -777,3 +777,71 @@ class TestRadiusArgumentsTests(unittest.TestCase):
         for flag in ("--max-fit-rmse-mm", "--max-fit-residual-mm"):
             with self.assertRaises(ValueError):
                 test_radius.validate_args(test_radius.parse_args([flag, "0"]))
+
+
+class MarkerCountAwareThresholdTests(unittest.TestCase):
+    """Reprojection error means different things on the two solver paths."""
+
+    @staticmethod
+    def _pose(used_ids, error_px):
+        return {"ok": True, "used_ids": list(used_ids), "reprojection_error_px": error_px}
+
+    def test_a_single_marker_pose_uses_the_tighter_limit(self):
+        accepted, reason = radius_calibration.classify_pose(self._pose([0], 1.2))
+        self.assertFalse(accepted)
+        self.assertIn("1-marker pose", reason)
+
+    def test_a_two_marker_pose_survives_the_same_error(self):
+        """1.05 px is the median of the well-conditioned poses, not a defect."""
+        accepted, reason = radius_calibration.classify_pose(self._pose([0, 1], 1.2))
+        self.assertTrue(accepted, reason)
+
+    def test_a_two_marker_pose_is_still_bounded(self):
+        accepted, reason = radius_calibration.classify_pose(self._pose([0, 1], 4.0))
+        self.assertFalse(accepted)
+        self.assertIn("2-marker pose", reason)
+
+    def test_a_near_zero_single_marker_error_is_not_evidence_of_quality(self):
+        """An exact 4-point IPPE fit passes, so other gates must do the work."""
+        accepted, _ = radius_calibration.classify_pose(self._pose([0], 0.03))
+        self.assertTrue(accepted)
+        rejected, reason = radius_calibration.classify_pose(
+            dict(self._pose([0], 0.03), ippe_error_ratio=1.1)
+        )
+        self.assertFalse(rejected)
+        self.assertIn("ambiguous", reason)
+
+
+class PreferMultiMarkerTests(unittest.TestCase):
+    @staticmethod
+    def _angle(*marker_counts):
+        return {
+            "angle_deg": 30.0,
+            "pose_valid": True,
+            "frames": [
+                {
+                    "accepted": True,
+                    "used_ids": list(range(count)),
+                    "rgb_camera_center_m": [float(count), 0.0, 0.0],
+                    "depth_camera_center_m": [float(count), 0.0, 0.0],
+                }
+                for count in marker_counts
+            ],
+        }
+
+    def test_single_marker_frames_are_dropped_where_two_exist(self):
+        samples = radius_calibration.build_fit_samples([self._angle(1, 2, 2)])
+        self.assertEqual(len(samples), 2)
+        self.assertTrue(
+            all(s["rgb_camera_center_m"][0] == 2.0 for s in samples), samples,
+        )
+
+    def test_single_marker_frames_survive_where_they_are_all_there_is(self):
+        samples = radius_calibration.build_fit_samples([self._angle(1, 1)])
+        self.assertEqual(len(samples), 2)
+
+    def test_the_preference_can_be_disabled(self):
+        samples = radius_calibration.build_fit_samples(
+            [self._angle(1, 2, 2)], prefer_multi_marker=False,
+        )
+        self.assertEqual(len(samples), 3)

@@ -36,6 +36,8 @@ from calculating_radius.radius_calibration import (
     convert_world_to_color_to_world_to_depth,
     DEFAULT_MAX_FIT_RESIDUAL_M,
     DEFAULT_MAX_FIT_RMSE_M,
+    DEFAULT_MAX_REPROJECTION_ERROR_PX,
+    DEFAULT_MAX_SINGLE_MARKER_REPROJECTION_ERROR_PX,
     DEFAULT_MIN_IPPE_ERROR_RATIO,
     evaluate_trajectory,
     orbit_geometry_in_camera_frame,
@@ -74,7 +76,28 @@ def parse_args(argv=None):
     parser.add_argument("--depth-min-m", type=float, default=0.02)
     parser.add_argument("--depth-max-m", type=float, default=0.35)
     parser.add_argument("--timeout-ms", type=int, default=2000)
-    parser.add_argument("--max-reprojection-error-px", type=float, default=1.5)
+    parser.add_argument(
+        "--max-reprojection-error-px",
+        type=float,
+        default=DEFAULT_MAX_REPROJECTION_ERROR_PX,
+        help="Reprojection limit for a multi-marker pose, where the measure is "
+        "meaningful because the markers over-constrain the fit",
+    )
+    parser.add_argument(
+        "--max-single-marker-reprojection-error-px",
+        type=float,
+        default=DEFAULT_MAX_SINGLE_MARKER_REPROJECTION_ERROR_PX,
+        help="Reprojection limit for a single-marker pose; IPPE solves four "
+        "coplanar points almost exactly, so this is a sanity check, not a "
+        "quality gate",
+    )
+    parser.add_argument(
+        "--no-prefer-multi-marker",
+        dest="prefer_multi_marker",
+        action="store_false",
+        help="Feed single-marker frames to the fit even at angles that also saw "
+        "two markers, instead of preferring the better-conditioned poses",
+    )
     parser.add_argument(
         "--min-markers-per-pose",
         type=int,
@@ -205,6 +228,9 @@ def estimate_frame_pose(
     max_reprojection_error_px,
     min_markers=1,
     min_ippe_error_ratio=DEFAULT_MIN_IPPE_ERROR_RATIO,
+    max_single_marker_reprojection_error_px=(
+        DEFAULT_MAX_SINGLE_MARKER_REPROJECTION_ERROR_PX
+    ),
 ):
     gray = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
@@ -217,10 +243,16 @@ def estimate_frame_pose(
         max_reprojection_error_px=max_reprojection_error_px,
         min_markers=min_markers,
         min_ippe_error_ratio=min_ippe_error_ratio,
+        max_single_marker_reprojection_error_px=(
+            max_single_marker_reprojection_error_px
+        ),
     )
     pose["accepted"] = accepted
     pose["rejection_reason"] = rejection_reason
-    if accepted:
+    # Store the camera centre for every solved pose, accepted or not, so a
+    # threshold can be re-evaluated against a recorded run instead of
+    # re-scanning the rig to find out what a rejected pose would have added.
+    if pose.get("ok"):
         world_to_color = pose["world_to_camera"]
         world_to_depth = convert_world_to_color_to_world_to_depth(
             world_to_color, depth_to_color
@@ -319,6 +351,9 @@ def capture_and_save(camera, angle, args, calibration):
             args.max_reprojection_error_px,
             min_markers=args.min_markers_per_pose,
             min_ippe_error_ratio=args.min_ippe_error_ratio,
+            max_single_marker_reprojection_error_px=(
+                args.max_single_marker_reprojection_error_px
+            ),
         )
         overlay = _draw_detection_overlay(
             pose_color,
@@ -424,6 +459,10 @@ def validate_args(args) -> None:
         raise ValueError("Depth range must satisfy 0 <= min < max.")
     if args.max_reprojection_error_px <= 0.0:
         raise ValueError("--max-reprojection-error-px must be positive.")
+    if args.max_single_marker_reprojection_error_px <= 0.0:
+        raise ValueError(
+            "--max-single-marker-reprojection-error-px must be positive."
+        )
     if args.min_ippe_error_ratio < 1.0:
         raise ValueError("--min-ippe-error-ratio must be at least 1.0.")
     if args.max_fit_rmse_mm <= 0.0:
@@ -490,7 +529,9 @@ def main():
         motor.move_y(0.0, feedrate=500)
 
     valid_samples = build_fit_samples(
-        angle_results, use_all_frames=not args.per_angle_median
+        angle_results,
+        use_all_frames=not args.per_angle_median,
+        prefer_multi_marker=args.prefer_multi_marker,
     )
     trajectory = evaluate_trajectory(
         valid_samples,
@@ -547,6 +588,10 @@ def main():
             "max_reprojection_error_px": args.max_reprojection_error_px,
             "min_markers_per_pose": args.min_markers_per_pose,
             "min_ippe_error_ratio": args.min_ippe_error_ratio,
+            "max_single_marker_reprojection_error_px": (
+                args.max_single_marker_reprojection_error_px
+            ),
+            "prefer_multi_marker": bool(args.prefer_multi_marker),
             "per_angle_median": bool(args.per_angle_median),
             "min_valid_poses_per_angle": args.min_valid_poses_per_angle,
             "min_unique_angles": args.min_unique_angles,

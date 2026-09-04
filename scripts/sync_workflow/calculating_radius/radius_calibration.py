@@ -14,6 +14,8 @@ DEFAULT_PROFILE_WIDTH_M = 0.040
 DEFAULT_PROFILE_DEPTH_M = 0.020
 DEFAULT_CARRIER_OFFSET_M = 0.0001
 DEFAULT_MIN_IPPE_ERROR_RATIO = 2.0
+DEFAULT_MAX_REPROJECTION_ERROR_PX = 3.0
+DEFAULT_MAX_SINGLE_MARKER_REPROJECTION_ERROR_PX = 1.0
 DEFAULT_AXIAL_OFFSETS_M = (0.0, 0.0, 0.0, 0.0)
 
 
@@ -180,20 +182,42 @@ def orbit_geometry_in_camera_frame(
 def classify_pose(
     pose: dict[str, Any],
     *,
-    max_reprojection_error_px: float,
+    max_reprojection_error_px: float = DEFAULT_MAX_REPROJECTION_ERROR_PX,
     min_markers: int = 1,
     min_ippe_error_ratio: float = DEFAULT_MIN_IPPE_ERROR_RATIO,
+    max_single_marker_reprojection_error_px: float = (
+        DEFAULT_MAX_SINGLE_MARKER_REPROJECTION_ERROR_PX
+    ),
 ) -> tuple[bool, str | None]:
-    """Decide whether a solved profile pose may feed the orbit-radius fit."""
+    """Decide whether a solved profile pose may feed the orbit-radius fit.
+
+    Reprojection error means different things on the two solver paths, so it
+    cannot share a threshold. A single marker gives four coplanar points and
+    IPPE solves those essentially exactly, so the error is near zero however
+    wrong the pose is: in outputs/radius_x100_rerun the 145 single-marker poses
+    had a median error of 0.124 px while the 90 better-conditioned two-marker
+    poses had a median of 1.050 px. A shared 1.5 px limit therefore admitted
+    every single-marker pose and rejected 22 two-marker poses -- the only
+    measurements the number could actually judge.
+    """
     if not pose.get("ok"):
         return False, "no usable mapped marker pose"
     error = pose.get("reprojection_error_px")
     if error is None or not np.isfinite(error):
         return False, "non-finite reprojection error"
-    if len(pose.get("used_ids") or []) < min_markers:
+    marker_count = len(pose.get("used_ids") or [])
+    if marker_count < min_markers:
         return False, f"fewer than {min_markers} mapped markers in view"
-    if error > max_reprojection_error_px:
-        return False, f"reprojection error exceeds {max_reprojection_error_px:.2f}px"
+    limit = (
+        max_reprojection_error_px
+        if marker_count >= 2
+        else max_single_marker_reprojection_error_px
+    )
+    if error > limit:
+        return False, (
+            f"reprojection error exceeds {limit:.2f}px "
+            f"for a {marker_count}-marker pose"
+        )
     ratio = pose.get("ippe_error_ratio")
     if ratio is not None and np.isfinite(ratio) and ratio < min_ippe_error_ratio:
         return False, (
@@ -207,11 +231,18 @@ def build_fit_samples(
     angle_results: list[dict[str, Any]],
     *,
     use_all_frames: bool = True,
+    prefer_multi_marker: bool = True,
 ) -> list[dict[str, Any]]:
     """Flatten accepted camera centers into circle-fit samples.
 
     With ``use_all_frames`` every accepted per-frame camera center becomes a
     sample; otherwise a single per-angle median sample is emitted.
+
+    With ``prefer_multi_marker`` an angle that saw two or more markers in any
+    accepted frame contributes only those frames, and its single-marker frames
+    are dropped. A single marker resolves its out-of-plane pose far more weakly
+    than two, so where both exist the weaker measurement only adds bias; where
+    only one exists it still supplies the angular coverage the fit needs.
     """
     samples: list[dict[str, Any]] = []
     for angle_result in angle_results:
@@ -219,7 +250,18 @@ def build_fit_samples(
             continue
         angle_deg = float(angle_result["angle_deg"])
         if use_all_frames:
-            for frame in angle_result.get("frames", []):
+            accepted = [
+                frame for frame in angle_result.get("frames", [])
+                if frame.get("accepted")
+            ]
+            if prefer_multi_marker:
+                multi = [
+                    frame for frame in accepted
+                    if len(frame.get("used_ids") or []) >= 2
+                ]
+                if multi:
+                    accepted = multi
+            for frame in accepted:
                 if not frame.get("accepted"):
                     continue
                 samples.append(
