@@ -34,6 +34,7 @@ from calculating_radius.radius_calibration import (  # noqa: E402
     solve_profile_pose,
 )
 from calculating_radius.generate_radius_markers import generate_marker_kit  # noqa: E402
+from calculating_radius import radius_calibration  # noqa: E402
 
 
 class DetectorParameterTests(unittest.TestCase):
@@ -640,3 +641,53 @@ class ProfilePoseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CircleFitResidualGateTests(unittest.TestCase):
+    """A clean reprojection error must not certify a poor orbit fit."""
+
+    @staticmethod
+    def _orbit_samples(radius_m: float, noise_m: float = 0.0):
+        angles = np.arange(0.0, 360.0, 30.0)
+        samples = []
+        for index, angle in enumerate(angles):
+            theta = np.radians(angle)
+            offset = noise_m if index % 2 == 0 else -noise_m
+            centre = np.array([
+                0.0,
+                (radius_m + offset) * np.cos(theta),
+                (radius_m + offset) * np.sin(theta),
+            ])
+            samples.append({
+                "angle_deg": float(angle),
+                "rgb_camera_center_m": centre.tolist(),
+                "depth_camera_center_m": centre.tolist(),
+            })
+        return samples
+
+    def test_a_clean_orbit_passes(self):
+        result = radius_calibration.evaluate_trajectory(
+            self._orbit_samples(0.1427), bootstrap_resamples=0,
+        )
+        self.assertEqual(result["quality_status"], "valid")
+
+    def test_a_five_millimetre_fit_is_rejected(self):
+        result = radius_calibration.evaluate_trajectory(
+            self._orbit_samples(0.1427, noise_m=0.005), bootstrap_resamples=0,
+        )
+        self.assertEqual(result["quality_status"], "invalid")
+        self.assertTrue(
+            any("circle-fit" in reason for reason in result["quality_reasons"]),
+            result["quality_reasons"],
+        )
+        self.assertIsNone(result["recommended_radius_m"])
+
+    def test_the_gate_thresholds_are_configurable(self):
+        samples = self._orbit_samples(0.1427, noise_m=0.005)
+        relaxed = radius_calibration.evaluate_trajectory(
+            samples,
+            bootstrap_resamples=0,
+            max_fit_rmse_m=0.02,
+            max_fit_residual_m=0.02,
+        )
+        self.assertEqual(relaxed["quality_status"], "valid")

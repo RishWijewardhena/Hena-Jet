@@ -403,6 +403,10 @@ def has_sufficient_angular_coverage(
     return largest_gap <= max_gap_deg + 1e-9
 
 
+DEFAULT_MAX_FIT_RMSE_M = 0.002
+DEFAULT_MAX_FIT_RESIDUAL_M = 0.005
+
+
 def evaluate_trajectory(
     samples: list[dict[str, Any]],
     *,
@@ -410,8 +414,17 @@ def evaluate_trajectory(
     max_gap_deg: float = 90.0,
     mad_threshold: float = 3.5,
     bootstrap_resamples: int = 250,
+    max_fit_rmse_m: float = DEFAULT_MAX_FIT_RMSE_M,
+    max_fit_residual_m: float = DEFAULT_MAX_FIT_RESIDUAL_M,
 ) -> dict[str, Any]:
-    """Fit RGB/depth trajectories and decide whether a radius is publishable."""
+    """Fit RGB/depth trajectories and decide whether a radius is publishable.
+
+    Reprojection error only reports how cleanly the marker corners were
+    detected. It says nothing about whether the fitted circle describes the
+    machine, so the fit residual is gated separately: a calibration whose
+    circle fit misses its own observations by millimetres cannot anchor a
+    sub-millimetre reconstruction, however sharp its corner detection was.
+    """
     reasons: list[str] = []
     if len(samples) < 3:
         return {
@@ -465,6 +478,20 @@ def evaluate_trajectory(
         for sample, is_inlier in zip(samples, depth_inliers)
         if is_inlier
     ]
+
+    for name, fit in (("RGB", rgb_fit), ("depth", depth_fit)):
+        fit_rmse_m = fit.get("rmse_m")
+        if fit_rmse_m is not None and fit_rmse_m > max_fit_rmse_m:
+            reasons.append(
+                f"{name} circle-fit RMSE {fit_rmse_m * 1000.0:.3f} mm exceeds "
+                f"{max_fit_rmse_m * 1000.0:.3f} mm"
+            )
+        fit_max_residual_m = fit.get("max_residual_m")
+        if fit_max_residual_m is not None and fit_max_residual_m > max_fit_residual_m:
+            reasons.append(
+                f"{name} circle-fit max residual {fit_max_residual_m * 1000.0:.3f} mm "
+                f"exceeds {max_fit_residual_m * 1000.0:.3f} mm"
+            )
 
     if len({round(angle % 360.0, 6) for angle in inlier_angles}) < min_unique_angles:
         reasons.append(f"fewer than {min_unique_angles} unique inlier angles")
