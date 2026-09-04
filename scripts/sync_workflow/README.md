@@ -78,13 +78,19 @@ Capture requires the Orbbec SDK, Open3D, and motor serial-port access. Reconstru
 
 The capture path preserves metric depth as floating-point metres from the SDK through PLY back-projection. The previous Open3D RGB-D path converted depth to unsigned 16-bit millimetres before projection, truncating every sample to the millimetre below and adding an approximately -0.5 mm systematic depth bias. `pointcloud_export.py` now back-projects the float depth directly, so that quantization is no longer part of the geometry.
 
-The Orbbec device's recommended depth post-processing chain is enabled by default and runs in this order before depth-to-color alignment:
+Five depth filters are enabled by default and run in this order before depth-to-color alignment:
 
-1. `DisparityTransform`;
-2. `SpatialAdvancedFilter`;
-3. `TemporalFilter`;
+1. `SpatialAdvancedFilter`;
+2. `TemporalFilter`;
+3. `DisparityTransform`;
 4. `NoiseRemovalFilter`;
 5. `EdgeNoiseRemovalFilter`.
+
+The spatial and temporal filters work in the disparity domain, so `DisparityTransform` converts back to depth after them, and the noise-removal filters then operate on depth. This is the Gemini 305's own recommended order.
+
+Only the first three come from the device. `get_recommended_filters()` on this device returns ten filters and includes neither `NoiseRemovalFilter` nor `EdgeNoiseRemovalFilter`, so naming them enabled nothing and reported nothing: three of the five requested filters actually ran. Both are now constructed directly from the SDK and appended to the chain, and the startup log lists what really runs.
+
+The remaining seven device filters stay off deliberately. `HoleFillingFilter` invents depth where the sensor measured none, `DecimationFilter` reduces resolution, and `SpatialFastFilter` and `SpatialModerateFilter` would stack redundant smoothing on top of `SpatialAdvancedFilter`. None belong in a chain feeding metric reconstruction.
 
 Each motor angle now captures 15 fresh RGB-D frames by default. A fused pixel must have at least three valid temporal samples (`--min-valid-samples 3`). The `--min-confidence` option is parsed, validated, and recorded in metadata, but the current capture path does not yet obtain a confidence frame or apply this gate. Keep it at its default `0` until confidence-frame wiring is completed.
 
