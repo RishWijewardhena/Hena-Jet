@@ -118,7 +118,7 @@ flowchart TD
     YLOOP -->|angles done| XLOOP
     XLOOP -->|stations done| META[scan_metadata.json]
     META --> RECON{"--reconstruct?"}
-    RECON -->|yes| SUB["launch reconstruct_pipeline.py<br/>radius + axis + crop only"]
+    RECON -->|yes| SUB["launch reconstruct_pipeline.py<br/>measured calibration + guarded ICP + crop"]
     RECON -->|no| DONE([captures on disk])
 
     style FILT fill:#e8f0fe
@@ -144,9 +144,10 @@ filters then operate on depth. The last two are **not** in the device's
 `HoleFillingFilter` is deliberately excluded — it invents depth the sensor
 never measured.
 
-> `--reconstruct` passes only the scalar radius and axis, never
-> `--orbit-geometry`, so the pivot falls back to `[0, 0, R]`. Run
-> `reconstruct_pipeline.py` separately to use a measured pivot and axis.
+> Both entrypoints default to guarded ICP and the fixed rig calibration at
+> `outputs/test_radius_x100/radius_calibration.json`. Capture records the resolved
+> calibration path and passes it to reconstruction. `--orbit-geometry` selects
+> another calibration; missing or invalid geometry stops the run.
 
 ---
 
@@ -155,13 +156,12 @@ never measured.
 ```mermaid
 flowchart TD
     START([reconstruct_pipeline.py]) --> DISC["Stage 1/4<br/>discover frame_*.ply<br/>read scan_metadata.json"]
-    DISC --> GEO{"--orbit-geometry?"}
-    GEO -->|yes| XCHK["read calibration's<br/>motor.x_position_mm"]
-    XCHK --> MEAS["measured pivot + axis<br/>pivot shifted by scan_X - calibration_X"]
-    GEO -->|no| ASSUME["assumed pivot [0,0,R]<br/>axis [1,0,0]"]
-
-    MEAS --> PRIOR
-    ASSUME --> PRIOR["build_orbit_poses<br/>rotate about axis by motor angle<br/>+ station X offset"]
+    DISC --> GEO["select calibration<br/>CLI, scan metadata, fixed rig file"]
+    GEO --> VALID{"valid measured geometry?"}
+    VALID -->|no| ERROR["stop: fix calibration"]
+    VALID -->|yes| XCHK["read calibration's<br/>motor.x_position_mm"]
+    XCHK --> MEAS["measured pivot + axis<br/>crop pivot adjusted for scan X"]
+    MEAS --> PRIOR["build_orbit_poses<br/>rotate about measured axis by motor angle<br/>+ station X offset"]
 
     PRIOR --> MODE{"--registration-mode"}
     MODE -->|motor| USE[use priors directly<br/>no edges recorded]

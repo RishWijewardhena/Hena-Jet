@@ -26,6 +26,7 @@ from typing import Optional
 
 import numpy as np
 
+from orbit_geometry import select_orbit_geometry, load_orbit_geometry, validate_camera_frame
 from pointcloud_processing import (
     CylinderCrop,
     merge_and_finalize_clouds,
@@ -878,29 +879,29 @@ def parse_args(argv=None):
     parser.add_argument(
         "--registration-mode",
         choices=("motor", "guarded-icp"),
-        default="motor",
+        default="guarded-icp",
         help=(
-            "Pose source: motor orbit or guarded motor+ICP (default: motor)"
+            "Pose source: motor orbit or guarded motor+ICP (default: guarded-icp)"
         ),
     )
     parser.add_argument("--auto-radius", action="store_true",
                         help="Estimate center-surface depth from the first frame (rough fallback; "
                              "not a physical orbit-radius calibration)")
     parser.add_argument("--orbit-radius-m", type=float, default=None,
-                        help="Camera orbit radius in metres; defaults to scan_metadata.json "
+                        help="Camera orbit radius in metres; defaults to measured calibration "
                              "(ignored if --auto-radius is used)")
     parser.add_argument("--orbit-axis", type=float, nargs=3, default=None,
-                        help="Orbit axis as X Y Z; defaults to scan metadata or 1 0 0")
+                        help="Legacy axis option; measured calibration supplies the orbit axis")
     parser.add_argument("--pivot", type=float, nargs=3, default=None,
                         help="Pivot point in camera coords as X Y Z metres "
-                             "(default: [0, 0, orbit-radius-m] = object centre in front of camera)")
+                             "(default: measured calibration pivot)")
     parser.add_argument(
         "--orbit-geometry",
         type=Path,
         default=None,
         help=(
             "radius_calibration.json whose measured orbit_geometry supplies "
-            "the pivot and axis instead of [0,0,R] / [1,0,0]"
+            "the pivot and axis; defaults to scan metadata or the fixed rig calibration"
         ),
     )
     parser.add_argument("--reference-angle-deg", type=float, default=0.0,
@@ -975,6 +976,33 @@ def main(argv=None):
         )
 
     input_dir = args.input_dir
+    scan_metadata = load_scan_metadata(input_dir)
+    captures = discover_captures(input_dir, scan_metadata)
+    ply_files = [capture.path for capture in captures]
+    logger.info("Found %d PLY files in %s", len(ply_files), input_dir)
+
+    args.orbit_geometry = select_orbit_geometry(args.orbit_geometry, scan_metadata)
+    calibration = load_orbit_geometry(args.orbit_geometry)
+    intrinsics_path = input_dir / "intrinsics.json"
+    if intrinsics_path.is_file():
+        validate_camera_frame(calibration, json.loads(intrinsics_path.read_text()))
+    measured_geometry = calibration["orbit_geometry"]
+    orbit_axis = np.asarray(measured_geometry["axis"], dtype=float)
+    calibration_x_mm = (
+        None if args.pivot else calibration_station_x_mm(calibration, args.orbit_geometry)
+    )
+    if args.auto_radius:
+        import open3d as o3d
+        orbit_radius_m = calculate_auto_radius(o3d, ply_files)
+    else:
+        orbit_radius_m = resolve_orbit_radius(
+            args.orbit_radius_m,
+            {"orbit_radius_m": calibration["recommended_radius_m"]},
+        )
+    pivot = np.asarray(args.pivot if args.pivot else measured_geometry["pivot_m"], dtype=float)
+    if pivot.shape != (3,) or not np.isfinite(pivot).all():
+        raise ValueError("--pivot must contain three finite coordinates")
+
     output_dir = args.output_dir or (input_dir / "reconstruction")
     output_dir.mkdir(parents=True, exist_ok=True)
     matrix_dir = output_dir / "matrices"
@@ -985,47 +1013,6 @@ def main(argv=None):
         logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     )
     logging.getLogger().addHandler(file_handler)
-
-    scan_metadata = load_scan_metadata(input_dir)
-    captures = discover_captures(input_dir, scan_metadata)
-    ply_files = [capture.path for capture in captures]
-    logger.info("Found %d PLY files in %s", len(ply_files), input_dir)
-
-    orbit_axis_values = args.orbit_axis or scan_metadata.get(
-        "orbit_axis", [1.0, 0.0, 0.0]
-    )
-    orbit_axis = normalized_vector(np.array(orbit_axis_values), name="orbit-axis")
-
-    if args.auto_radius:
-        import open3d as o3d
-
-        orbit_radius_m = calculate_auto_radius(o3d, ply_files)
-    else:
-        orbit_radius_m = resolve_orbit_radius(args.orbit_radius_m, scan_metadata)
-
-    measured_geometry = None
-    calibration_x_mm = None
-    if args.orbit_geometry is not None:
-        calibration = json.loads(args.orbit_geometry.read_text(encoding="utf-8"))
-        measured_geometry = calibration.get("orbit_geometry")
-        if not measured_geometry:
-            raise ValueError(
-                f"{args.orbit_geometry} has no orbit_geometry block; re-run the "
-                "radius calibration with a valid full-orbit result."
-            )
-        orbit_axis = np.asarray(measured_geometry["axis"], dtype=float)
-        if not args.pivot:
-            calibration_x_mm = calibration_station_x_mm(
-                calibration, args.orbit_geometry,
-            )
-
-    if args.pivot:
-        pivot = np.array(args.pivot, dtype=float)
-    elif measured_geometry is not None:
-        pivot = np.asarray(measured_geometry["pivot_m"], dtype=float)
-    else:
-        # Camera is on the ring and Z+ points inward at the object at angle zero.
-        pivot = np.array([0.0, 0.0, orbit_radius_m])
 
     reconstruction_metadata = scan_metadata.get("reconstruction", {})
     if not isinstance(reconstruction_metadata, dict):
@@ -1045,15 +1032,10 @@ def main(argv=None):
     # Stage 1: Discover files and build pose priors
     logger.info("Stage 1/4: Discovering PLY files and building pose priors...")
     logger.info("Found %d point clouds.", len(ply_files))
-    if orbit_radius_m is not None:
-        logger.info(
-            "Orbit radius: %.4f m, axis: %s, pivot: %s",
-            orbit_radius_m,
-            orbit_axis,
-            pivot,
-        )
-    else:
-        logger.info("Measured poses: axis: %s, profile pivot: %s", orbit_axis, pivot)
+    logger.info(
+        "Orbit calibration: %s; radius %.4f m, axis %s, pivot %s",
+        args.orbit_geometry, orbit_radius_m, orbit_axis, pivot,
+    )
 
     priors = build_orbit_poses(
         captures, orbit_axis, pivot,
@@ -1203,7 +1185,7 @@ def main(argv=None):
             if args.auto_radius
             else "cli"
             if args.orbit_radius_m is not None
-            else "scan_metadata"
+            else "orbit_geometry"
         ),
         "orbit_geometry_source": (
             str(args.orbit_geometry) if args.orbit_geometry else None

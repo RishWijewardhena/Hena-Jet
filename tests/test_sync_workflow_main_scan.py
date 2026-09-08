@@ -89,7 +89,7 @@ class ScanMetadataTests(unittest.TestCase):
     def test_x_positions_default_to_the_existing_single_station(self):
         args = main_scan.parse_args([])
 
-        self.assertEqual(args.x_positions_mm, [200.0])
+        self.assertEqual(args.x_positions_mm, [150.0])
 
     def test_registration_crop_defaults_to_10cm(self):
         args = main_scan.parse_args([])
@@ -332,3 +332,20 @@ class FuseDepthFramesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RegistrationModeDefaultTests(unittest.TestCase):
+    def test_capture_defaults_to_guarded_icp(self):
+        """Motor mode writes no edges, so ICP is on for its diagnostics."""
+        self.assertEqual(main_scan.parse_args([]).registration_mode, "guarded-icp")
+
+    def test_motor_can_still_be_requested(self):
+        args = main_scan.parse_args(["--registration-mode", "motor"])
+        self.assertEqual(args.registration_mode, "motor")
+
+    def test_the_mode_reaches_scan_metadata(self):
+        args = main_scan.parse_args([])
+        metadata = main_scan.build_scan_metadata(
+            args, active_disparity=256, captured_angles=[0.0],
+        )
+        self.assertEqual(metadata["registration_mode"], "guarded-icp")

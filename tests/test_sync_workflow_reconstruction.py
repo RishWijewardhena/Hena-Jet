@@ -19,10 +19,10 @@ import reconstruct_pipeline
 
 
 class ReconstructionCliTests(unittest.TestCase):
-    def test_motor_registration_is_the_safe_default(self):
+    def test_guarded_icp_is_the_default(self):
         args = reconstruct_pipeline.parse_args(["--input-dir", "scan"])
 
-        self.assertEqual(args.registration_mode, "motor")
+        self.assertEqual(args.registration_mode, "guarded-icp")
 
     def test_uses_the_radius_recorded_during_capture(self):
         args = reconstruct_pipeline.parse_args(["--input-dir", "scan"])
@@ -455,9 +455,16 @@ class ReconstructionEndToEndTests(unittest.TestCase):
             }
             (input_dir / "scan_metadata.json").write_text(json.dumps(metadata))
 
+            calibration_path = root / "radius_calibration.json"
+            calibration_path.write_text(json.dumps({
+                "quality_status": "valid", "recommended_radius_m": 0.1,
+                "orbit_geometry": {"pivot_m": [0, 0, 0.1], "axis": [1, 0, 0]},
+                "motor": {"x_position_mm": 200},
+            }))
             reconstruct_pipeline.main([
                 "--input-dir", str(input_dir),
                 "--output-dir", str(output_dir),
+                "--orbit-geometry", str(calibration_path),
                 "--registration-mode", "motor",
                 "--skip-per-scan-sor",
             ])
@@ -506,9 +513,16 @@ class ReconstructionEndToEndTests(unittest.TestCase):
                     )
                 )
 
+            calibration_path = root / "radius_calibration.json"
+            calibration_path.write_text(json.dumps({
+                "quality_status": "valid", "recommended_radius_m": 0.1,
+                "orbit_geometry": {"pivot_m": [0, 0, 0.1], "axis": [1, 0, 0]},
+                "motor": {"x_position_mm": 200},
+            }))
             reconstruct_pipeline.main([
                 "--input-dir", str(input_dir),
                 "--output-dir", str(output_dir),
+                "--orbit-geometry", str(calibration_path),
                 "--orbit-radius-m", "0.1",
                 "--crop-radius-m", "0.05",
                 "--registration-mode", "motor",
