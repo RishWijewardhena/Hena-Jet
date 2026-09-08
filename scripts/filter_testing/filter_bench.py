@@ -198,6 +198,10 @@ def compare(args):
         raise ValueError(f"Recording does not exist: {args.bag}")
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=False)
+    write_json(out / "comparison.json", {
+        "min_depth_m": args.min_depth, "max_depth_m": args.max_depth,
+        "bag": str(Path(args.bag).resolve()),
+    })
     specs = [{"name": "baseline", "filters": {}}]
     if args.trials:
         specs.extend(json.loads(Path(args.trials).read_text()))
@@ -250,7 +254,79 @@ def compare(args):
         print(f"  {row['status']}" + (f": {row['error']}" if "error" in row else ""), flush=True)
         write_json(out / "summary.json", summary)
     print(f"Results: {out / 'summary.json'}")
+    if getattr(args, "plot", False):
+        plot_results(out)
     return 0 if all(row["status"] == "ok" for row in summary) else 1
+
+
+def plot_results(directory, show=False):
+    """Plot all trials, keeping failed/invalid trials visible and out of charts."""
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from textwrap import fill
+
+    directory = Path(directory)
+    rows = json.loads((directory / "summary.json").read_text())
+    if not rows:
+        raise ValueError("No trials to plot")
+    columns = 4
+    fig, axes = plt.subplots(math.ceil(len(rows) / columns), columns,
+                             figsize=(20, 3.8 * math.ceil(len(rows) / columns)),
+                             squeeze=False, layout="constrained")
+    for ax, row in zip(axes.flat, rows):
+        ax.set_title(row["name"], fontsize=11)
+        ax.set_axis_off()
+        preview = directory / row["name"] / "depth_preview.png"
+        if row["status"] == "ok" and row.get("same_input_frames") and preview.exists():
+            ax.imshow(plt.imread(preview), interpolation="nearest")
+            h, w = row["shape"]
+            p95 = row.get("p95_frame_change_mm")
+            change = f"{p95:.2f}" if p95 is not None else "N/A"
+            ax.set_title(f"{row['name']}  ({w}×{h})\n"
+                         f"Coverage {row['valid_fraction']:.1%} | "
+                         f"P95 change {change} mm", fontsize=10)
+        else:
+            ax.text(0.5, 0.5, fill(row.get("error", row["status"]), 45),
+                    transform=ax.transAxes, ha="center", va="center", color="firebrick", fontsize=9)
+    for ax in list(axes.flat)[len(rows):]:
+        ax.set_visible(False)
+    settings_path = directory / "comparison.json"
+    limits = ""
+    if settings_path.exists():
+        settings = json.loads(settings_path.read_text())
+        limits = f" ({settings['min_depth_m'] * 1000:g}–{settings['max_depth_m'] * 1000:g} mm)"
+    fig.suptitle("Software filters — same final input frame, common depth colour scale" + limits +
+                 "\nBlack = invalid/outside range. Lower-resolution outputs are labelled. "
+                 "Smoothness does not establish accuracy.", fontsize=13)
+    fig.savefig(directory / "overview.png", dpi=160)
+
+    good = [row for row in rows if row["status"] == "ok" and row.get("same_input_frames")]
+    chart, panels = plt.subplots(1, 3, figsize=(19, max(5, len(good) * 0.4)), layout="constrained")
+    for ax, key, factor, title in zip(panels,
+            ("valid_fraction", "p95_frame_change_mm", "filter_ms_per_frame"),
+            (100, 1, 1), ("Valid coverage (%)", "P95 frame change (mm)", "Filter time (ms/frame)")):
+        for index, row in enumerate(good):
+            value = row.get(key)
+            if value is not None:
+                value *= factor
+                ax.barh(index, value, color="#d97706" if row["name"] == "current" else "#287eac")
+                ax.text(value, index, f" {value:.2f}", va="center", fontsize=8)
+        ax.set_yticks(range(len(good)), [r["name"] for r in good])
+        ax.invert_yaxis()
+        ax.set_title(title)
+        ax.margins(x=0.18)
+        ax.grid(axis="x", alpha=0.2)
+    chart.suptitle("Coverage, stability and processing cost — no automatic winner\n"
+                   "Whole-image metrics; inspect edge loss. Decimation changes resolution. "
+                   "Failed/mismatched trials excluded.")
+    chart.savefig(directory / "metrics_overview.png", dpi=160)
+    print(f"Plots: {directory / 'overview.png'} and {directory / 'metrics_overview.png'}")
+    if show:
+        plt.show()
+    plt.close(fig)
+    plt.close(chart)
 
 
 def main():
@@ -258,11 +334,14 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     record = sub.add_parser("capture", help="Record native depth without host post-processing")
     record.add_argument("--bag", required=True)
-    record.add_argument("--width", type=int, default=848)
-    record.add_argument("--height", type=int, default=530)
+    record.add_argument("--width", type=int, default=1280)
+    record.add_argument("--height", type=int, default=800)
     record.add_argument("--fps", type=int, default=30)
     record.add_argument("--disparity", choices=("128", "256"), default="256")
     record.add_argument("--seconds", type=float, default=3)
+    plot = sub.add_parser("plot", help="Show all existing filter trials in Matplotlib")
+    plot.add_argument("--input", required=True, help="Comparison result directory")
+    plot.add_argument("--show", action="store_true", help="Also open interactive Matplotlib windows")
     for name in ("compare", "_worker"):
         command = sub.add_parser(name)
         command.add_argument("--bag", required=True)
@@ -274,10 +353,11 @@ def main():
         if name == "compare":
             command.add_argument("--trials", help="JSON list of named filter chains and parameter overrides")
             command.add_argument("--timeout", type=float, default=180)
+            command.add_argument("--plot", action="store_true", help="Save Matplotlib overview figures after trials")
         else:
             command.add_argument("--spec", required=True)
     args = parser.parse_args()
-    if not math.isfinite(args.seconds) or not 0 < args.seconds <= 60:
+    if hasattr(args, "seconds") and (not math.isfinite(args.seconds) or not 0 < args.seconds <= 60):
         parser.error("--seconds must be between 0 and 60; recordings are buffered in memory")
     if hasattr(args, "min_depth") and not 0 < args.min_depth < args.max_depth < math.inf:
         parser.error("Expected 0 < min-depth < max-depth, in metres")
@@ -286,6 +366,8 @@ def main():
             capture(args)
         elif args.command == "compare":
             return compare(args)
+        elif args.command == "plot":
+            plot_results(args.input, args.show)
         else:
             worker(args)
     except Exception as exc:

@@ -13,12 +13,33 @@ From the repository root, with the camera available:
 
 ```bash
 conda run --no-capture-output -n hena_jet python scripts/filter_testing/filter_bench.py capture \
-  --bag outputs/filter_test/raw.bag --width 848 --height 530 --disparity 256 --seconds 3
+  --bag outputs/filter_test_1280/raw.bag --width 1280 --height 800 --disparity 256 --seconds 3
 
 conda run --no-capture-output -n hena_jet python scripts/filter_testing/filter_bench.py compare \
-  --bag outputs/filter_test/raw.bag --output outputs/filter_test/comparison \
-  --seconds 5 --min-depth 0.04 --max-depth 0.25
+  --bag outputs/filter_test_1280/raw.bag --output outputs/filter_test_1280/comparison \
+  --seconds 5 --min-depth 0.05 --max-depth 0.25 --plot
 ```
+
+Capture now defaults to 1280×800. The supplied datasheet lists a 50 mm minimum
+for this resolution at disparity 256 in Close-Range mode; the example evaluates
+50–250 mm. Existing 848×530 recordings must be recaptured to test 1280×800.
+
+`--plot` saves `overview.png` with all depth previews together, including failure
+panels, and `metrics_overview.png` with coverage, stability and runtime charts.
+These are still produced if an unavailable filter causes a nonzero suite exit.
+The images label output resolution (decimation reduces it) and exclude failed
+or mismatched trials from metric charts. Compare edge preservation as well as
+noise; coverage and stability alone cannot identify the most accurate filter.
+
+To plot an existing comparison or open interactive Matplotlib windows:
+
+```bash
+python scripts/filter_testing/filter_bench.py plot \
+  --input outputs/filter_test_1280/comparison --show
+```
+
+Omit `--show` on a headless machine. Existing plots are regenerated; recordings
+and per-trial results are retained. Matplotlib is required for plotting only.
 
 Capture sets and verifies the disparity property and exports device settings.
 The settings sidecar is capture metadata only: hardware properties are not

@@ -109,3 +109,22 @@ def test_playback_does_not_restore_hardware_properties(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="stop after playback"):
         bench.worker(SimpleNamespace(bag=str(bag), spec=str(trial)))
     assert calls == ["opened", "pipeline"]
+
+
+def test_plot_includes_failure_panel_and_handles_missing_metric(tmp_path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    (tmp_path / "baseline").mkdir()
+    plt.imsave(tmp_path / "baseline/depth_preview.png", np.zeros((3, 4, 3)))
+    bench.write_json(tmp_path / "summary.json", [
+        {"name": "baseline", "status": "ok", "same_input_frames": True,
+         "shape": [3, 4], "valid_fraction": 0, "p95_frame_change_mm": None,
+         "filter_ms_per_frame": 0.1},
+        {"name": "unavailable", "status": "failed", "error": "SDK cannot create filter"},
+    ])
+    bench.plot_results(tmp_path)
+    assert (tmp_path / "overview.png").stat().st_size > 0
+    assert (tmp_path / "metrics_overview.png").stat().st_size > 0
+    assert not plt.get_fignums()
