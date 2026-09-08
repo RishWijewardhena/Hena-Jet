@@ -21,6 +21,9 @@ conda run --no-capture-output -n hena_jet python scripts/filter_testing/filter_b
 ```
 
 Capture sets and verifies the disparity property and exports device settings.
+The settings sidecar is capture metadata only: hardware properties are not
+restored onto the read-only playback device. Playback uses bag calibration and
+profiles, with host filter settings explicitly selected for each trial.
 It does not select a Close-Range preset: select/verify the appropriate preset
 beforehand. A 40 mm software gate does not guarantee 40 mm hardware operation.
 Existing recordings/results are not overwritten. Close other camera applications.

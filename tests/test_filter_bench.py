@@ -81,3 +81,31 @@ def test_different_playback_frames_invalidate_comparison(tmp_path, monkeypatch):
     assert result[0]["same_input_frames"] is True
     assert result[1]["same_input_frames"] is False
     assert result[1]["status"].startswith("invalid comparison")
+
+
+def test_playback_does_not_restore_hardware_properties(tmp_path, monkeypatch):
+    import sys
+
+    bag = tmp_path / "raw.bag"
+    bag.touch()
+    bench.write_json(bag.with_suffix(".settings.json"), {"hardware": "capture settings"})
+    trial = tmp_path / "spec.json"
+    bench.write_json(trial, {"filters": {}})
+    calls = []
+
+    class Playback:
+        def __init__(self, path):
+            calls.append("opened")
+
+        def load_preset_from_json_file(self, path):
+            pytest.fail("Playback cannot restore read-only hardware properties")
+
+    def pipeline(device):
+        calls.append("pipeline")
+        raise RuntimeError("stop after playback initialization")
+
+    monkeypatch.setitem(sys.modules, "pyorbbecsdk", SimpleNamespace(
+        PlaybackDevice=Playback, Pipeline=pipeline))
+    with pytest.raises(RuntimeError, match="stop after playback"):
+        bench.worker(SimpleNamespace(bag=str(bag), spec=str(trial)))
+    assert calls == ["opened", "pipeline"]

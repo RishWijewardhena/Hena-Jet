@@ -121,9 +121,9 @@ def worker(args):
     import pyorbbecsdk as sdk
     spec = json.loads(Path(args.spec).read_text())
     device = sdk.PlaybackDevice(str(Path(args.bag).resolve()))
-    settings = Path(args.bag).with_suffix(".settings.json")
-    if settings.exists():
-        device.load_preset_from_json_file(str(settings.resolve()))
+    # Capture settings document hardware state; replay cannot write those
+    # properties. The bag supplies recorded profiles/calibration, while this
+    # trial explicitly configures its host filters below.
     pipeline = sdk.Pipeline(device)
     config = sdk.Config()
     config.enable_stream(sdk.OBStreamType.DEPTH_STREAM)
@@ -138,7 +138,8 @@ def worker(args):
         if name not in available:
             if name not in SDK_FILTERS or not hasattr(sdk, name):
                 raise ValueError(f"Unavailable SDK filter: {name}")
-            f = getattr(sdk, name)()
+            factory = getattr(sdk, name)
+            f = factory(device) if name == "EnhancedDepthFilter" else factory()
             available[name] = f
             chain.append(f)
     inventory = []
@@ -232,6 +233,10 @@ def compare(args):
             except subprocess.TimeoutExpired:
                 status = "timeout"
         row = {"name": spec["name"], "status": status}
+        if status != "ok":
+            lines = (target / "worker.log").read_text(errors="replace").splitlines()
+            row["error"] = lines[-1] if lines else status
+            row["log"] = str(target / "worker.log")
         if status == "ok":
             with np.load(target / "depths.npz") as data:
                 ids = data["frame_ids"]
@@ -242,6 +247,7 @@ def compare(args):
                 row["status"] = "invalid comparison: input frames differ or baseline failed"
             row.update(json.loads((target / "metrics.json").read_text()))
         summary.append(row)
+        print(f"  {row['status']}" + (f": {row['error']}" if "error" in row else ""), flush=True)
         write_json(out / "summary.json", summary)
     print(f"Results: {out / 'summary.json'}")
     return 0 if all(row["status"] == "ok" for row in summary) else 1
