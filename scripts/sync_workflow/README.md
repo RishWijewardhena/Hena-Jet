@@ -83,7 +83,7 @@ Only the first three come from the device. `get_recommended_filters()` on this d
 
 The remaining seven device filters stay off deliberately. `HoleFillingFilter` invents depth where the sensor measured none, `DecimationFilter` reduces resolution, and `SpatialFastFilter` and `SpatialModerateFilter` would stack redundant smoothing on top of `SpatialAdvancedFilter`. None belong in a chain feeding metric reconstruction.
 
-Each motor angle now captures 15 fresh RGB-D frames by default. A fused pixel must have at least three valid temporal samples (`--min-valid-samples 3`). The `--min-confidence` option is parsed, validated, and recorded in metadata, but the current capture path does not yet obtain a confidence frame or apply this gate. Keep it at its default `0` until confidence-frame wiring is completed.
+Each motor angle now captures 6 fresh RGB-D frames by default. A fused pixel must have at least three valid temporal samples (`--min-valid-samples 3`). The `--min-confidence` option is parsed, validated, and recorded in metadata, but the current capture path does not yet obtain a confidence frame or apply this gate. Keep it at its default `0` until confidence-frame wiring is completed.
 
 Capture logs print the valid-depth fill rate for every fused angle. After reconstructing each capture, run the quality report and compare its JSON with the preceding run:
 
@@ -205,7 +205,7 @@ Unless `--no-home` is used, the motor performs this sequence:
 6. Move Y to its staging position with `G1 Y40 F500`.
 7. Move to the final scan staging position with `G1 X200 Y0 F500`.
 
-After homing, `main_scan.py` sends `G90` to explicitly select absolute positioning. It moves to each requested X station only while Y is at zero. Every `move_x()` and `move_y()` command is followed by `M400`, and the program waits 0.5 seconds after movement before capture.
+After homing, `main_scan.py` sends `G90` to explicitly select absolute positioning. It moves to each requested X station only while Y is at zero. Every `move_x()` and `move_y()` command is followed by `M400`, and the program uses Y feedrate 800 and waits 0.1 seconds after each Y movement before capture.
 
 For a 10-degree step, capture order is:
 
@@ -223,7 +223,7 @@ X positions are absolute Marlin millimetres. Reconstruction treats the first sta
 
 ### 4. Capture and fuse an RGB-D burst
 
-At each angle, the camera records `--frames-per-angle` fresh aligned frames; the default is 15. For every depth frame, the code:
+At each angle, the camera records `--frames-per-angle` fresh aligned frames; the default is 6. For every depth frame, the code:
 
 1. converts SDK depth values to metres;
 2. rejects zero, invalid, and non-finite samples;
@@ -231,7 +231,7 @@ At each angle, the camera records `--frames-per-angle` fresh aligned frames; the
 4. computes the median only from remaining valid samples;
 5. keeps a fused pixel only when at least `--min-valid-samples` samples were valid, with a default of three.
 
-Filtering before the median prevents invalid zeros from pulling fused depth toward the camera. Requiring three samples suppresses intermittent depth speckle while the 15-frame burst leaves enough temporal observations for stable surfaces. The latest aligned color frame supplies RGB.
+Filtering before the median prevents invalid zeros from pulling fused depth toward the camera. Requiring three samples suppresses intermittent depth speckle within the six-frame burst. The latest aligned color frame supplies RGB.
 
 The default interval is 0.02-0.25 m. Keeping the maximum close to the working distance stops much of the room and scanner structure from entering the cloud.
 
@@ -259,7 +259,7 @@ Metadata is updated during scanning, so completed angles remain recorded if a la
     "height": 530,
     "fps": 30,
     "disparity": 256,
-    "frames_per_angle": 15,
+    "frames_per_angle": 6,
     "min_valid_samples": 3,
     "min_confidence": 0,
     "depth_range_m": [0.02, 0.25]
@@ -305,7 +305,7 @@ With `--reconstruct`, the program closes the hardware after capture and launches
 | `--x-positions-mm` | One or more absolute X scan stations in millimetres; default `200`. |
 | `--orbit-axis X Y Z` | Legacy option; measured calibration axis takes precedence. |
 | `--registration-mode` | `motor` or `guarded-icp`; default `guarded-icp`. Full-pose reconstruction is launched separately. |
-| `--frames-per-angle` | Fresh frames fused per angle; default 15. |
+| `--frames-per-angle` | Fresh frames fused per angle; default 6. |
 | `--min-valid-samples` | Valid temporal depth samples required per fused pixel; default 3. |
 | `--min-confidence` | Reserved confidence threshold recorded in metadata; keep at 0 because confidence frames are not yet wired into capture. |
 | `--depth-min-m`, `--depth-max-m` | Accepted depth interval; defaults 0.02 and 0.25 m. |

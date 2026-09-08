@@ -109,8 +109,8 @@ flowchart TD
 
     PLAN --> XLOOP{for each X station}
     XLOOP --> YLOOP{for each Y angle}
-    YLOOP -->|"G1 Y.. F500 + M400"| SETTLE[blocking move]
-    SETTLE --> BURST["capture_fused_rgbd<br/>15 fresh RGB-D frames"]
+    YLOOP -->|"G1 Y.. F800 + M400"| SETTLE[blocking move + 0.1 s settling]
+    SETTLE --> BURST["capture_fused_rgbd<br/>6 fresh RGB-D frames"]
     BURST --> FUSE["per-pixel median<br/>needs &gt;= 3 valid samples"]
     FUSE --> PROJ["backproject_to_points<br/>float metres, RGB intrinsics"]
     PROJ --> SAVE["frame_s&lt;st&gt;_x&lt;X&gt;_y&lt;angle&gt;.ply"]

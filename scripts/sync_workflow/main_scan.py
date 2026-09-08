@@ -63,7 +63,7 @@ def parse_args(argv=None):
             "whose ICP correction exceeds the pose guards"
         ),
     )
-    parser.add_argument("--frames-per-angle", type=int, default=15,
+    parser.add_argument("--frames-per-angle", type=int, default=6,
                         help="Fresh RGB-D frames to median-combine at each angle")
     parser.add_argument("--min-valid-samples", type=int, default=3,
                         help="Valid temporal samples a pixel needs to survive fusion")
@@ -458,10 +458,10 @@ def main():
             should_capture = step["capture"]
 
             logger.info("Moving Y to %.1f degrees...", angle)
-            motor.move_y(angle, feedrate=500)
+            motor.move_y(angle, feedrate=800)
 
             # Brief pause to let camera settle after movement
-            time.sleep(0.5)
+            time.sleep(0.1)
 
             if should_capture:
                 logger.info("Capturing frame at %.1f degrees...", angle)
