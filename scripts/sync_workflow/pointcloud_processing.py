@@ -6,13 +6,65 @@ import concurrent.futures
 import logging
 import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import numpy as np
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CylinderCrop:
+    """Cylindrical crop around the orbit axis, in reference-frame coordinates.
+
+    The scanner encloses the object in a ring at roughly the orbit radius, so a
+    cube centred on the pivot cannot separate object from enclosure: shrinking
+    it enough to drop the ring also clips the object along the axis. A cylinder
+    cuts radially and axially independently.
+    """
+
+    center: tuple[float, float, float]
+    axis: tuple[float, float, float]
+    radius_m: float
+    axial_half_length_m: float
+
+    def __post_init__(self) -> None:
+        center = np.asarray(self.center, dtype=float)
+        axis = np.asarray(self.axis, dtype=float)
+        if center.shape != (3,) or not np.isfinite(center).all():
+            raise ValueError("Cylinder crop center must be three finite values")
+        if axis.shape != (3,) or not np.isfinite(axis).all():
+            raise ValueError("Cylinder crop axis must be three finite values")
+        if not np.isfinite(np.linalg.norm(axis)) or np.linalg.norm(axis) <= 0.0:
+            raise ValueError("Cylinder crop axis must have non-zero length")
+        if not np.isfinite(self.radius_m) or self.radius_m <= 0.0:
+            raise ValueError("Cylinder crop radius must be finite and positive")
+        if (
+            not np.isfinite(self.axial_half_length_m)
+            or self.axial_half_length_m <= 0.0
+        ):
+            raise ValueError(
+                "Cylinder crop axial half-length must be finite and positive"
+            )
+
+    def mask(self, points: np.ndarray) -> np.ndarray:
+        """Return a boolean mask of the points inside the cylinder."""
+        points = np.asarray(points, dtype=float)
+        if points.size == 0:
+            return np.zeros(len(points), dtype=bool)
+        center = np.asarray(self.center, dtype=float)
+        axis = np.asarray(self.axis, dtype=float)
+        axis = axis / np.linalg.norm(axis)
+        offsets = points - center
+        along = offsets @ axis
+        radial = np.linalg.norm(offsets - np.outer(along, axis), axis=1)
+        return (radial <= self.radius_m) & (np.abs(along) <= self.axial_half_length_m)
+
+
+CropRegion = Union[tuple[float, float, float, float, float, float], CylinderCrop]
 
 
 def _geometry_libraries():
@@ -61,7 +113,7 @@ def _transform_one_cloud(
     transformed_dir: Path,
     matrix_dir: Path,
     *,
-    crop_bounds: Optional[tuple[float, float, float, float, float, float]],
+    crop_bounds: Optional[CropRegion],
     skip_sor: bool,
     sor_neighbors: int,
     sor_sigma: float,
@@ -76,7 +128,10 @@ def _transform_one_cloud(
     input_points = len(cloud.points)
     cloud.transform(pose)
 
-    if crop_bounds is not None:
+    if isinstance(crop_bounds, CylinderCrop):
+        kept = np.flatnonzero(crop_bounds.mask(np.asarray(cloud.points)))
+        cloud = cloud.select_by_index(kept.tolist())
+    elif crop_bounds is not None:
         bounds = np.asarray(crop_bounds, dtype=float)
         if bounds.shape != (6,) or not np.isfinite(bounds).all():
             raise ValueError("crop_bounds must contain six finite values")
@@ -126,10 +181,8 @@ def transform_and_clean_clouds(
     transformed_dir: Path,
     matrix_dir: Path,
     *,
-    crop_bounds: Optional[tuple[float, float, float, float, float, float]],
-    crop_bounds_by_cloud: Optional[
-        Sequence[Optional[tuple[float, float, float, float, float, float]]]
-    ] = None,
+    crop_bounds: Optional[CropRegion],
+    crop_bounds_by_cloud: Optional[Sequence[Optional[CropRegion]]] = None,
     skip_sor: bool,
     sor_neighbors: int,
     sor_sigma: float,
@@ -263,6 +316,36 @@ def _validate_final_artifact(o3d, trimesh, output_path: Path) -> dict:
     }
 
 
+def largest_component_indices(
+    o3d,
+    cloud,
+    *,
+    eps_m: float,
+    min_points: int,
+    min_fraction: float,
+) -> np.ndarray:
+    """Indices of connected components at least ``min_fraction`` of the largest.
+
+    Statistical outlier removal judges a point by its own neighbourhood, so a
+    compact blob of noise floating clear of the object looks entirely healthy
+    from the inside and survives. Connectivity separates them: the object is one
+    body, and detached debris is not attached to it at any distance.
+
+    Points DBSCAN assigns to no cluster belong to no component and are dropped
+    with the undersized ones. A ``min_fraction`` at or below zero disables the
+    filter and keeps every point.
+    """
+    if min_fraction <= 0.0:
+        return np.arange(len(cloud.points))
+    labels = np.asarray(cloud.cluster_dbscan(eps=eps_m, min_points=min_points))
+    if labels.size == 0 or labels.max() < 0:
+        return np.arange(len(cloud.points))
+    counts = np.bincount(labels[labels >= 0])
+    threshold = max(1.0, float(counts.max()) * float(min_fraction))
+    keep_labels = {int(label) for label, n in enumerate(counts) if n >= threshold}
+    return np.flatnonzero(np.isin(labels, list(keep_labels)))
+
+
 def merge_and_finalize_clouds(
     transformed_paths: Sequence[Path],
     output_path: Path,
@@ -275,6 +358,9 @@ def merge_and_finalize_clouds(
     normal_radius_m: float,
     normal_max_neighbors: int,
     normal_mst_neighbors: int,
+    component_eps_m: float = 0.003,
+    component_min_points: int = 10,
+    component_min_fraction: float = 0.01,
 ) -> dict:
     """Merge transformed scans, clean them, orient normals, and validate PLY."""
     o3d, trimesh = _geometry_libraries()
@@ -311,6 +397,19 @@ def merge_and_finalize_clouds(
             nb_neighbors=sor_neighbors,
             std_ratio=sor_sigma,
         )
+    sor_filtered_points = len(merged.points)
+
+    if component_min_fraction > 0.0 and len(merged.points) > component_min_points:
+        keep = largest_component_indices(
+            o3d,
+            merged,
+            eps_m=component_eps_m,
+            min_points=component_min_points,
+            min_fraction=component_min_fraction,
+        )
+        if len(keep) >= 3:
+            merged = merged.select_by_index(keep.tolist())
+
     if len(merged.points) < 3:
         raise RuntimeError("Final cleanup left too few points to estimate normals")
     filtered_points = len(merged.points)
@@ -345,6 +444,8 @@ def merge_and_finalize_clouds(
         "voxel_points": voxel_points,
         "spatially_separated_points": spatially_separated_points,
         "deduplicated_points": deduplicated_points,
+        "sor_filtered_points": sor_filtered_points,
+        "component_filtered_points": filtered_points,
         "filtered_points": filtered_points,
         "elapsed_seconds": time.perf_counter() - started,
         **validation,

@@ -13,6 +13,9 @@ DEFAULT_MARKER_SIZES_M = (0.018, 0.014, 0.018, 0.014)
 DEFAULT_PROFILE_WIDTH_M = 0.040
 DEFAULT_PROFILE_DEPTH_M = 0.020
 DEFAULT_CARRIER_OFFSET_M = 0.0001
+DEFAULT_MIN_IPPE_ERROR_RATIO = 2.0
+DEFAULT_MAX_REPROJECTION_ERROR_PX = 3.0
+DEFAULT_MAX_SINGLE_MARKER_REPROJECTION_ERROR_PX = 1.0
 DEFAULT_AXIAL_OFFSETS_M = (0.0, 0.0, 0.0, 0.0)
 
 
@@ -179,19 +182,48 @@ def orbit_geometry_in_camera_frame(
 def classify_pose(
     pose: dict[str, Any],
     *,
-    max_reprojection_error_px: float,
-    min_markers: int = 2,
+    max_reprojection_error_px: float = DEFAULT_MAX_REPROJECTION_ERROR_PX,
+    min_markers: int = 1,
+    min_ippe_error_ratio: float = DEFAULT_MIN_IPPE_ERROR_RATIO,
+    max_single_marker_reprojection_error_px: float = (
+        DEFAULT_MAX_SINGLE_MARKER_REPROJECTION_ERROR_PX
+    ),
 ) -> tuple[bool, str | None]:
-    """Decide whether a solved profile pose may feed the orbit-radius fit."""
+    """Decide whether a solved profile pose may feed the orbit-radius fit.
+
+    Reprojection error means different things on the two solver paths, so it
+    cannot share a threshold. A single marker gives four coplanar points and
+    IPPE solves those essentially exactly, so the error is near zero however
+    wrong the pose is: in outputs/radius_x100_rerun the 145 single-marker poses
+    had a median error of 0.124 px while the 90 better-conditioned two-marker
+    poses had a median of 1.050 px. A shared 1.5 px limit therefore admitted
+    every single-marker pose and rejected 22 two-marker poses -- the only
+    measurements the number could actually judge.
+    """
     if not pose.get("ok"):
         return False, "no usable mapped marker pose"
     error = pose.get("reprojection_error_px")
     if error is None or not np.isfinite(error):
         return False, "non-finite reprojection error"
-    if len(pose.get("used_ids") or []) < min_markers:
+    marker_count = len(pose.get("used_ids") or [])
+    if marker_count < min_markers:
         return False, f"fewer than {min_markers} mapped markers in view"
-    if error > max_reprojection_error_px:
-        return False, f"reprojection error exceeds {max_reprojection_error_px:.2f}px"
+    limit = (
+        max_reprojection_error_px
+        if marker_count >= 2
+        else max_single_marker_reprojection_error_px
+    )
+    if error > limit:
+        return False, (
+            f"reprojection error exceeds {limit:.2f}px "
+            f"for a {marker_count}-marker pose"
+        )
+    ratio = pose.get("ippe_error_ratio")
+    if ratio is not None and np.isfinite(ratio) and ratio < min_ippe_error_ratio:
+        return False, (
+            f"ambiguous single-marker pose: the rejected IPPE solution fits "
+            f"{ratio:.2f}x as well, below {min_ippe_error_ratio:.2f}x"
+        )
     return True, None
 
 
@@ -199,11 +231,18 @@ def build_fit_samples(
     angle_results: list[dict[str, Any]],
     *,
     use_all_frames: bool = True,
+    prefer_multi_marker: bool = True,
 ) -> list[dict[str, Any]]:
     """Flatten accepted camera centers into circle-fit samples.
 
     With ``use_all_frames`` every accepted per-frame camera center becomes a
     sample; otherwise a single per-angle median sample is emitted.
+
+    With ``prefer_multi_marker`` an angle that saw two or more markers in any
+    accepted frame contributes only those frames, and its single-marker frames
+    are dropped. A single marker resolves its out-of-plane pose far more weakly
+    than two, so where both exist the weaker measurement only adds bias; where
+    only one exists it still supplies the angular coverage the fit needs.
     """
     samples: list[dict[str, Any]] = []
     for angle_result in angle_results:
@@ -211,7 +250,18 @@ def build_fit_samples(
             continue
         angle_deg = float(angle_result["angle_deg"])
         if use_all_frames:
-            for frame in angle_result.get("frames", []):
+            accepted = [
+                frame for frame in angle_result.get("frames", [])
+                if frame.get("accepted")
+            ]
+            if prefer_multi_marker:
+                multi = [
+                    frame for frame in accepted
+                    if len(frame.get("used_ids") or []) >= 2
+                ]
+                if multi:
+                    accepted = multi
+            for frame in accepted:
                 if not frame.get("accepted"):
                     continue
                 samples.append(
@@ -353,16 +403,43 @@ def bootstrap_radius_ci(
     confidence: float = 0.95,
     seed: int = 0,
     mad_threshold: float = 3.5,
+    cluster_labels: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
-    """Bootstrap a confidence interval for the fitted orbit radius."""
+    """Bootstrap a confidence interval for the fitted orbit radius.
+
+    ``cluster_labels`` groups observations that are not independent, normally
+    one label per motor angle, and makes the resampling draw whole clusters.
+    The frames captured at one angle share that angle's pose error, so treating
+    them as independent draws inflates the apparent sample size by the burst
+    length and reports a radius far more precise than it is. Measured over
+    three runs of the same rig, per-frame resampling claimed a 0.165 mm mean
+    standard deviation while the radii actually spread with a 0.315 mm standard
+    deviation, understating the real figure by 1.9x; resampling by angle gave
+    0.466 mm, erring toward caution instead.
+    """
     points = np.asarray(camera_centers_m, dtype=np.float64)
     if points.ndim != 2 or points.shape[1] != 3 or len(points) < 3:
         raise ValueError("At least three 3D camera centers are required")
 
+    groups: list[np.ndarray]
+    if cluster_labels is None:
+        groups = [np.array([index]) for index in range(len(points))]
+    else:
+        labels = list(cluster_labels)
+        if len(labels) != len(points):
+            raise ValueError("cluster_labels must have one entry per camera center")
+        indices: dict[Any, list[int]] = {}
+        for index, label in enumerate(labels):
+            indices.setdefault(label, []).append(index)
+        groups = [np.asarray(value) for value in indices.values()]
+    if len(groups) < 3:
+        raise ValueError("At least three independent clusters are required")
+
     rng = np.random.default_rng(seed)
     radii: list[float] = []
     for _ in range(n_resamples):
-        sample = points[rng.integers(0, len(points), size=len(points))]
+        picked = rng.integers(0, len(groups), size=len(groups))
+        sample = points[np.concatenate([groups[index] for index in picked])]
         try:
             radii.append(
                 fit_orbit_circle(sample, mad_threshold=mad_threshold)["radius_m"]
@@ -403,6 +480,33 @@ def has_sufficient_angular_coverage(
     return largest_gap <= max_gap_deg + 1e-9
 
 
+DEFAULT_MAX_RADIUS_STD_M = 0.00025
+
+
+def angle_median_residuals(
+    samples: list[dict[str, Any]],
+    residuals_m: np.ndarray,
+) -> dict[float, float]:
+    """Median circle-fit residual per motor angle, for diagnostics only.
+
+    This is reported, never gated on. Excluding high-residual angles was tried
+    and measurably hurt: across two runs of the same rig it moved the fitted
+    radii apart by 0.22-0.32 mm at every threshold, against 0.058 mm when
+    nothing was excluded, because the offending angles differ from run to run
+    and each fit then loses different angular support. The worst angle also
+    barely biases the result -- dropping it alone moved one run by 0.003 mm.
+    Large values here mark views worth inspecting, not samples worth deleting.
+    """
+    grouped: dict[float, list[float]] = {}
+    for sample, residual in zip(samples, np.asarray(residuals_m, dtype=float)):
+        grouped.setdefault(round(float(sample["angle_deg"]), 6), []).append(
+            float(residual)
+        )
+    return {
+        angle: float(np.median(values)) for angle, values in grouped.items()
+    }
+
+
 def evaluate_trajectory(
     samples: list[dict[str, Any]],
     *,
@@ -410,8 +514,20 @@ def evaluate_trajectory(
     max_gap_deg: float = 90.0,
     mad_threshold: float = 3.5,
     bootstrap_resamples: int = 250,
+    max_radius_std_m: float = DEFAULT_MAX_RADIUS_STD_M,
 ) -> dict[str, Any]:
-    """Fit RGB/depth trajectories and decide whether a radius is publishable."""
+    """Fit RGB/depth trajectories and decide whether a radius is publishable.
+
+    What makes a radius publishable is the uncertainty of the fitted radius,
+    not the scatter of the observations behind it. Single-marker ArUco poses
+    are noisy but unbiased, so hundreds of them average to a stable radius: a
+    3.2 mm observation RMSE over 179 inliers gives a 0.24 mm standard error,
+    and two independent runs agreed to 0.031 mm. Gating the per-observation
+    residual would reject that perfectly usable result.
+
+    So one gate remains: the bootstrap radius spread must be small enough to
+    trust. Per-angle median residuals are reported alongside it as diagnostics.
+    """
     reasons: list[str] = []
     if len(samples) < 3:
         return {
@@ -440,6 +556,7 @@ def evaluate_trajectory(
             "depth_fit": None,
         }
 
+    angle_labels = [round(float(sample["angle_deg"]), 6) for sample in samples]
     for fit, fit_points in ((rgb_fit, rgb_points), (depth_fit, depth_points)):
         try:
             fit.update(
@@ -447,6 +564,7 @@ def evaluate_trajectory(
                     fit_points,
                     n_resamples=bootstrap_resamples,
                     mad_threshold=mad_threshold,
+                    cluster_labels=angle_labels,
                 )
             )
         except (ValueError, np.linalg.LinAlgError):
@@ -466,6 +584,16 @@ def evaluate_trajectory(
         if is_inlier
     ]
 
+    for name, fit in (("RGB", rgb_fit), ("depth", depth_fit)):
+        radius_std_m = fit.get("radius_std_m")
+        if radius_std_m is None:
+            reasons.append(f"{name} radius uncertainty could not be estimated")
+        elif radius_std_m > max_radius_std_m:
+            reasons.append(
+                f"{name} radius uncertainty {radius_std_m * 1000.0:.4f} mm exceeds "
+                f"{max_radius_std_m * 1000.0:.4f} mm"
+            )
+
     if len({round(angle % 360.0, 6) for angle in inlier_angles}) < min_unique_angles:
         reasons.append(f"fewer than {min_unique_angles} unique inlier angles")
     if not has_sufficient_angular_coverage(
@@ -484,6 +612,14 @@ def evaluate_trajectory(
         "recommended_radius_m": depth_fit["radius_m"] if valid else None,
         "rgb_fit": rgb_fit,
         "depth_fit": depth_fit,
+        "angle_median_residual_m": {
+            str(angle): value
+            for angle, value in sorted(
+                angle_median_residuals(
+                    samples, np.asarray(depth_fit["residuals_m"], dtype=float)
+                ).items()
+            )
+        },
     }
 
 
@@ -687,9 +823,20 @@ def solve_profile_pose(
     if not candidates:
         return empty_result
 
-    error, world_to_camera, rvec, tvec, method = min(
-        candidates, key=lambda item: item[0]
-    )
+    candidates.sort(key=lambda item: item[0])
+    error, world_to_camera, rvec, tvec, method = candidates[0]
+    # A square marker admits two IPPE poses that mirror each other about the
+    # image plane. When both survive cheirality and the outward-normal test and
+    # fit nearly as well, choosing the lower reprojection error is a coin flip
+    # between poses that differ mostly out of plane, which is the one direction
+    # the orbit fit depends on. Report how much better the winner actually was
+    # so an ambiguous pose can be rejected rather than silently believed.
+    ippe_error_ratio = None
+    if len(candidates) > 1:
+        runner_up = candidates[1][0]
+        ippe_error_ratio = (
+            float("inf") if error <= 0.0 else float(runner_up / error)
+        )
     return {
         "ok": True,
         "method": method,
@@ -698,4 +845,5 @@ def solve_profile_pose(
         "rvec": rvec,
         "tvec": tvec,
         "reprojection_error_px": error,
+        "ippe_error_ratio": ippe_error_ratio,
     }

@@ -34,6 +34,8 @@ from calculating_radius.radius_calibration import (  # noqa: E402
     solve_profile_pose,
 )
 from calculating_radius.generate_radius_markers import generate_marker_kit  # noqa: E402
+from calculating_radius import radius_calibration  # noqa: E402
+from calculating_radius import test_radius  # noqa: E402
 
 
 class DetectorParameterTests(unittest.TestCase):
@@ -87,7 +89,7 @@ class ClassifyPoseTests(unittest.TestCase):
         )
 
         self.assertFalse(accepted)
-        self.assertEqual(reason, "reprojection error exceeds 1.50px")
+        self.assertIn("reprojection error exceeds 1.50px", reason)
 
     def test_rejects_failed_pose_and_non_finite_error(self):
         failed = {"ok": False, "used_ids": [], "reprojection_error_px": None}
@@ -640,3 +642,288 @@ class ProfilePoseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RadiusUncertaintyGateTests(unittest.TestCase):
+    """What makes a radius publishable is its uncertainty, not its scatter."""
+
+    @staticmethod
+    def _orbit_samples(radius_m: float, noise_m: float = 0.0, count: int = 24, seed=3):
+        rng = np.random.default_rng(seed)
+        samples = []
+        for angle in np.linspace(0.0, 360.0, count, endpoint=False):
+            theta = np.radians(angle)
+            r = radius_m + (rng.normal(scale=noise_m) if noise_m else 0.0)
+            centre = [0.0, r * np.cos(theta), r * np.sin(theta)]
+            samples.append({
+                "angle_deg": float(angle),
+                "rgb_camera_center_m": centre,
+                "depth_camera_center_m": list(centre),
+            })
+        return samples
+
+    def test_a_clean_orbit_passes(self):
+        result = radius_calibration.evaluate_trajectory(
+            self._orbit_samples(0.1427), bootstrap_resamples=64,
+        )
+        self.assertEqual(result["quality_status"], "valid", result["quality_reasons"])
+        self.assertAlmostEqual(result["recommended_radius_m"], 0.1427, places=6)
+
+    def test_noisy_but_unbiased_observations_still_pass(self):
+        """3 mm of random scatter over many samples is a usable calibration."""
+        result = radius_calibration.evaluate_trajectory(
+            self._orbit_samples(0.1427, noise_m=0.003, count=200, seed=5),
+            bootstrap_resamples=120,
+        )
+        self.assertEqual(result["quality_status"], "valid", result["quality_reasons"])
+        self.assertAlmostEqual(result["recommended_radius_m"], 0.1427, delta=0.0005)
+
+    def test_too_few_noisy_samples_are_rejected(self):
+        """The same scatter over too few samples leaves the radius uncertain."""
+        result = radius_calibration.evaluate_trajectory(
+            self._orbit_samples(0.1427, noise_m=0.003, count=12, seed=9),
+            bootstrap_resamples=120,
+        )
+        self.assertEqual(result["quality_status"], "invalid")
+        self.assertTrue(
+            any("radius uncertainty" in r for r in result["quality_reasons"]),
+            result["quality_reasons"],
+        )
+        self.assertIsNone(result["recommended_radius_m"])
+
+    def test_the_threshold_is_configurable(self):
+        samples = self._orbit_samples(0.1427, noise_m=0.003, count=12, seed=9)
+        relaxed = radius_calibration.evaluate_trajectory(
+            samples, bootstrap_resamples=120, max_radius_std_m=0.01,
+        )
+        self.assertEqual(relaxed["quality_status"], "valid", relaxed["quality_reasons"])
+
+    def test_per_angle_medians_are_reported_but_not_gated(self):
+        samples = self._orbit_samples(0.1427)
+        # Push one angle far out; it must be reported, and must not fail the run.
+        samples[3]["depth_camera_center_m"][1] += 0.02
+        samples[3]["rgb_camera_center_m"][1] += 0.02
+        result = radius_calibration.evaluate_trajectory(
+            samples, bootstrap_resamples=64,
+        )
+        medians = result["angle_median_residual_m"]
+        self.assertEqual(len(medians), len(samples))
+        self.assertGreater(max(medians.values()), 0.005)
+
+
+class IppeAmbiguityGateTests(unittest.TestCase):
+    """A square marker admits two IPPE poses; near-equal ones must be rejected."""
+
+    BASE = {
+        "ok": True,
+        "used_ids": [1],
+        "reprojection_error_px": 0.4,
+    }
+
+    def _classify(self, **overrides):
+        pose = dict(self.BASE)
+        pose.update(overrides)
+        return radius_calibration.classify_pose(
+            pose, max_reprojection_error_px=1.5,
+        )
+
+    def test_a_decisive_solution_is_accepted(self):
+        accepted, reason = self._classify(ippe_error_ratio=6.0)
+        self.assertTrue(accepted, reason)
+        self.assertIsNone(reason)
+
+    def test_an_ambiguous_solution_is_rejected(self):
+        accepted, reason = self._classify(ippe_error_ratio=1.05)
+        self.assertFalse(accepted)
+        self.assertIn("ambiguous single-marker pose", reason)
+
+    def test_a_lone_solution_is_not_penalised(self):
+        """One surviving IPPE solution carries no ratio and stays acceptable."""
+        accepted, reason = self._classify(ippe_error_ratio=None)
+        self.assertTrue(accepted, reason)
+
+    def test_the_ratio_threshold_is_configurable(self):
+        pose = dict(self.BASE, ippe_error_ratio=1.5)
+        self.assertFalse(
+            radius_calibration.classify_pose(
+                pose, max_reprojection_error_px=1.5, min_ippe_error_ratio=2.0,
+            )[0]
+        )
+        self.assertTrue(
+            radius_calibration.classify_pose(
+                pose, max_reprojection_error_px=1.5, min_ippe_error_ratio=1.2,
+            )[0]
+        )
+
+    def test_a_single_marker_is_allowed_by_default(self):
+        """The four-face profile cannot show two markers at most angles."""
+        accepted, reason = self._classify(ippe_error_ratio=6.0)
+        self.assertTrue(accepted, reason)
+
+
+class TestRadiusArgumentsTests(unittest.TestCase):
+    """Every gate validate_args reads must exist on the parser."""
+
+    def test_defaults_parse_and_validate(self):
+        args = test_radius.parse_args([])
+        self.assertEqual(args.min_markers_per_pose, 1)
+        self.assertEqual(
+            args.min_ippe_error_ratio,
+            radius_calibration.DEFAULT_MIN_IPPE_ERROR_RATIO,
+        )
+        self.assertEqual(
+            args.max_radius_std_mm,
+            radius_calibration.DEFAULT_MAX_RADIUS_STD_M * 1000.0,
+        )
+        test_radius.validate_args(args)
+
+    def test_the_ambiguity_ratio_is_overridable_and_bounded(self):
+        args = test_radius.parse_args(["--min-ippe-error-ratio", "1.5"])
+        self.assertEqual(args.min_ippe_error_ratio, 1.5)
+        test_radius.validate_args(args)
+
+        with self.assertRaises(ValueError):
+            test_radius.validate_args(
+                test_radius.parse_args(["--min-ippe-error-ratio", "0.5"])
+            )
+
+    def test_the_radius_gate_is_overridable_and_bounded(self):
+        args = test_radius.parse_args(["--max-radius-std-mm", "0.4"])
+        self.assertEqual(args.max_radius_std_mm, 0.4)
+        test_radius.validate_args(args)
+        with self.assertRaises(ValueError):
+            test_radius.validate_args(
+                test_radius.parse_args(["--max-radius-std-mm", "0"])
+            )
+
+
+class MarkerCountAwareThresholdTests(unittest.TestCase):
+    """Reprojection error means different things on the two solver paths."""
+
+    @staticmethod
+    def _pose(used_ids, error_px):
+        return {"ok": True, "used_ids": list(used_ids), "reprojection_error_px": error_px}
+
+    def test_a_single_marker_pose_uses_the_tighter_limit(self):
+        accepted, reason = radius_calibration.classify_pose(self._pose([0], 1.2))
+        self.assertFalse(accepted)
+        self.assertIn("1-marker pose", reason)
+
+    def test_a_two_marker_pose_survives_the_same_error(self):
+        """1.05 px is the median of the well-conditioned poses, not a defect."""
+        accepted, reason = radius_calibration.classify_pose(self._pose([0, 1], 1.2))
+        self.assertTrue(accepted, reason)
+
+    def test_a_two_marker_pose_is_still_bounded(self):
+        accepted, reason = radius_calibration.classify_pose(self._pose([0, 1], 4.0))
+        self.assertFalse(accepted)
+        self.assertIn("2-marker pose", reason)
+
+    def test_a_near_zero_single_marker_error_is_not_evidence_of_quality(self):
+        """An exact 4-point IPPE fit passes, so other gates must do the work."""
+        accepted, _ = radius_calibration.classify_pose(self._pose([0], 0.03))
+        self.assertTrue(accepted)
+        rejected, reason = radius_calibration.classify_pose(
+            dict(self._pose([0], 0.03), ippe_error_ratio=1.1)
+        )
+        self.assertFalse(rejected)
+        self.assertIn("ambiguous", reason)
+
+
+class PreferMultiMarkerTests(unittest.TestCase):
+    @staticmethod
+    def _angle(*marker_counts):
+        return {
+            "angle_deg": 30.0,
+            "pose_valid": True,
+            "frames": [
+                {
+                    "accepted": True,
+                    "used_ids": list(range(count)),
+                    "rgb_camera_center_m": [float(count), 0.0, 0.0],
+                    "depth_camera_center_m": [float(count), 0.0, 0.0],
+                }
+                for count in marker_counts
+            ],
+        }
+
+    def test_single_marker_frames_are_dropped_where_two_exist(self):
+        samples = radius_calibration.build_fit_samples([self._angle(1, 2, 2)])
+        self.assertEqual(len(samples), 2)
+        self.assertTrue(
+            all(s["rgb_camera_center_m"][0] == 2.0 for s in samples), samples,
+        )
+
+    def test_single_marker_frames_survive_where_they_are_all_there_is(self):
+        samples = radius_calibration.build_fit_samples([self._angle(1, 1)])
+        self.assertEqual(len(samples), 2)
+
+    def test_the_preference_can_be_disabled(self):
+        samples = radius_calibration.build_fit_samples(
+            [self._angle(1, 2, 2)], prefer_multi_marker=False,
+        )
+        self.assertEqual(len(samples), 3)
+
+
+class ClusterBootstrapTests(unittest.TestCase):
+    """Frames from one angle are correlated and must resample as a unit."""
+
+    @staticmethod
+    def _burst_orbit(radius_m=0.1427, angles=24, frames=10, angle_bias_m=0.004, seed=1):
+        """An orbit whose error is per-angle, not per-frame, as the rig's is."""
+        rng = np.random.default_rng(seed)
+        points, labels = [], []
+        for angle in np.linspace(0.0, 360.0, angles, endpoint=False):
+            theta = np.radians(angle)
+            # One systematic offset for the whole burst, tiny scatter within it.
+            biased = radius_m + rng.normal(scale=angle_bias_m)
+            for _ in range(frames):
+                r = biased + rng.normal(scale=1e-5)
+                points.append([0.0, r * np.cos(theta), r * np.sin(theta)])
+                labels.append(round(float(angle), 6))
+        return np.asarray(points), labels
+
+    def test_per_frame_resampling_understates_the_spread(self):
+        points, labels = self._burst_orbit()
+        naive = radius_calibration.bootstrap_radius_ci(points, n_resamples=200)
+        clustered = radius_calibration.bootstrap_radius_ci(
+            points, n_resamples=200, cluster_labels=labels,
+        )
+        self.assertLess(naive["radius_std_m"], clustered["radius_std_m"])
+        self.assertGreater(
+            clustered["radius_std_m"] / naive["radius_std_m"], 1.5,
+        )
+
+    def test_labels_must_match_the_points(self):
+        points, labels = self._burst_orbit(angles=4, frames=2)
+        with self.assertRaises(ValueError):
+            radius_calibration.bootstrap_radius_ci(
+                points, cluster_labels=labels[:-1],
+            )
+
+    def test_too_few_clusters_is_an_error(self):
+        points, _ = self._burst_orbit(angles=2, frames=10)
+        with self.assertRaises(ValueError):
+            radius_calibration.bootstrap_radius_ci(
+                points, cluster_labels=[0] * 10 + [1] * 10,
+            )
+
+    def test_evaluate_trajectory_clusters_by_angle(self):
+        """Bursts at one angle must not buy the fit false precision."""
+        points, labels = self._burst_orbit(angles=12, frames=10)
+        samples = [
+            {
+                "angle_deg": label,
+                "rgb_camera_center_m": list(point),
+                "depth_camera_center_m": list(point),
+            }
+            for point, label in zip(points, labels)
+        ]
+        result = radius_calibration.evaluate_trajectory(
+            samples, bootstrap_resamples=200,
+        )
+        self.assertEqual(result["quality_status"], "invalid")
+        self.assertTrue(
+            any("radius uncertainty" in r for r in result["quality_reasons"]),
+            result["quality_reasons"],
+        )

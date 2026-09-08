@@ -7,6 +7,8 @@ This workflow captures RGB-D point clouds while the camera moves around a statio
 
 ## End-to-end flow
 
+[WORKFLOW.md](WORKFLOW.md) charts the same pipeline in more detail: the calibration gates, the depth filter chain, the four reconstruction stages, and which measurements are internally consistent versus traceable.
+
 ```text
 main_scan.py arguments
         |
@@ -30,7 +32,6 @@ merged_cloud.ply + pose matrices + registration_diagnostics.json
 
 The reconstruction is anchored by known motor positions. ICP is optional and cannot make a large, unconstrained correction to the motor geometry.
 
-For mechanisms that do not follow a perfect circle, `calculating_radius/capture_orbit_pose_map.py` provides a second path. It observes the fixed ArUco profile and records the complete point-cloud-camera rotation and translation at every motor angle. Reconstruction can then use those measured poses instead of deriving poses from one radius, axis, and motor angle.
 
 ## Coordinate model and `--radius-m`
 
@@ -43,26 +44,16 @@ It is not:
 - a motor-axis coordinate;
 - a measurement from the housing or front glass unless corrected to the optical center.
 
-For `--radius-m 0.1175`, the assumed camera-to-center distance is 117.5 mm. With the default camera-coordinate orbit axis `[1, 0, 0]`, the default pivot is `[0, 0, 0.1175]` metres. Rotating about this pivot produces both rotation and translation. At 180 degrees, the implied displacement from the starting camera frame is twice the radius: 235 mm in this example.
-
-A small radius error becomes visible across a wide scan as duplicated surfaces, thick edges, or failure to close. The value flows through the system as follows:
-
-```text
-main_scan.py --radius-m
-    -> scan_metadata.json: orbit_radius_m
-    -> reconstruct_pipeline.py --orbit-radius-m
-    -> pivot and motor pose priors
-    -> per-frame transformation matrices
-    -> merged_cloud.ply
-```
-
-When `main_scan.py --reconstruct` is used, it passes the same radius to the reconstruction subprocess. The radius affects reconstruction geometry only; it does not change motor travel.
+The rig calibration supplies the measured pivot, axis, and recommended radius.
+A radius override changes the recorded radius; it does not replace the measured
+pivot with `[0, 0, R]`. Pose priors use the measured pivot and axis.
 
 ### Motor axis versus reconstruction orbit axis
 
-The motor moves its configured physical axis. The reconstruction axis is expressed in each point cloud's camera coordinate system. The default is `[1, 0, 0]`, even if the physical motor command uses an axis named `Y`.
-
-If the reconstruction axis or sign is wrong, clouds rotate in the wrong plane or open outward instead of overlapping. Use `--orbit-axis X Y Z` when calibration shows the default is incorrect.
+The motor moves its configured physical axis. The reconstruction axis is a
+unit direction in the zero-degree point-cloud camera frame, supplied by the
+calibration. A motor command named `Y` does not imply camera Y. The legacy
+`--orbit-axis` option is accepted, but the measured axis takes precedence.
 
 ## Environment
 
@@ -78,15 +69,21 @@ Capture requires the Orbbec SDK, Open3D, and motor serial-port access. Reconstru
 
 The capture path preserves metric depth as floating-point metres from the SDK through PLY back-projection. The previous Open3D RGB-D path converted depth to unsigned 16-bit millimetres before projection, truncating every sample to the millimetre below and adding an approximately -0.5 mm systematic depth bias. `pointcloud_export.py` now back-projects the float depth directly, so that quantization is no longer part of the geometry.
 
-The Orbbec device's recommended depth post-processing chain is enabled by default and runs in this order before depth-to-color alignment:
+Five depth filters are enabled by default and run in this order before depth-to-color alignment:
 
-1. `DisparityTransform`;
-2. `SpatialAdvancedFilter`;
-3. `TemporalFilter`;
+1. `SpatialAdvancedFilter`;
+2. `TemporalFilter`;
+3. `DisparityTransform`;
 4. `NoiseRemovalFilter`;
 5. `EdgeNoiseRemovalFilter`.
 
-Each motor angle now captures 15 fresh RGB-D frames by default. A fused pixel must have at least three valid temporal samples (`--min-valid-samples 3`). The `--min-confidence` option is parsed, validated, and recorded in metadata, but the current capture path does not yet obtain a confidence frame or apply this gate. Keep it at its default `0` until confidence-frame wiring is completed.
+The spatial and temporal filters work in the disparity domain, so `DisparityTransform` converts back to depth after them, and the noise-removal filters then operate on depth. This is the Gemini 305's own recommended order.
+
+Only the first three come from the device. `get_recommended_filters()` on this device returns ten filters and includes neither `NoiseRemovalFilter` nor `EdgeNoiseRemovalFilter`, so naming them enabled nothing and reported nothing: three of the five requested filters actually ran. Both are now constructed directly from the SDK and appended to the chain, and the startup log lists what really runs.
+
+The remaining seven device filters stay off deliberately. `HoleFillingFilter` invents depth where the sensor measured none, `DecimationFilter` reduces resolution, and `SpatialFastFilter` and `SpatialModerateFilter` would stack redundant smoothing on top of `SpatialAdvancedFilter`. None belong in a chain feeding metric reconstruction.
+
+Each motor angle now captures 6 fresh RGB-D frames by default. A fused pixel must have at least three valid temporal samples (`--min-valid-samples 3`). The `--min-confidence` option is parsed, validated, and recorded in metadata, but the current capture path does not yet obtain a confidence frame or apply this gate. Keep it at its default `0` until confidence-frame wiring is completed.
 
 Capture logs print the valid-depth fill rate for every fused angle. After reconstructing each capture, run the quality report and compare its JSON with the preceding run:
 
@@ -95,6 +92,19 @@ python scripts/sync_workflow/scan_quality_report.py \
   --scan-dir outputs/<scan-directory> \
   --output outputs/<scan-directory>/quality_report.json
 ```
+
+Pass `--compare-merged` a second merged cloud of the same rigid object to add a repeatability section. It reports the residual twice: `as_reconstructed` compares the clouds where the pipeline put them and therefore carries any drift in the reconstructed frame, while `after_rigid_alignment` re-registers the pair first and isolates how reproducible the measured shape is. A large gap between the two means the shape repeats but the frame does not, which points at the orbit calibration rather than the sensor.
+
+Every metric above is internal consistency: plane-RMS, cross-view residual, repeatability and ICP fitness all measure the pipeline against itself, and all stay happy around a systematically wrong orbit radius. Only a certified artifact detects that. `sphere_bar_report.py` fits both spheres of a two-sphere ball bar in a merged cloud and compares the centre-to-centre distance with the certified length:
+
+```bash
+python scripts/sync_workflow/sphere_bar_report.py \
+  --merged outputs/<scan-directory>/reconstruction/merged_cloud.ply \
+  --certified-distance-mm <certified> --sphere-diameter-mm <certified> \
+  --output outputs/<scan-directory>/sphere_bar_report.json
+```
+
+Sphere centres are recoverable far more accurately than the point noise, because thousands of points are fitted to one known radius, so the 1.5 mm single-frame noise still resolves a sub-millimetre length error. A proportional error in the measured length is a proportional error in the calibrated radius, reported as `implied_radius_correction_ratio`.
 
 `scan_quality_report.py` measures single-frame and merged-cloud surface plane-RMS and cross-view residual grouped by angular separation; it does not currently copy the capture-time fill rates into its JSON. Together, the logged fill rate and report measurements separate capture noise from multi-view pose error: plane-RMS describes local surface thickness, while cross-view residual shows how well different viewing angles coincide.
 
@@ -166,76 +176,11 @@ For a valid run, the console prints a directly usable value:
 
 If the report says `quality_status: invalid`, do not copy a radius. Inspect the annotated images, check printed scale and placement, improve illumination, and repeat the complete orbit. The tool reports the value but deliberately does not overwrite scan metadata or reconstruction settings.
 
-## Calibrate a full pose at every angle
-
-Radius-only reconstruction assumes a perfectly circular path, a fixed look-at direction, and a known orbit axis. Use the full-pose workflow when the real mechanism has camera tilt, axis offset, wobble, or small non-circular motion.
-
-### 1. Scan only the fixed marked profile
-
-Keep the wrapped profile rigidly fixed and run:
-
-```bash
-python scripts/sync_workflow/calculating_radius/capture_orbit_pose_map.py \
-  --x-pos 150 \
-  --step-deg 10 \
-  --frames-per-angle 10 \
-  --marker-map outputs/radius_markers/profile_marker_map.json \
-  --output-dir outputs/profile_pose_calibration
-```
-
-Dry-run the motor sequence first when needed:
-
-```bash
-python scripts/sync_workflow/calculating_radius/capture_orbit_pose_map.py \
-  --x-pos 150 --step-deg 10 --dry-run
-```
-
-The workflow uses software depth-to-color alignment. Therefore, aligned depth is back-projected with RGB intrinsics and each PLY lives in the RGB camera coordinate system. This is intentional: using the original depth intrinsics on a depth-to-color aligned image changes metric X/Y scale. The pose map consequently uses the matching RGB/point-cloud camera pose.
-
-For each angle, the program solves every accepted ArUco frame, rejects translation and rotation outliers with a 3.5-MAD test, and robustly combines the surviving transforms. The important output is `orbit_pose_map.json`. It contains:
-
-- `world_to_pointcloud`: the fixed-profile coordinate system expressed in that angle's aligned point-cloud camera;
-- `camera_to_reference`: the transform applied to that angle's raw depth points;
-- `reference_angle_deg`: the depth-camera coordinate system used by the final cloud;
-- `profile_origin_in_reference_m`: the profile origin in that reference camera, used as the default crop center;
-- per-angle translation/rotation spreads and all frame-level detection diagnostics;
-- a fitted radius for diagnostics, although measured-pose reconstruction does not require it.
-
-The map is marked incomplete if any commanded angle lacks a valid pose. Do not lower the reprojection threshold to hide a bad marker map; inspect `pose_diagnostics/`, lighting, wrap flatness, and corner orientation.
-
-### 2. Capture the object with identical mechanics
-
-After pose calibration, capture the hand or object using exactly the same homing reference, X position, angular step, camera mount, and motor mechanism:
-
-```bash
-python scripts/sync_workflow/main_scan.py \
-  --x-positions-mm 150 \
-  --step-deg 10 \
-  --output-dir outputs/hand_scan_measured_poses
-```
-
-The fixed profile must not move between the calibration and object scans. The camera mount, belt/coupling, motor zero, and X station must also remain unchanged. The first implementation intentionally supports one X station; create a separate pose map for a different X position.
-
-### 3. Reconstruct with the measured poses
-
-```bash
-python scripts/sync_workflow/reconstruct_pipeline.py \
-  --input-dir outputs/hand_scan_measured_poses \
-  --output-dir outputs/hand_scan_measured_poses/reconstruction_aruco \
-  --registration-mode aruco \
-  --pose-map outputs/profile_pose_calibration/orbit_pose_map.json \
-  --crop-radius-m 0.075
-```
-
-`aruco` uses the measured matrices directly and disables ICP. `aruco-guarded-icp` starts from the same measured matrices and then attempts guarded residual ICP corrections. Start with `aruco` so the calibration can be judged without ICP changing it.
-
-The final coordinate-system origin and axes are those of the aligned RGB/point-cloud camera at `reference_angle_deg`, not the profile. To crop around a point other than the profile origin, pass an explicit `--pivot X Y Z` expressed in that reference camera.
-
 ## Capture flow: `main_scan.py`
 
 ### 1. Validate and plan
 
-The program validates angle spacing, capture dimensions, depth limits, orbit axis, and reconstruction settings. A radius is required with `--reconstruct`, because meaningful motor priors cannot be built without it.
+The program validates angle spacing, capture dimensions, depth limits, orbit axis, and reconstruction settings. The fixed rig calibration is validated before hardware access and supplies measured geometry and the default radius.
 
 `--dry-run` creates the selected output directory and prints the planned motor/capture sequence without connecting to hardware. It returns before starting reconstruction.
 
@@ -260,7 +205,7 @@ Unless `--no-home` is used, the motor performs this sequence:
 6. Move Y to its staging position with `G1 Y40 F500`.
 7. Move to the final scan staging position with `G1 X200 Y0 F500`.
 
-After homing, `main_scan.py` sends `G90` to explicitly select absolute positioning. It moves to each requested X station only while Y is at zero. Every `move_x()` and `move_y()` command is followed by `M400`, and the program waits 0.5 seconds after movement before capture.
+After homing, `main_scan.py` sends `G90` to explicitly select absolute positioning. It moves to each requested X station only while Y is at zero. Every `move_x()` and `move_y()` command is followed by `M400`, and the program uses Y feedrate 800 and waits 0.1 seconds after each Y movement before capture.
 
 For a 10-degree step, capture order is:
 
@@ -274,11 +219,11 @@ The origin is captured once and the reset does not produce a duplicate frame.
 
 By default, this orbit runs once at X200. The opt-in command `--x-positions-mm 200 280` runs the complete orbit at X200, returns Y to zero, moves to X280, and repeats the complete orbit. With a 10-degree step this produces 37 captures per station, or 74 captures total.
 
-X positions are absolute Marlin millimetres. Reconstruction treats the first position as the reference and converts later differences to metres along the positive configured orbit axis. Therefore, X200 to X280 adds `[0.080, 0, 0]` metres when the default orbit axis is `[1, 0, 0]`. Calibrate this direction before relying on multi-station fusion if the physical X stage is not parallel to that camera-coordinate axis.
+X positions are absolute Marlin millimetres. Reconstruction treats the first station as the reference and applies subsequent station differences as negative translations along the measured orbit axis. For an axis `[1, 0, 0]`, X200 to X280 contributes `[-0.080, 0, 0]` metres to the point-cloud transform. This is the implementation's rig convention; the physical stage must remain parallel to the calibrated orbit axis.
 
 ### 4. Capture and fuse an RGB-D burst
 
-At each angle, the camera records `--frames-per-angle` fresh aligned frames; the default is 15. For every depth frame, the code:
+At each angle, the camera records `--frames-per-angle` fresh aligned frames; the default is 6. For every depth frame, the code:
 
 1. converts SDK depth values to metres;
 2. rejects zero, invalid, and non-finite samples;
@@ -286,7 +231,7 @@ At each angle, the camera records `--frames-per-angle` fresh aligned frames; the
 4. computes the median only from remaining valid samples;
 5. keeps a fused pixel only when at least `--min-valid-samples` samples were valid, with a default of three.
 
-Filtering before the median prevents invalid zeros from pulling fused depth toward the camera. Requiring three samples suppresses intermittent depth speckle while the 15-frame burst leaves enough temporal observations for stable surfaces. The latest aligned color frame supplies RGB.
+Filtering before the median prevents invalid zeros from pulling fused depth toward the camera. Requiring three samples suppresses intermittent depth speckle within the six-frame burst. The latest aligned color frame supplies RGB.
 
 The default interval is 0.02-0.25 m. Keeping the maximum close to the working distance stops much of the room and scanner structure from entering the cloud.
 
@@ -314,7 +259,7 @@ Metadata is updated during scanning, so completed angles remain recorded if a la
     "height": 530,
     "fps": 30,
     "disparity": 256,
-    "frames_per_angle": 15,
+    "frames_per_angle": 6,
     "min_valid_samples": 3,
     "min_confidence": 0,
     "depth_range_m": [0.02, 0.25]
@@ -345,7 +290,7 @@ The ordered capture manifest is authoritative for schema-version-2 scans. Older 
 
 ### 6. Optionally reconstruct
 
-With `--reconstruct`, the program closes the hardware after capture and launches `reconstruct_pipeline.py` with the scan directory, radius, axis, final crop, registration crop, and registration mode.
+With `--reconstruct`, the program closes the hardware after capture and launches `reconstruct_pipeline.py` with the scan directory, calibration file, radius, final crop, registration crop, and registration mode.
 
 ## `main_scan.py` options
 
@@ -355,11 +300,12 @@ With `--reconstruct`, the program closes the hardware after capture and launches
 | `--step-deg` | Angular spacing between captures. |
 | `--disparity` | Gemini 305 disparity range: 128 or 256. |
 | `--width`, `--height`, `--fps` | Requested RGB-D stream configuration. |
-| `--radius-m` | Optical-center to orbit-center distance in metres; required with `--reconstruct`. |
+| `--orbit-geometry` | Measured calibration file; default repository `outputs/test_radius_x100/radius_calibration.json`. |
+| `--radius-m` | Optical-center to orbit-center distance in metres; defaults to the calibration recommended radius. |
 | `--x-positions-mm` | One or more absolute X scan stations in millimetres; default `200`. |
-| `--orbit-axis X Y Z` | Orbit axis in camera coordinates; default `1 0 0`. |
-| `--registration-mode` | `motor` or `guarded-icp`; default `motor`. Full-pose reconstruction is launched separately. |
-| `--frames-per-angle` | Fresh frames fused per angle; default 15. |
+| `--orbit-axis X Y Z` | Legacy option; measured calibration axis takes precedence. |
+| `--registration-mode` | `motor` or `guarded-icp`; default `guarded-icp`. Full-pose reconstruction is launched separately. |
+| `--frames-per-angle` | Fresh frames fused per angle; default 6. |
 | `--min-valid-samples` | Valid temporal depth samples required per fused pixel; default 3. |
 | `--min-confidence` | Reserved confidence threshold recorded in metadata; keep at 0 because confidence frames are not yet wired into capture. |
 | `--depth-min-m`, `--depth-max-m` | Accepted depth interval; defaults 0.02 and 0.25 m. |
@@ -378,17 +324,43 @@ For schema-version-2 datasets, the program reads station, X position, offset, an
 
 ### Configuration precedence
 
-For motor modes, orbit radius is resolved in this order:
+Both entrypoints default to **guarded ICP** and the fixed rig calibration:
+`outputs/test_radius_x100/radius_calibration.json`. The default path is resolved
+relative to the repository, independently of the working directory.
 
-1. a rough visible-surface estimate when `--auto-radius` is requested (this deliberately ignores `--orbit-radius-m`);
-2. otherwise, explicit `--orbit-radius-m`;
-3. otherwise, `orbit_radius_m` from `scan_metadata.json`.
+Capture accepts `--orbit-geometry` to choose another file and records its
+absolute path as `orbit_geometry_source` in `scan_metadata.json`. Reconstruction
+selects an explicit `--orbit-geometry`, then the recorded scan path, then the
+fixed default. No calibration file is copied for each scan or X station.
+Replacing the shared file affects future reconstructions that reference it.
 
-When `--orbit-geometry` points to a valid `radius_calibration.json`, its top-level `orbit_geometry` block supplies the measured axis and, unless `--pivot` is also passed, the measured pivot. An explicit `--pivot` takes precedence over the measured pivot. Prefer this measured geometry to a scalar radius: radius-only reconstruction has to assume `pivot = [0, 0, R]` and, unless separately overridden, `axis = [1, 0, 0]`.
+The calibration must have `quality_status: valid`, finite measured pivot and
+nonzero axis, a positive recommended radius, and a recorded motor X station.
+Missing or invalid calibration stops the run instead of using assumed geometry.
+Known point-cloud camera frames must match the calibration camera frame.
 
-`--auto-radius` is diagnostic, not physical calibration. It cannot reliably distinguish the object's visible surface from the mechanical rotation center. Explicit CLI axis and crop values similarly override recorded metadata and defaults. Legacy metadata without `registration_crop_radius_m` automatically uses the smaller of 0.10 m and the positive final crop, so existing datasets gain the safer ICP region without changing their final output extent.
+The measured axis is authoritative. `--pivot` overrides the measured pivot and
+disables the calibration-station crop shift. Radius comes from
+`recommended_radius_m`, unless `--radius-m` (capture) or `--orbit-radius-m`
+(reconstruction) overrides it. `--auto-radius` remains a diagnostic surface-depth
+estimate; changing the scalar radius does not alter the measured pivot or axis.
+`--registration-mode motor` disables ICP while retaining measured geometry.
 
-For ArUco modes, `--pose-map` supplies the complete pose matrices and a radius is not required. An explicit `--pivot` overrides the pose map's profile-origin crop center.
+A calibration is accepted on the uncertainty of the fitted radius, not on the scatter of the observations behind it. Single-marker ArUco poses are noisy but unbiased, so hundreds of them average to a stable radius: in `outputs/radius_x100_rerun2` a 3.207 mm observation RMSE over 179 inliers gave a 0.194 mm bootstrap standard deviation, and two independent runs fifteen minutes apart agreed to 0.058 mm while individual angles moved by up to 8.5 mm. `--max-radius-std-mm` (0.25) is therefore the gate, and per-angle median residuals are reported in `angle_median_residual_m` as diagnostics.
+
+Excluding high-residual angles was implemented, measured, and removed. It made the two runs disagree by 0.22-0.32 mm at every threshold tried, against 0.058 mm when nothing was excluded, because the offending angles differ from run to run and each fit then loses different angular support. The worst angle barely biases the result anyway: dropping +120 degrees alone moved one run by 0.003 mm. Treat a large per-angle median as a view to inspect -- a small, steeply oblique or overexposed marker -- not as a sample to delete.
+
+The bootstrap resamples whole angles, not individual frames. The ten frames captured at one angle share that angle's pose error, so treating them as independent draws inflates the apparent sample size by the burst length. Across three runs of the same rig, per-frame resampling claimed a 0.165 mm mean standard deviation while the radii actually spread with a 0.324 mm standard deviation, understating it by 1.9x; resampling by angle reports 0.39-0.54 mm, erring toward caution.
+
+Measured on this rig, one run therefore determines the radius to roughly +/- 0.5 mm and does not pass the 0.25 mm gate. Three runs gave 143.483, 143.425 and 142.895 mm, a 0.560 mm spread, combining to **143.268 +/- 0.187 mm** as a standard error of the mean. Averaging independent runs is the honest route to a tighter number; a single run reporting +/- 0.15 mm was an artefact of the resampling, not a measurement.
+
+Two limitations remain. A bootstrap standard deviation measures precision, not accuracy, so it cannot detect a biased calibration from one run: the original `outputs/test_radius_x100` result sits 0.7 mm from the later runs, its bias coming from sparse angular coverage of 13 angles at a 30 degree step with two contributing no poses. And the gate cannot distinguish a rig that needs better markers from one that needs more runs. Comparing repeat runs is what exposes both.
+
+One `--orbit-geometry` calibration serves every X station. The radius and axis are properties of the mechanism and do not depend on X; the pivot only slides along the axis, which leaves the pose priors untouched because rotation about a line is invariant to where along it the pivot sits. Reconstruction reads the calibration's own `motor.x_position_mm` and shifts the pivot by `scan_X - calibration_X` before using it as a crop centre, so a calibration captured at X=100 reconstructs an X=50 scan correctly. A calibration must record its station; an explicit `--pivot` overrides the shift.
+
+
+`--auto-radius` is diagnostic, not physical calibration. It cannot reliably distinguish the object's visible surface from the mechanical rotation center. Explicit crop values override recorded crop metadata and defaults. Legacy metadata without `registration_crop_radius_m` automatically uses the smaller of 0.10 m and the positive final crop, so existing datasets gain the safer ICP region without changing their final output extent.
+
 
 ### `reconstruct_pipeline.py` options
 
@@ -396,22 +368,23 @@ For ArUco modes, `--pose-map` supplies the complete pose matrices and a radius i
 |---|---|
 | `--input-dir` | Required directory containing `frame_*.ply` and optional scan metadata. |
 | `--output-dir` | Reconstruction destination; default `<input-dir>/reconstruction`. |
-| `--registration-mode` | `motor`, `guarded-icp`, `aruco`, or `aruco-guarded-icp`; default `motor`. |
-| `--pose-map` | Full-pose calibration JSON required by the two `aruco` modes. |
-| `--orbit-radius-m` | Explicit calibrated orbit radius; otherwise read from metadata. Not required by ArUco modes. |
-| `--orbit-geometry` | `radius_calibration.json` whose measured `orbit_geometry` supplies the orbit axis and pivot. |
+| `--registration-mode` | `motor` or `guarded-icp`; default `guarded-icp`. |
+| `--orbit-radius-m` | Explicit orbit radius; otherwise the calibration recommended radius. |
+| `--orbit-geometry` | `radius_calibration.json` whose measured `orbit_geometry` supplies the orbit axis and pivot; selection is CLI, recorded scan path, then the fixed rig file. |
 | `--auto-radius` | Use a rough first-frame surface-depth estimate instead of calibrated radius. |
-| `--orbit-axis X Y Z` | Axis in camera coordinates; otherwise metadata or `1 0 0`. |
-| `--pivot X Y Z` | Explicit orbit center in zero-frame camera coordinates; default `[0, 0, radius]`. |
+| `--orbit-axis X Y Z` | Legacy option; measured calibration axis takes precedence. |
+| `--pivot X Y Z` | Explicit orbit center in zero-frame camera coordinates; default measured calibration pivot. |
 | `--reference-angle-deg` | Motor angle treated as the reference pose; default 0 degrees. |
 | `--angle-sign` | Converts the recorded motor-angle direction to the reconstruction convention; use `1` or `-1`. |
 | `--crop-radius-m` | Final output crop-cube half-extent around the pivot; metadata or 0.15 m by default, and `<= 0` disables it. |
 | `--registration-crop-radius-m` | Crop-cube half-extent used only to construct ICP clouds; metadata or `min(final crop, 0.10 m)` by default, and `<= 0` disables it. |
+| `--crop-shape` | `cube` (default) or `cylinder`; the cylinder reads both crop radii as radial limits around the orbit axis. |
+| `--crop-axial-half-length-m` | Half-length along the orbit axis when `--crop-shape cylinder`; metadata or 0.15 m by default. |
 | `--skip-per-scan-sor` | Skip the per-frame outlier filter; final merged-cloud SOR still runs. |
 
 ### Stage 1: build pose priors
 
-In motor modes, the pipeline constructs the circular motor transform and adds the station's metric X offset along the orbit axis. In ArUco modes, it looks up the measured `camera_to_reference` matrix for every capture angle. These matrices are saved as `*_prior.txt`.
+The pipeline constructs the circular motor transform and adds the station offset along the orbit axis. These matrices are saved as `*_prior.txt`.
 
 ### Stage 2: select or refine poses
 
@@ -419,10 +392,12 @@ In motor modes, the pipeline constructs the circular motor transform and adds th
 |---|---|---|
 | `motor` | Uses each motor prior and skips ICP. | Default for calibrated hardware and noisy or symmetric subjects. |
 | `guarded-icp` | Attempts a small correction around each prior and rejects unsafe or unhelpful results. | Experiments with distinctive, overlapping geometry. |
-| `aruco` | Uses the complete measured depth-camera pose for every angle and skips ICP. | Diagnosing or correcting non-ideal mechanical orbits. |
-| `aruco-guarded-icp` | Starts from complete measured poses and allows guarded residual ICP. | Only after direct ArUco reconstruction is already close. |
 
-Motor mode is deliberately the default. Smooth hands, repeated geometry, background points, and partial overlap can give ICP a plausible but physically incorrect match.
+Both `main_scan.py` and `reconstruct_pipeline.py` default to guarded ICP. Guarded ICP is the capture-time default for its diagnostics rather than its corrections: motor mode writes no edges at all, so nothing records per-edge fitness, residual, or whether the orbit closes. The guards keep it safe, since any correction that fails them falls back to the motor prior.
+
+Do not expect it to improve the surface. On `outputs/scan_x100_r143259`, measured against the same captures, guarded ICP gave a 2.155 mm local surface RMS from 108542 points against motor mode's 2.084 mm from 140110, because its corrections have a 0.85 mm median and the surface noise is about 2 mm: it is adjusting poses by less than the uncertainty of the points it aligns. Smooth hands, repeated geometry, background points, and partial overlap can also give ICP a plausible but physically incorrect match, which is what the guards exist to catch.
+
+The reason to keep it on is the loop edge. On that scan it matched the two 180 degree views with 0.941 fitness and reported them 6.83 mm and 2.61 deg apart, exceeding the guards and falling back to the prior. That number is the largest geometric error left in the pipeline, larger than the radius uncertainty or the surface noise, and motor mode never measures it.
 
 Guarded ICP processes adjacent angles within each station, a loop edge for each complete orbit, and same-angle links between adjacent X stations:
 
@@ -459,6 +434,10 @@ The pose graph produces `optimized_poses.npy` and per-frame `*_optimized.txt` ma
 
 Registration uses reduced copies, but Open3D applies final matrices to the original PLYs. Four bounded workers transform, crop, optionally filter, and write the scans to `01_transformed/` in stable frame order.
 
+`--crop-shape` selects the crop geometry. With the default `cube`, both crop arguments are half-extents of axis-aligned cubes, not spherical radii. With `cylinder`, they become radial limits around the orbit axis and `--crop-axial-half-length-m` bounds the axis separately.
+
+Prefer the cylinder on this rig. The enclosure ring sits 90-115 mm from the orbit axis, the object stays inside 55 mm, and the object also runs +/-120 mm along the axis. Measured on `outputs/new_scan`, an 80 mm cylinder keeps 100% of the object and 0% of the ring, whereas every cube small enough to drop the ring (90 mm half-extent or less) clips 21-39% of the object, because shrinking a cube shortens it along the axis at the same time.
+
 Despite their historical `radius` names, both crop arguments are half-extents of axis-aligned cubes, not spherical radii. Each station receives station-adjusted crop cubes around its expected pivot. `--registration-crop-radius-m` affects only the reduced copies used to estimate ICP poses. `--crop-radius-m` affects the full-resolution clouds written to `01_transformed/` and therefore the final merge. Changing the registration crop does not remove additional points from `merged_cloud.ply`. A value at or below zero disables the corresponding crop when running reconstruction directly.
 
 Per-scan SOR uses 10 neighbors and sigma 2.0 unless `--skip-per-scan-sor` is set.
@@ -468,6 +447,7 @@ Per-scan SOR uses 10 neighbors and sigma 2.0 unless `--skip-per-scan-sor` is set
 The transformed scans are merged, then processed with:
 
 - 1 mm spatial subsampling;
+- connected-component filtering, discarding any cluster smaller than 1 percent of the largest;
 - Trimesh quantized duplicate grouping at 0.1 mm;
 - final SOR with 20 neighbors and sigma 1.5;
 - normal estimation in a 4 mm neighborhood;
@@ -492,7 +472,7 @@ reconstruction/
 `-- merged_cloud.ply
 ```
 
-- `*_prior.txt`: pose from motor angle, axis, pivot, and radius only.
+- `*_prior.txt`: pose from motor angle, measured axis/pivot, and station offset.
 - `*_optimized.txt`: selected final pose; identical to the prior in motor mode.
 - `*_optimized_matrix.txt`: transform copy used while processing the full-resolution scan.
 - `optimized_poses.npy`: all final poses for programmatic inspection.
@@ -594,7 +574,7 @@ Measure from the mechanical rotation center to the depth camera's optical center
 
 `calculating_radius/test_radius.py` captures a multi-angle dataset using the fixed marked profile, fits the camera trajectory, and reports a radius only when its coverage and residual checks pass.
 
-A valid report also records the measured pivot and axis in `orbit_geometry`. Use that complete geometry with `--orbit-geometry` instead of reducing calibration to `--orbit-radius-m`; the scalar form forces an idealized pivot and axis that may not match the real mechanism.
+A valid report also records the measured pivot and axis in `orbit_geometry`. Both entrypoints use that complete geometry by default; `--orbit-geometry` selects a replacement calibration.
 
 Never use the nearest hand-surface depth as orbit radius. That value changes with shape and view and describes the object, not the mechanism.
 
@@ -632,7 +612,7 @@ Return to `--registration-mode motor`. Smooth, symmetric, or repetitive surfaces
 
 ### No radius is available
 
-Pass `--orbit-radius-m` or record calibrated `orbit_radius_m` metadata. Use `--auto-radius` only for rough investigation.
+Restore the fixed calibration file or pass `--orbit-geometry` with a valid measured calibration. A radius override does not replace missing geometry.
 
 ### Open3D/Trimesh processing fails
 

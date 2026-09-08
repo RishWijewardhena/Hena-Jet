@@ -19,6 +19,7 @@ from pathlib import Path
 from motor_controller import MotorController
 from camera_controller import CameraController
 from pointcloud_export import backproject_to_points
+from orbit_geometry import select_orbit_geometry, load_orbit_geometry, validate_camera_frame
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -35,19 +36,34 @@ def parse_args(argv=None):
     parser.add_argument("--fps", type=int, default=30, help="Camera framerate")
     parser.add_argument("--radius-m", type=float, default=None,
                         help="Radius from camera optical center to orbit center in metres "
-                             "(required with --reconstruct)")
+                             "(defaults to the measured calibration radius)")
     parser.add_argument(
         "--x-positions-mm",
         type=float,
         nargs="+",
         default=[150.0],
-        help="Absolute X stations to scan in millimetres (default: 200)",
+        help="Absolute X stations to scan in millimetres (default: 150)",
     )
+    parser.add_argument("--orbit-geometry", type=Path, default=None,
+                        help="Measured calibration JSON (default: repository outputs/test_radius_x100/radius_calibration.json)")
     parser.add_argument("--orbit-axis", type=float, nargs=3, default=[1.0, 0.0, 0.0],
-                        help="Orbit axis in camera coordinates (default: 1 0 0)")
+                        help="Legacy axis option; measured calibration supplies the reconstruction axis")
     parser.add_argument("--registration-mode", choices=("motor", "guarded-icp"),
-                        default="motor", help="Reconstruction pose source (default: motor)")
-    parser.add_argument("--frames-per-angle", type=int, default=15,
+                        default="guarded-icp",
+                        help="Reconstruction pose source (default: guarded-icp). "
+                             "Guarded ICP records per-edge fitness, residual and "
+                             "loop closure, which motor mode does not produce at "
+                             "all, and falls back to the motor prior whenever a "
+                             "correction fails its guards. Pass motor to skip ICP")
+    parser.add_argument(
+        "--exclude-high-drift-frames",
+        action="store_true",
+        help=(
+            "When auto-reconstructing with guarded ICP, omit sequential frames "
+            "whose ICP correction exceeds the pose guards"
+        ),
+    )
+    parser.add_argument("--frames-per-angle", type=int, default=6,
                         help="Fresh RGB-D frames to median-combine at each angle")
     parser.add_argument("--min-valid-samples", type=int, default=3,
                         help="Valid temporal samples a pixel needs to survive fusion")
@@ -68,6 +84,22 @@ def parse_args(argv=None):
             "(default: min(final crop, 0.10 m))"
         ),
     )
+    parser.add_argument(
+        "--crop-shape",
+        choices=("cube", "cylinder"),
+        default="cube",
+        help=(
+            "Reconstruction crop geometry: 'cylinder' reads the crop radii as "
+            "radial limits around the orbit axis, which drops the enclosure "
+            "ring without clipping the object along the axis (default: cube)"
+        ),
+    )
+    parser.add_argument(
+        "--crop-axial-half-length-m",
+        type=float,
+        default=0.15,
+        help="Half-length along the orbit axis for --crop-shape cylinder",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/scan"), help="Output directory for PLY files")
     parser.add_argument("--dry-run", action="store_true", help="Print sequence without moving or capturing")
     parser.add_argument("--no-home", action="store_true", help="Skip the homing sequence (use only if already homed)")
@@ -81,6 +113,7 @@ def parse_args(argv=None):
                 args.registration_crop_radius_m,
                 args.crop_radius_m,
             )
+    args.orbit_geometry = select_orbit_geometry(args.orbit_geometry)
     return args
 
 
@@ -222,9 +255,11 @@ def build_scan_metadata(args, *, active_disparity, captured_angles, captures=Non
     return {
         "schema_version": 2,
         "orbit_radius_m": args.radius_m,
+        "orbit_geometry_source": str(args.orbit_geometry),
         "orbit_axis": [float(value) for value in args.orbit_axis],
         "step_deg": float(args.step_deg),
         "registration_mode": args.registration_mode,
+        "exclude_high_drift_frames": bool(args.exclude_high_drift_frames),
         "capture": {
             "width": int(args.width),
             "height": int(args.height),
@@ -238,6 +273,8 @@ def build_scan_metadata(args, *, active_disparity, captured_angles, captures=Non
         "reconstruction": {
             "crop_radius_m": float(args.crop_radius_m),
             "registration_crop_radius_m": float(args.registration_crop_radius_m),
+            "crop_shape": args.crop_shape,
+            "crop_axial_half_length_m": float(args.crop_axial_half_length_m),
         },
         "x_stage": {
             "positions_mm": [float(value) for value in args.x_positions_mm],
@@ -275,6 +312,37 @@ def save_frame_as_ply(
     return out_path
 
 
+def prepare_scan_geometry(args):
+    """Validate the rig calibration before hardware access and resolve metadata."""
+    calibration = load_orbit_geometry(args.orbit_geometry)
+    if args.radius_m is None:
+        args.radius_m = float(calibration["recommended_radius_m"])
+    if not np.isfinite(args.radius_m) or args.radius_m <= 0:
+        raise ValueError("--radius-m must be finite and positive")
+    args.orbit_axis = calibration["orbit_geometry"]["axis"]
+    return calibration
+
+
+def build_reconstruction_command(args):
+    """Forward the same measured geometry used to describe the scan."""
+    cmd = [
+        sys.executable,
+        str(Path(__file__).parent / "reconstruct_pipeline.py"),
+        "--input-dir", str(args.output_dir),
+        "--orbit-radius-m", str(args.radius_m),
+        "--registration-mode", args.registration_mode,
+        "--orbit-geometry", str(args.orbit_geometry),
+        "--crop-radius-m", str(args.crop_radius_m),
+        "--registration-crop-radius-m", str(args.registration_crop_radius_m),
+        "--crop-shape", args.crop_shape,
+        "--crop-axial-half-length-m", str(args.crop_axial_half_length_m),
+    ]
+    if args.exclude_high_drift_frames:
+        cmd.append("--exclude-high-drift-frames")
+
+    return cmd
+
+
 def main():
     args = parse_args()
 
@@ -295,14 +363,20 @@ def main():
         or args.registration_crop_radius_m <= 0.0
     ):
         raise ValueError("--registration-crop-radius-m must be finite and positive.")
+    if (
+        not np.isfinite(args.crop_axial_half_length_m)
+        or args.crop_axial_half_length_m <= 0.0
+    ):
+        raise ValueError("--crop-axial-half-length-m must be finite and positive.")
     if not args.x_positions_mm or not all(np.isfinite(args.x_positions_mm)):
         raise ValueError("--x-positions-mm must contain finite positions.")
     if len(set(args.x_positions_mm)) != len(args.x_positions_mm):
         raise ValueError("--x-positions-mm must not contain duplicates.")
     if len({f"{value:.1f}" for value in args.x_positions_mm}) != len(args.x_positions_mm):
         raise ValueError("--x-positions-mm must be unique at 0.1 mm precision.")
-    if args.reconstruct and args.radius_m is None:
-        raise ValueError("--radius-m is required when --reconstruct is enabled.")
+    calibration = prepare_scan_geometry(args)
+    if args.exclude_high_drift_frames and args.registration_mode != "guarded-icp":
+        raise ValueError("--exclude-high-drift-frames requires guarded-icp")
 
     # Ensure output dir exists
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -338,6 +412,8 @@ def main():
 
     with MotorController(port=args.port, baud=args.baud) as motor, \
          CameraController(width=args.width, height=args.height, fps=args.fps, disparity=args.disparity) as camera:
+
+        validate_camera_frame(calibration, camera.intrinsics)
 
         if not args.no_home:
             motor.home_all()
@@ -382,10 +458,10 @@ def main():
             should_capture = step["capture"]
 
             logger.info("Moving Y to %.1f degrees...", angle)
-            motor.move_y(angle, feedrate=500)
+            motor.move_y(angle, feedrate=800)
 
             # Brief pause to let camera settle after movement
-            time.sleep(0.5)
+            time.sleep(0.1)
 
             if should_capture:
                 logger.info("Capturing frame at %.1f degrees...", angle)
@@ -457,36 +533,17 @@ def main():
     # Optionally invoke reconstruction
     if args.reconstruct and len(saved_files) > 0:
         logger.info("Launching reconstruction pipeline...")
-        script_dir = Path(__file__).parent
-        cmd = [
-            sys.executable,
-            str(script_dir / "reconstruct_pipeline.py"),
-            "--input-dir", str(args.output_dir),
-            "--orbit-radius-m", str(args.radius_m),
-            "--registration-mode", args.registration_mode,
-            "--orbit-axis", *(str(value) for value in args.orbit_axis),
-            "--crop-radius-m", str(args.crop_radius_m),
-            "--registration-crop-radius-m", str(args.registration_crop_radius_m),
-        ]
+        cmd = build_reconstruction_command(args)
 
         logger.info("$ %s", " ".join(cmd))
         subprocess.run(cmd, check=True)
     elif len(saved_files) > 0:
-        if args.radius_m is None:
-            logger.info(
-                "Capture has no calibrated orbit radius. Reconstruct with:\n"
-                "  python %s/reconstruct_pipeline.py --input-dir %s "
-                "--orbit-radius-m <CALIBRATED_METRES>",
-                Path(__file__).parent,
-                args.output_dir,
-            )
-        else:
-            logger.info(
-                "To reconstruct, run:\n"
-                "  python %s/reconstruct_pipeline.py --input-dir %s",
-                Path(__file__).parent,
-                args.output_dir,
-            )
+        logger.info(
+            "To reconstruct, run:\n"
+            "  python %s/reconstruct_pipeline.py --input-dir %s",
+            Path(__file__).parent,
+            args.output_dir,
+        )
     else:
         logger.warning("No frames were captured.")
 

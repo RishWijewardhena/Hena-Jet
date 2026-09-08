@@ -89,7 +89,7 @@ class ScanMetadataTests(unittest.TestCase):
     def test_x_positions_default_to_the_existing_single_station(self):
         args = main_scan.parse_args([])
 
-        self.assertEqual(args.x_positions_mm, [200.0])
+        self.assertEqual(args.x_positions_mm, [150.0])
 
     def test_registration_crop_defaults_to_10cm(self):
         args = main_scan.parse_args([])
@@ -248,7 +248,8 @@ class RadiusCalibrationCaptureTests(unittest.TestCase):
         self.assertFalse(pose["accepted"])
         self.assertIn("exceeds 1.50px", pose["rejection_reason"])
 
-    def test_rejects_pose_that_sees_only_one_marker_face(self):
+    def _single_marker_pose(self, **overrides):
+        """Run estimate_frame_pose over one solved single-marker pose."""
         class FakeDetector:
             def detectMarkers(self, _gray):
                 return [], np.empty((0, 1), dtype=np.int32), []
@@ -262,6 +263,11 @@ class RadiusCalibrationCaptureTests(unittest.TestCase):
             "tvec": np.array([[0.0], [0.0], [0.15]]),
             "reprojection_error_px": 0.3,
         }
+        kwargs = {"max_reprojection_error_px": 1.5}
+        for key in ("min_markers", "min_ippe_error_ratio"):
+            if key in overrides:
+                kwargs[key] = overrides.pop(key)
+        solved_pose.update(overrides)
         with mock.patch.object(test_radius, "solve_profile_pose", return_value=solved_pose):
             pose, _, _ = test_radius.estimate_frame_pose(
                 np.zeros((10, 10, 3), dtype=np.uint8),
@@ -270,10 +276,24 @@ class RadiusCalibrationCaptureTests(unittest.TestCase):
                 np.eye(3),
                 np.zeros((8, 1)),
                 np.eye(4),
-                max_reprojection_error_px=1.5,
+                **kwargs,
             )
+        return pose
 
+    def test_accepts_an_unambiguous_single_marker_pose(self):
+        """The four-face profile shows one marker at most angles, so one must do."""
+        pose = self._single_marker_pose(ippe_error_ratio=6.0)
+        self.assertTrue(pose["accepted"], pose["rejection_reason"])
+
+    def test_rejects_an_ambiguous_single_marker_pose(self):
+        pose = self._single_marker_pose(ippe_error_ratio=1.05)
         self.assertFalse(pose["accepted"])
+        self.assertIn("ambiguous single-marker pose", pose["rejection_reason"])
+
+    def test_two_marker_faces_can_still_be_demanded_explicitly(self):
+        pose = self._single_marker_pose(ippe_error_ratio=6.0, min_markers=2)
+        self.assertFalse(pose["accepted"])
+        self.assertIn("fewer than 2 mapped markers", pose["rejection_reason"])
         self.assertIn("fewer than 2 mapped markers", pose["rejection_reason"])
 
     def test_requires_enough_valid_pose_frames_per_angle(self):
@@ -312,3 +332,20 @@ class FuseDepthFramesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RegistrationModeDefaultTests(unittest.TestCase):
+    def test_capture_defaults_to_guarded_icp(self):
+        """Motor mode writes no edges, so ICP is on for its diagnostics."""
+        self.assertEqual(main_scan.parse_args([]).registration_mode, "guarded-icp")
+
+    def test_motor_can_still_be_requested(self):
+        args = main_scan.parse_args(["--registration-mode", "motor"])
+        self.assertEqual(args.registration_mode, "motor")
+
+    def test_the_mode_reaches_scan_metadata(self):
+        args = main_scan.parse_args([])
+        metadata = main_scan.build_scan_metadata(
+            args, active_disparity=256, captured_angles=[0.0],
+        )
+        self.assertEqual(metadata["registration_mode"], "guarded-icp")
