@@ -26,7 +26,6 @@ from typing import Optional
 
 import numpy as np
 
-from calculating_radius.orbit_pose_map import camera_poses_in_reference
 from pointcloud_processing import (
     CylinderCrop,
     merge_and_finalize_clouds,
@@ -246,33 +245,6 @@ def load_scan_metadata(input_dir: Path) -> dict:
     return metadata
 
 
-def load_orbit_pose_map(path: Path) -> dict:
-    """Load a full-pose calibration produced by the orbit-pose capture tool."""
-    if not path.is_file():
-        raise FileNotFoundError(f"Orbit pose map not found: {path}")
-    pose_map = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(pose_map, dict):
-        raise ValueError(f"Expected a JSON object in {path}")
-    if int(pose_map.get("schema_version", -1)) != 1:
-        raise ValueError(f"Unsupported orbit pose-map schema in {path}")
-    return pose_map
-
-
-def validate_pose_map_coordinate_frame(input_dir: Path, pose_map: dict) -> None:
-    """Prevent applying color-camera poses to depth-camera point clouds or vice versa."""
-    intrinsics_path = input_dir / "intrinsics.json"
-    if not intrinsics_path.is_file():
-        return
-    intrinsics = json.loads(intrinsics_path.read_text(encoding="utf-8"))
-    scan_frame = intrinsics.get("coordinate_frame") if isinstance(intrinsics, dict) else None
-    pose_frame = pose_map.get("pointcloud_coordinate_frame")
-    if scan_frame and pose_frame and scan_frame != pose_frame:
-        raise ValueError(
-            f"Point-cloud coordinate-frame mismatch: scan uses {scan_frame!r}, "
-            f"pose map uses {pose_frame!r}"
-        )
-
-
 def discover_captures(input_dir: Path, metadata: dict) -> list[CaptureRecord]:
     """Load schema-v2 capture records, with legacy filename compatibility."""
     manifest = metadata.get("captures")
@@ -370,40 +342,27 @@ def resolve_crop_radii(
     return final_crop_m, registration_crop_m
 
 
-def validate_calibration_station(
-    calibration: dict,
-    captures: list,
-    source: Path,
-) -> None:
-    """Reject an orbit calibration measured at a different X station.
+def calibration_station_x_mm(calibration: dict, source: Path) -> Optional[float]:
+    """Return the X station a calibration was measured at, if it records one.
 
-    The measured pivot is a point in the reference camera frame at the
-    calibration station. Sliding it along the orbit axis leaves the pose
-    priors alone, but it is also the crop centre, so a station mismatch
-    silently displaces every crop cube by the station offset.
+    The radius and the axis are properties of the mechanism and do not depend on
+    X: the camera-to-axis distance is fixed by the mount, and the axis is the X
+    direction itself. The pivot is the only part that moves, and it only slides
+    along the axis, which leaves the pose priors untouched because rotation
+    about a line is invariant to where along that line the pivot sits.
+
+    So one calibration serves every station, provided the pivot is shifted by
+    the station difference before it is used as a crop centre.
     """
     motor = calibration.get("motor")
     if not isinstance(motor, dict) or motor.get("x_position_mm") is None:
         logger.warning(
-            "%s records no motor X station; cannot verify it matches the scan.",
-            source,
+            "%s records no motor X station, so the pivot cannot be shifted to "
+            "the scan's station; crop centres assume the scan's own first "
+            "station.", source,
         )
-        return
-    calibration_x_mm = float(motor["x_position_mm"])
-    mismatched = sorted(
-        {
-            float(capture.x_position_mm)
-            for capture in captures
-            if not np.isclose(capture.x_position_mm, calibration_x_mm, atol=0.05)
-        }
-    )
-    if mismatched:
-        raise ValueError(
-            f"{source} was captured at X={calibration_x_mm:.1f} mm, but the scan "
-            f"contains X={mismatched[0]:.1f} mm. Its pivot is the crop centre, so "
-            "reusing it across stations displaces every crop. Re-run the radius "
-            "calibration at the scan's X station, or pass an explicit --pivot."
-        )
+        return None
+    return float(motor["x_position_mm"])
 
 
 def resolve_crop_axial_half_length(
@@ -486,31 +445,6 @@ def build_orbit_poses(
         pose[:3, 3] -= orbit_axis * capture.x_offset_m
         poses.append(pose)
     return poses
-
-
-def build_measured_pose_priors(
-    captures: list[CaptureRecord], pose_map: dict
-) -> list[np.ndarray]:
-    """Resolve ArUco-measured camera-to-reference poses for one X station."""
-    calibration_x_mm = float(pose_map["x_position_mm"])
-    capture_stations = {capture.station_index for capture in captures}
-    if len(capture_stations) != 1:
-        raise ValueError(
-            "An ArUco pose map currently supports one X station per reconstruction"
-        )
-    mismatched = [
-        capture.x_position_mm
-        for capture in captures
-        if not np.isclose(capture.x_position_mm, calibration_x_mm, atol=0.05)
-    ]
-    if mismatched:
-        raise ValueError(
-            f"Pose map was captured at X={calibration_x_mm:.1f} mm, but the scan "
-            f"contains X={mismatched[0]:.1f} mm. Capture the pose map at the same X."
-        )
-    return camera_poses_in_reference(
-        pose_map, [capture.angle_deg for capture in captures]
-    )
 
 
 def crop_bounds_around(
@@ -943,18 +877,11 @@ def parse_args(argv=None):
                         help="Reconstruction output directory (default: <input-dir>/reconstruction)")
     parser.add_argument(
         "--registration-mode",
-        choices=("motor", "guarded-icp", "aruco", "aruco-guarded-icp"),
+        choices=("motor", "guarded-icp"),
         default="motor",
         help=(
-            "Pose source: ideal motor orbit, guarded motor+ICP, measured ArUco "
-            "poses, or measured ArUco poses with guarded ICP (default: motor)"
+            "Pose source: motor orbit or guarded motor+ICP (default: motor)"
         ),
-    )
-    parser.add_argument(
-        "--pose-map",
-        type=Path,
-        default=None,
-        help="orbit_pose_map.json required by the aruco registration modes",
     )
     parser.add_argument("--auto-radius", action="store_true",
                         help="Estimate center-surface depth from the first frame (rough fallback; "
@@ -1040,13 +967,11 @@ def main(argv=None):
 
     args = parse_args(argv)
 
-    guarded_icp_mode = args.registration_mode in (
-        "guarded-icp", "aruco-guarded-icp",
-    )
+    guarded_icp_mode = args.registration_mode == "guarded-icp"
     if args.exclude_high_drift_frames and not guarded_icp_mode:
         raise ValueError(
             "--exclude-high-drift-frames requires --registration-mode "
-            "guarded-icp or aruco-guarded-icp"
+            "guarded-icp"
         )
 
     input_dir = args.input_dir
@@ -1066,20 +991,7 @@ def main(argv=None):
     ply_files = [capture.path for capture in captures]
     logger.info("Found %d PLY files in %s", len(ply_files), input_dir)
 
-    measured_pose_mode = args.registration_mode in ("aruco", "aruco-guarded-icp")
-    pose_map = None
-    if measured_pose_mode:
-        if args.pose_map is None:
-            raise ValueError(
-                f"--pose-map is required with --registration-mode {args.registration_mode}"
-            )
-        if args.auto_radius:
-            raise ValueError("--auto-radius cannot be combined with an ArUco pose map")
-        pose_map = load_orbit_pose_map(args.pose_map)
-        validate_pose_map_coordinate_frame(input_dir, pose_map)
-
-    pose_map_axis = pose_map.get("orbit_axis_reference") if pose_map else None
-    orbit_axis_values = args.orbit_axis or pose_map_axis or scan_metadata.get(
+    orbit_axis_values = args.orbit_axis or scan_metadata.get(
         "orbit_axis", [1.0, 0.0, 0.0]
     )
     orbit_axis = normalized_vector(np.array(orbit_axis_values), name="orbit-axis")
@@ -1088,22 +1000,11 @@ def main(argv=None):
         import open3d as o3d
 
         orbit_radius_m = calculate_auto_radius(o3d, ply_files)
-    elif measured_pose_mode:
-        measured_fit = pose_map.get("orbit_fit_profile_frame") or {}
-        measured_radius = measured_fit.get("radius_m")
-        if args.orbit_radius_m is not None:
-            orbit_radius_m = float(args.orbit_radius_m)
-        elif measured_radius is not None:
-            orbit_radius_m = float(measured_radius)
-        else:
-            metadata_radius = scan_metadata.get("orbit_radius_m")
-            orbit_radius_m = (
-                float(metadata_radius) if metadata_radius is not None else None
-            )
     else:
         orbit_radius_m = resolve_orbit_radius(args.orbit_radius_m, scan_metadata)
 
     measured_geometry = None
+    calibration_x_mm = None
     if args.orbit_geometry is not None:
         calibration = json.loads(args.orbit_geometry.read_text(encoding="utf-8"))
         measured_geometry = calibration.get("orbit_geometry")
@@ -1114,14 +1015,14 @@ def main(argv=None):
             )
         orbit_axis = np.asarray(measured_geometry["axis"], dtype=float)
         if not args.pivot:
-            validate_calibration_station(calibration, captures, args.orbit_geometry)
+            calibration_x_mm = calibration_station_x_mm(
+                calibration, args.orbit_geometry,
+            )
 
     if args.pivot:
         pivot = np.array(args.pivot, dtype=float)
     elif measured_geometry is not None:
         pivot = np.asarray(measured_geometry["pivot_m"], dtype=float)
-    elif measured_pose_mode:
-        pivot = np.asarray(pose_map["profile_origin_in_reference_m"], dtype=float)
     else:
         # Camera is on the ring and Z+ points inward at the object at angle zero.
         pivot = np.array([0.0, 0.0, orbit_radius_m])
@@ -1154,19 +1055,11 @@ def main(argv=None):
     else:
         logger.info("Measured poses: axis: %s, profile pivot: %s", orbit_axis, pivot)
 
-    if measured_pose_mode:
-        priors = build_measured_pose_priors(captures, pose_map)
-        logger.info(
-            "Using full point-cloud-camera poses measured from %s (reference Y=%+.1f deg).",
-            args.pose_map,
-            float(pose_map["reference_angle_deg"]),
-        )
-    else:
-        priors = build_orbit_poses(
-            captures, orbit_axis, pivot,
-            reference_angle_deg=args.reference_angle_deg,
-            angle_sign=args.angle_sign,
-        )
+    priors = build_orbit_poses(
+        captures, orbit_axis, pivot,
+        reference_angle_deg=args.reference_angle_deg,
+        angle_sign=args.angle_sign,
+    )
 
     frames = [
         RegistrationFrame(
@@ -1179,11 +1072,16 @@ def main(argv=None):
         )
         for capture, prior in zip(captures, priors)
     ]
+    # Shift the pivot from wherever it was measured to each frame's station.
+    # With a calibration station the offset is absolute; without one, fall back
+    # to the scan's own first station, which is all the metadata records.
     frame_crop_centers = [
         (
-            pivot
-            if measured_pose_mode
-            else pivot - orbit_axis * frame.x_offset_m
+            pivot - orbit_axis * (
+                (frame.x_position_mm - calibration_x_mm) / 1000.0
+                if calibration_x_mm is not None
+                else frame.x_offset_m
+            )
         )
         for frame in frames
     ]
@@ -1222,8 +1120,8 @@ def main(argv=None):
         ),
     )
 
-    if args.registration_mode in ("motor", "aruco"):
-        source = "measured ArUco" if measured_pose_mode else "deterministic motor"
+    if args.registration_mode == "motor":
+        source = "deterministic motor"
         logger.info("Stage 2/4: Using %s poses (ICP disabled).", source)
         optimized_poses = [prior.copy() for prior in priors]
         edges = []
@@ -1305,21 +1203,15 @@ def main(argv=None):
             if args.auto_radius
             else "cli"
             if args.orbit_radius_m is not None
-            else "pose_map"
-            if measured_pose_mode and pose_map.get("orbit_fit_profile_frame")
             else "scan_metadata"
         ),
-        "pose_map": str(args.pose_map) if args.pose_map else None,
         "orbit_geometry_source": (
             str(args.orbit_geometry) if args.orbit_geometry else None
         ),
+        "calibration_x_position_mm": calibration_x_mm,
         "orbit_axis": orbit_axis.tolist(),
         "pivot": pivot.tolist(),
-        "reference_angle_deg": (
-            float(pose_map["reference_angle_deg"])
-            if measured_pose_mode
-            else args.reference_angle_deg
-        ),
+        "reference_angle_deg": args.reference_angle_deg,
         "angle_sign": args.angle_sign,
         "crop_radius_m": crop_radius_m,
         "registration_crop_radius_m": registration_crop_radius_m,
@@ -1409,8 +1301,6 @@ def main(argv=None):
         merged_cloud_path,
         pivot=(
             pivot
-            if measured_pose_mode
-            else pivot
             - orbit_axis * float(np.mean(sorted({frame.x_offset_m for frame in frames})))
         ),
         spatial_subsample_m=SPATIAL_SUBSAMPLE_M,

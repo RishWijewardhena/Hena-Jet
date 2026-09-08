@@ -31,8 +31,9 @@ writes that geometry to a file. `main_scan.py` contains no marker code at all --
 it only moves the motor and saves point clouds. Reconstruction reads the
 calibration *file*, so a scan never needs a marker in view.
 
-Re-run the calibration only when the mechanics change, or when scanning at a
-different X station.
+Re-run the calibration only when the mechanics change. **A different X station
+does not need its own calibration** -- the radius and axis do not depend on X,
+and reconstruction shifts the pivot by the station difference automatically.
 
 ---
 
@@ -155,16 +156,15 @@ never measured.
 flowchart TD
     START([reconstruct_pipeline.py]) --> DISC["Stage 1/4<br/>discover frame_*.ply<br/>read scan_metadata.json"]
     DISC --> GEO{"--orbit-geometry?"}
-    GEO -->|yes| XCHK{"calibration X<br/>== scan X?"}
-    XCHK -->|no| ERR([error: re-calibrate at this X])
-    XCHK -->|yes| MEAS[measured pivot + axis]
+    GEO -->|yes| XCHK["read calibration's<br/>motor.x_position_mm"]
+    XCHK --> MEAS["measured pivot + axis<br/>pivot shifted by scan_X - calibration_X"]
     GEO -->|no| ASSUME["assumed pivot [0,0,R]<br/>axis [1,0,0]"]
 
     MEAS --> PRIOR
     ASSUME --> PRIOR["build_orbit_poses<br/>rotate about axis by motor angle<br/>+ station X offset"]
 
     PRIOR --> MODE{"--registration-mode"}
-    MODE -->|motor / aruco| USE[use priors directly<br/>no edges recorded]
+    MODE -->|motor| USE[use priors directly<br/>no edges recorded]
     MODE -->|guarded-icp| ICP
 
     subgraph ICP ["Stage 2/4 — guarded ICP"]
@@ -193,7 +193,6 @@ flowchart TD
 
     MERGE --> OUT(["merged_cloud.ply<br/>optimized_poses.npy<br/>registration_diagnostics.json"])
 
-    style ERR fill:#fce8e6
     style OUT fill:#e6f4ea
 ```
 
@@ -269,7 +268,8 @@ orbit radius, and only a certified length detects that.
 | `registration_diagnostics.json` | reconstruction | per-edge fitness, residual, loop closure |
 | `merged_cloud.ply` | reconstruction stage 4 | quality and ball-bar reports |
 
-A calibration is tied to its X station: the pivot is a point in the reference
-camera frame at that station. Pose priors survive a station mismatch, because
-rotation about a line is invariant to sliding the pivot along it, but the crop
-centre does not — which is why reconstruction refuses the mismatch.
+A calibration serves every X station. The pivot is a point in the reference
+camera frame at the calibration station; reconstruction shifts it by
+`scan_X - calibration_X` along the axis before using it as a crop centre. The
+pose priors never needed the shift, since rotation about a line is invariant to
+where along it the pivot sits.

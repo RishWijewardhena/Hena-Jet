@@ -34,29 +34,7 @@ class ReconstructionCliTests(unittest.TestCase):
 
         self.assertEqual(radius, 0.1175)
 
-    def test_accepts_measured_aruco_pose_mode_and_pose_map(self):
-        args = reconstruct_pipeline.parse_args(
-            [
-                "--input-dir", "scan",
-                "--registration-mode", "aruco",
-                "--pose-map", "calibration/orbit_pose_map.json",
-            ]
-        )
 
-        self.assertEqual(args.registration_mode, "aruco")
-        self.assertEqual(args.pose_map, Path("calibration/orbit_pose_map.json"))
-
-    def test_rejects_pose_map_for_a_different_pointcloud_camera_frame(self):
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            input_dir = Path(temporary_dir)
-            (input_dir / "intrinsics.json").write_text(
-                json.dumps({"coordinate_frame": "color"})
-            )
-
-            with self.assertRaisesRegex(ValueError, "coordinate-frame mismatch"):
-                reconstruct_pipeline.validate_pose_map_coordinate_frame(
-                    input_dir, {"pointcloud_coordinate_frame": "depth"}
-                )
 
     def test_registration_crop_defaults_to_10cm_without_shrinking_final_crop(self):
         args = reconstruct_pipeline.parse_args(["--input-dir", "scan"])
@@ -122,7 +100,7 @@ class MultiStationPoseTests(unittest.TestCase):
                 [(0, 0.0), (0, 10.0), (1, 0.0), (1, 10.0)],
             )
 
-    def test_second_station_pose_adds_80mm_along_the_orbit_axis(self):
+    def test_second_station_pose_subtracts_80mm_along_the_orbit_axis(self):
         captures = [
             reconstruct_pipeline.CaptureRecord(
                 path=Path("frame_s00_x200.0_y+030.0.ply"),
@@ -150,7 +128,7 @@ class MultiStationPoseTests(unittest.TestCase):
 
         np.testing.assert_allclose(
             poses[1][:3, 3] - poses[0][:3, 3],
-            [0.08, 0.0, 0.0],
+            [-0.08, 0.0, 0.0],
             atol=1e-12,
         )
 
@@ -187,60 +165,7 @@ class MultiStationPoseTests(unittest.TestCase):
             self.assertTrue(all(item.station_index == 0 for item in captures))
             self.assertTrue(all(item.x_offset_m == 0.0 for item in captures))
 
-    def test_measured_pose_priors_are_loaded_by_angle(self):
-        angle_0_pose = np.eye(4)
-        angle_10_pose = np.eye(4)
-        angle_10_pose[:3, 3] = [0.002, -0.001, 0.020]
-        pose_map = {
-            "schema_version": 1,
-            "x_position_mm": 150.0,
-            "angles": [
-                {
-                    "angle_deg": 0.0,
-                    "pose_valid": True,
-                    "camera_to_reference": angle_0_pose.tolist(),
-                },
-                {
-                    "angle_deg": 10.0,
-                    "pose_valid": True,
-                    "camera_to_reference": angle_10_pose.tolist(),
-                },
-            ],
-        }
-        captures = [
-            reconstruct_pipeline.CaptureRecord(
-                Path("frame_0.ply"), 0.0, x_position_mm=150.0
-            ),
-            reconstruct_pipeline.CaptureRecord(
-                Path("frame_10.ply"), 10.0, x_position_mm=150.0
-            ),
-        ]
 
-        poses = reconstruct_pipeline.build_measured_pose_priors(captures, pose_map)
-
-        np.testing.assert_allclose(poses[0], angle_0_pose)
-        np.testing.assert_allclose(poses[1], angle_10_pose)
-
-    def test_measured_pose_map_rejects_a_different_x_station(self):
-        pose_map = {
-            "schema_version": 1,
-            "x_position_mm": 150.0,
-            "angles": [
-                {
-                    "angle_deg": 0.0,
-                    "pose_valid": True,
-                    "camera_to_reference": np.eye(4).tolist(),
-                }
-            ],
-        }
-        captures = [
-            reconstruct_pipeline.CaptureRecord(
-                Path("frame_0.ply"), 0.0, x_position_mm=200.0
-            )
-        ]
-
-        with self.assertRaisesRegex(ValueError, "X=150.0 mm"):
-            reconstruct_pipeline.build_measured_pose_priors(captures, pose_map)
 
 
 class GuardedIcpTests(unittest.TestCase):
@@ -481,95 +406,6 @@ class ReconstructionDiagnosticsTests(unittest.TestCase):
 
 
 class ReconstructionEndToEndTests(unittest.TestCase):
-    def test_aruco_pose_pipeline_uses_measured_full_transforms_without_a_radius(self):
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            root = Path(temporary_dir)
-            input_dir = root / "scan"
-            output_dir = root / "reconstruction"
-            input_dir.mkdir()
-
-            reference_points = np.array(
-                [
-                    [x, y, z]
-                    for x in np.linspace(-0.015, 0.015, 8)
-                    for y in np.linspace(-0.010, 0.010, 6)
-                    for z in (0.035, 0.045)
-                ]
-            )
-            colors = np.tile([0.7, 0.2, 0.1], (len(reference_points), 1))
-            angle_0_pose = np.eye(4)
-            angle_90_pose = reconstruct_pipeline.rotation_about_axis(
-                12.0, np.array([0.0, 0.0, 0.04]), np.array([0.2, 0.9, 0.1])
-            )
-            filenames = [
-                "frame_s00_x150.0_y+000.0.ply",
-                "frame_s00_x150.0_y+090.0.ply",
-            ]
-            for filename, camera_to_reference in zip(
-                filenames, (angle_0_pose, angle_90_pose)
-            ):
-                cloud = o3d.geometry.PointCloud()
-                raw_points = reconstruct_pipeline.transformed_points(
-                    reference_points, np.linalg.inv(camera_to_reference)
-                )
-                cloud.points = o3d.utility.Vector3dVector(raw_points)
-                cloud.colors = o3d.utility.Vector3dVector(colors)
-                self.assertTrue(o3d.io.write_point_cloud(str(input_dir / filename), cloud))
-
-            metadata = {
-                "schema_version": 2,
-                "captures": [
-                    {
-                        "filename": filename,
-                        "station_index": 0,
-                        "x_position_mm": 150.0,
-                        "x_offset_m": 0.0,
-                        "angle_deg": angle,
-                    }
-                    for filename, angle in zip(filenames, (0.0, 90.0))
-                ],
-            }
-            (input_dir / "scan_metadata.json").write_text(json.dumps(metadata))
-            pose_map = {
-                "schema_version": 1,
-                "quality_status": "valid",
-                "x_position_mm": 150.0,
-                "reference_angle_deg": 0.0,
-                "profile_origin_in_reference_m": [0.0, 0.0, 0.04],
-                "orbit_axis_reference": [1.0, 0.0, 0.0],
-                "orbit_fit_profile_frame": None,
-                "angles": [
-                    {
-                        "angle_deg": angle,
-                        "pose_valid": True,
-                        "camera_to_reference": pose.tolist(),
-                    }
-                    for angle, pose in ((0.0, angle_0_pose), (90.0, angle_90_pose))
-                ],
-            }
-            pose_map_path = root / "orbit_pose_map.json"
-            pose_map_path.write_text(json.dumps(pose_map))
-
-            reconstruct_pipeline.main(
-                [
-                    "--input-dir", str(input_dir),
-                    "--output-dir", str(output_dir),
-                    "--registration-mode", "aruco",
-                    "--pose-map", str(pose_map_path),
-                    "--crop-radius-m", "0.08",
-                    "--skip-per-scan-sor",
-                ]
-            )
-
-            merged = o3d.io.read_point_cloud(str(output_dir / "merged_cloud.ply"))
-            bounds = merged.get_axis_aligned_bounding_box()
-            np.testing.assert_allclose(bounds.get_min_bound(), reference_points.min(axis=0), atol=0.002)
-            np.testing.assert_allclose(bounds.get_max_bound(), reference_points.max(axis=0), atol=0.002)
-            diagnostics = json.loads(
-                (output_dir / "registration_diagnostics.json").read_text()
-            )
-            self.assertEqual(diagnostics["settings"]["registration_mode"], "aruco")
-            self.assertEqual(diagnostics["settings"]["orbit_radius_m"], None)
 
     def test_two_station_motor_pipeline_fuses_both_x_positions(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -596,7 +432,7 @@ class ReconstructionEndToEndTests(unittest.TestCase):
             ]
             for filename, offset in zip(filenames, (0.0, 0.08)):
                 cloud = o3d.geometry.PointCloud()
-                local_points = world_points - np.array([offset, 0.0, 0.0])
+                local_points = world_points + np.array([offset, 0.0, 0.0])
                 cloud.points = o3d.utility.Vector3dVector(local_points)
                 cloud.colors = o3d.utility.Vector3dVector(colors)
                 self.assertTrue(o3d.io.write_point_cloud(str(input_dir / filename), cloud))
@@ -605,7 +441,7 @@ class ReconstructionEndToEndTests(unittest.TestCase):
                 "schema_version": 2,
                 "orbit_radius_m": 0.1,
                 "orbit_axis": [1.0, 0.0, 0.0],
-                "reconstruction": {"crop_radius_m": 0.08},
+                "reconstruction": {"crop_radius_m": 0.20},
                 "captures": [
                     {
                         "filename": filename,
@@ -855,38 +691,43 @@ class HighDriftFrameExclusionTests(unittest.TestCase):
         self.assertEqual(reconstruct_pipeline.high_drift_frame_ids(edges), set())
 
 
-class CalibrationStationValidationTests(unittest.TestCase):
-    @staticmethod
-    def _captures(x_position_mm: float):
-        return [
-            reconstruct_pipeline.CaptureRecord(
-                path=Path(f"frame_s00_x{x_position_mm}_y+000.0.ply"),
-                angle_deg=0.0,
-                station_index=0,
-                x_position_mm=x_position_mm,
-                x_offset_m=0.0,
-            )
-        ]
+class CalibrationStationTests(unittest.TestCase):
+    """One calibration serves every X station once the pivot is shifted."""
 
-    def test_a_matching_station_is_accepted(self):
-        reconstruct_pipeline.validate_calibration_station(
-            {"motor": {"x_position_mm": 50.0}},
-            self._captures(50.0),
-            Path("radius_calibration.json"),
+    SOURCE = Path("radius_calibration.json")
+
+    def test_the_station_is_read_when_present(self):
+        self.assertEqual(
+            reconstruct_pipeline.calibration_station_x_mm(
+                {"motor": {"x_position_mm": 100.0}}, self.SOURCE,
+            ),
+            100.0,
         )
 
-    def test_a_mismatched_station_is_rejected(self):
-        with self.assertRaises(ValueError) as raised:
-            reconstruct_pipeline.validate_calibration_station(
-                {"motor": {"x_position_mm": 100.0}},
-                self._captures(50.0),
-                Path("radius_calibration.json"),
-            )
-        self.assertIn("X=100.0", str(raised.exception))
-        self.assertIn("X=50.0", str(raised.exception))
-
-    def test_a_calibration_without_a_station_only_warns(self):
+    def test_a_calibration_without_a_station_warns_and_returns_none(self):
         with self.assertLogs(reconstruct_pipeline.logger, level="WARNING"):
-            reconstruct_pipeline.validate_calibration_station(
-                {}, self._captures(50.0), Path("radius_calibration.json"),
+            self.assertIsNone(
+                reconstruct_pipeline.calibration_station_x_mm({}, self.SOURCE)
             )
+
+    def test_the_pivot_shifts_by_the_station_difference(self):
+        """A pivot measured at X=100 must move 50 mm along the axis for X=50."""
+        pivot = np.array([0.0, 0.0, 0.1433])
+        axis = np.array([1.0, 0.0, 0.0])
+        shifted = pivot - axis * ((50.0 - 100.0) / 1000.0)
+        np.testing.assert_allclose(shifted, [0.05, 0.0, 0.1433], atol=1e-12)
+
+    def test_a_matching_station_leaves_the_pivot_alone(self):
+        pivot = np.array([0.0, 0.0, 0.1433])
+        axis = np.array([1.0, 0.0, 0.0])
+        shifted = pivot - axis * ((100.0 - 100.0) / 1000.0)
+        np.testing.assert_allclose(shifted, pivot, atol=1e-12)
+
+
+class RemovedPoseMapTests(unittest.TestCase):
+    def test_removed_modes_and_pose_map_are_rejected(self):
+        for options in (["--registration-mode", "aruco"],
+                        ["--registration-mode", "aruco-guarded-icp"],
+                        ["--pose-map", "poses.json"]):
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                reconstruct_pipeline.parse_args(["--input-dir", "scan", *options])

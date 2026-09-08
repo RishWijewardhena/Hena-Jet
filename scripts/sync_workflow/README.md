@@ -32,7 +32,6 @@ merged_cloud.ply + pose matrices + registration_diagnostics.json
 
 The reconstruction is anchored by known motor positions. ICP is optional and cannot make a large, unconstrained correction to the motor geometry.
 
-For mechanisms that do not follow a perfect circle, `calculating_radius/capture_orbit_pose_map.py` provides a second path. It observes the fixed ArUco profile and records the complete point-cloud-camera rotation and translation at every motor angle. Reconstruction can then use those measured poses instead of deriving poses from one radius, axis, and motor angle.
 
 ## Coordinate model and `--radius-m`
 
@@ -186,71 +185,6 @@ For a valid run, the console prints a directly usable value:
 ```
 
 If the report says `quality_status: invalid`, do not copy a radius. Inspect the annotated images, check printed scale and placement, improve illumination, and repeat the complete orbit. The tool reports the value but deliberately does not overwrite scan metadata or reconstruction settings.
-
-## Calibrate a full pose at every angle
-
-Radius-only reconstruction assumes a perfectly circular path, a fixed look-at direction, and a known orbit axis. Use the full-pose workflow when the real mechanism has camera tilt, axis offset, wobble, or small non-circular motion.
-
-### 1. Scan only the fixed marked profile
-
-Keep the wrapped profile rigidly fixed and run:
-
-```bash
-python scripts/sync_workflow/calculating_radius/capture_orbit_pose_map.py \
-  --x-pos 150 \
-  --step-deg 10 \
-  --frames-per-angle 10 \
-  --marker-map outputs/radius_markers/profile_marker_map.json \
-  --output-dir outputs/profile_pose_calibration
-```
-
-Dry-run the motor sequence first when needed:
-
-```bash
-python scripts/sync_workflow/calculating_radius/capture_orbit_pose_map.py \
-  --x-pos 150 --step-deg 10 --dry-run
-```
-
-The workflow uses software depth-to-color alignment. Therefore, aligned depth is back-projected with RGB intrinsics and each PLY lives in the RGB camera coordinate system. This is intentional: using the original depth intrinsics on a depth-to-color aligned image changes metric X/Y scale. The pose map consequently uses the matching RGB/point-cloud camera pose.
-
-For each angle, the program solves every accepted ArUco frame, rejects translation and rotation outliers with a 3.5-MAD test, and robustly combines the surviving transforms. The important output is `orbit_pose_map.json`. It contains:
-
-- `world_to_pointcloud`: the fixed-profile coordinate system expressed in that angle's aligned point-cloud camera;
-- `camera_to_reference`: the transform applied to that angle's raw depth points;
-- `reference_angle_deg`: the depth-camera coordinate system used by the final cloud;
-- `profile_origin_in_reference_m`: the profile origin in that reference camera, used as the default crop center;
-- per-angle translation/rotation spreads and all frame-level detection diagnostics;
-- a fitted radius for diagnostics, although measured-pose reconstruction does not require it.
-
-The map is marked incomplete if any commanded angle lacks a valid pose. Do not lower the reprojection threshold to hide a bad marker map; inspect `pose_diagnostics/`, lighting, wrap flatness, and corner orientation.
-
-### 2. Capture the object with identical mechanics
-
-After pose calibration, capture the hand or object using exactly the same homing reference, X position, angular step, camera mount, and motor mechanism:
-
-```bash
-python scripts/sync_workflow/main_scan.py \
-  --x-positions-mm 150 \
-  --step-deg 10 \
-  --output-dir outputs/hand_scan_measured_poses
-```
-
-The fixed profile must not move between the calibration and object scans. The camera mount, belt/coupling, motor zero, and X station must also remain unchanged. The first implementation intentionally supports one X station; create a separate pose map for a different X position.
-
-### 3. Reconstruct with the measured poses
-
-```bash
-python scripts/sync_workflow/reconstruct_pipeline.py \
-  --input-dir outputs/hand_scan_measured_poses \
-  --output-dir outputs/hand_scan_measured_poses/reconstruction_aruco \
-  --registration-mode aruco \
-  --pose-map outputs/profile_pose_calibration/orbit_pose_map.json \
-  --crop-radius-m 0.075
-```
-
-`aruco` uses the measured matrices directly and disables ICP. `aruco-guarded-icp` starts from the same measured matrices and then attempts guarded residual ICP corrections. Start with `aruco` so the calibration can be judged without ICP changing it.
-
-The final coordinate-system origin and axes are those of the aligned RGB/point-cloud camera at `reference_angle_deg`, not the profile. To crop around a point other than the profile origin, pass an explicit `--pivot X Y Z` expressed in that reference camera.
 
 ## Capture flow: `main_scan.py`
 
@@ -417,11 +351,11 @@ Measured on this rig, one run therefore determines the radius to roughly +/- 0.5
 
 Two limitations remain. A bootstrap standard deviation measures precision, not accuracy, so it cannot detect a biased calibration from one run: the original `outputs/test_radius_x100` result sits 0.7 mm from the later runs, its bias coming from sparse angular coverage of 13 angles at a 30 degree step with two contributing no poses. And the gate cannot distinguish a rig that needs better markers from one that needs more runs. Comparing repeat runs is what exposes both.
 
-Reconstruction also refuses an `--orbit-geometry` calibration measured at a different X station than the scan, matching the check the ArUco pose-map path already performed. Pose priors survive a station mismatch, since rotation about a line is invariant to sliding the pivot along it, but the pivot is also the crop centre, so the crop is displaced by the whole station offset. An explicit `--pivot` overrides the check.
+One `--orbit-geometry` calibration serves every X station. The radius and axis are properties of the mechanism and do not depend on X; the pivot only slides along the axis, which leaves the pose priors untouched because rotation about a line is invariant to where along it the pivot sits. Reconstruction reads the calibration's own `motor.x_position_mm` and shifts the pivot by `scan_X - calibration_X` before using it as a crop centre, so a calibration captured at X=100 reconstructs an X=50 scan correctly. A calibration that records no station falls back to the scan's own first station and logs a warning; an explicit `--pivot` overrides the shift.
+
 
 `--auto-radius` is diagnostic, not physical calibration. It cannot reliably distinguish the object's visible surface from the mechanical rotation center. Explicit CLI axis and crop values similarly override recorded metadata and defaults. Legacy metadata without `registration_crop_radius_m` automatically uses the smaller of 0.10 m and the positive final crop, so existing datasets gain the safer ICP region without changing their final output extent.
 
-For ArUco modes, `--pose-map` supplies the complete pose matrices and a radius is not required. An explicit `--pivot` overrides the pose map's profile-origin crop center.
 
 ### `reconstruct_pipeline.py` options
 
@@ -429,9 +363,8 @@ For ArUco modes, `--pose-map` supplies the complete pose matrices and a radius i
 |---|---|
 | `--input-dir` | Required directory containing `frame_*.ply` and optional scan metadata. |
 | `--output-dir` | Reconstruction destination; default `<input-dir>/reconstruction`. |
-| `--registration-mode` | `motor`, `guarded-icp`, `aruco`, or `aruco-guarded-icp`; default `motor`. |
-| `--pose-map` | Full-pose calibration JSON required by the two `aruco` modes. |
-| `--orbit-radius-m` | Explicit calibrated orbit radius; otherwise read from metadata. Not required by ArUco modes. |
+| `--registration-mode` | `motor` or `guarded-icp`; default `motor`. |
+| `--orbit-radius-m` | Explicit calibrated orbit radius; otherwise read from metadata. |
 | `--orbit-geometry` | `radius_calibration.json` whose measured `orbit_geometry` supplies the orbit axis and pivot. |
 | `--auto-radius` | Use a rough first-frame surface-depth estimate instead of calibrated radius. |
 | `--orbit-axis X Y Z` | Axis in camera coordinates; otherwise metadata or `1 0 0`. |
@@ -446,7 +379,7 @@ For ArUco modes, `--pose-map` supplies the complete pose matrices and a radius i
 
 ### Stage 1: build pose priors
 
-In motor modes, the pipeline constructs the circular motor transform and adds the station's metric X offset along the orbit axis. In ArUco modes, it looks up the measured `camera_to_reference` matrix for every capture angle. These matrices are saved as `*_prior.txt`.
+The pipeline constructs the circular motor transform and adds the station offset along the orbit axis. These matrices are saved as `*_prior.txt`.
 
 ### Stage 2: select or refine poses
 
@@ -454,8 +387,6 @@ In motor modes, the pipeline constructs the circular motor transform and adds th
 |---|---|---|
 | `motor` | Uses each motor prior and skips ICP. | Default for calibrated hardware and noisy or symmetric subjects. |
 | `guarded-icp` | Attempts a small correction around each prior and rejects unsafe or unhelpful results. | Experiments with distinctive, overlapping geometry. |
-| `aruco` | Uses the complete measured depth-camera pose for every angle and skips ICP. | Diagnosing or correcting non-ideal mechanical orbits. |
-| `aruco-guarded-icp` | Starts from complete measured poses and allows guarded residual ICP. | Only after direct ArUco reconstruction is already close. |
 
 `main_scan.py` defaults to guarded ICP; `reconstruct_pipeline.py` still defaults to motor when run directly. Guarded ICP is the capture-time default for its diagnostics rather than its corrections: motor mode writes no edges at all, so nothing records per-edge fitness, residual, or whether the orbit closes. The guards keep it safe, since any correction that fails them falls back to the motor prior.
 
