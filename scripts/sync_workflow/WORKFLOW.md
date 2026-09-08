@@ -5,19 +5,34 @@ can stop a run. Prose and parameter tables live in [README.md](README.md); this
 file is the map.
 
 ```mermaid
-flowchart LR
-    A["calculating_radius/test_radius.py<br/>orbit calibration"] -->|radius_calibration.json| C
-    B["main_scan.py<br/>capture"] -->|"frame_*.ply<br/>scan_metadata.json"| C
-    C["reconstruct_pipeline.py<br/>pose + merge"] -->|merged_cloud.ply| D["scan_quality_report.py<br/>sphere_bar_report.py<br/>validation"]
+flowchart TD
+    subgraph ONCE ["ONCE per machine — ArUco profile bar in the rig"]
+        A["test_radius.py"] --> AJ["radius_calibration.json<br/>radius, pivot, axis"]
+    end
 
-    style A fill:#e8f0fe,stroke:#4285f4
-    style B fill:#e6f4ea,stroke:#34a853
+    subgraph EVERY ["EVERY scan — hand in the rig, no markers"]
+        B["main_scan.py"] --> BJ["frame_*.ply<br/>scan_metadata.json"]
+    end
+
+    AJ -.->|numbers only| C
+    BJ --> C["reconstruct_pipeline.py"]
+    C --> MC["merged_cloud.ply"]
+    MC --> D["scan_quality_report.py<br/>sphere_bar_report.py"]
+
+    style ONCE fill:#e8f0fe,stroke:#4285f4
+    style EVERY fill:#e6f4ea,stroke:#34a853
     style C fill:#fef7e0,stroke:#fbbc04
     style D fill:#fce8e6,stroke:#ea4335
 ```
 
-Calibration and capture are independent: the calibration measures the *machine*
-and is reused across scans, as long as both are at the same X station.
+**The marker bar and the hand are never in the rig at the same time.**
+`test_radius.py` looks at the ArUco bar to measure where the camera travels, and
+writes that geometry to a file. `main_scan.py` contains no marker code at all --
+it only moves the motor and saves point clouds. Reconstruction reads the
+calibration *file*, so a scan never needs a marker in view.
+
+Re-run the calibration only when the mechanics change, or when scanning at a
+different X station.
 
 ---
 
