@@ -7,6 +7,8 @@ This workflow captures RGB-D point clouds while the camera moves around a statio
 
 ## End-to-end flow
 
+[WORKFLOW.md](WORKFLOW.md) charts the same pipeline in more detail: the calibration gates, the depth filter chain, the four reconstruction stages, and which measurements are internally consistent versus traceable.
+
 ```text
 main_scan.py arguments
         |
@@ -377,7 +379,7 @@ With `--reconstruct`, the program closes the hardware after capture and launches
 | `--radius-m` | Optical-center to orbit-center distance in metres; required with `--reconstruct`. |
 | `--x-positions-mm` | One or more absolute X scan stations in millimetres; default `200`. |
 | `--orbit-axis X Y Z` | Orbit axis in camera coordinates; default `1 0 0`. |
-| `--registration-mode` | `motor` or `guarded-icp`; default `motor`. Full-pose reconstruction is launched separately. |
+| `--registration-mode` | `motor` or `guarded-icp`; default `guarded-icp`. Full-pose reconstruction is launched separately. |
 | `--frames-per-angle` | Fresh frames fused per angle; default 15. |
 | `--min-valid-samples` | Valid temporal depth samples required per fused pixel; default 3. |
 | `--min-confidence` | Reserved confidence threshold recorded in metadata; keep at 0 because confidence frames are not yet wired into capture. |
@@ -455,7 +457,11 @@ In motor modes, the pipeline constructs the circular motor transform and adds th
 | `aruco` | Uses the complete measured depth-camera pose for every angle and skips ICP. | Diagnosing or correcting non-ideal mechanical orbits. |
 | `aruco-guarded-icp` | Starts from complete measured poses and allows guarded residual ICP. | Only after direct ArUco reconstruction is already close. |
 
-Motor mode is deliberately the default. Smooth hands, repeated geometry, background points, and partial overlap can give ICP a plausible but physically incorrect match.
+`main_scan.py` defaults to guarded ICP; `reconstruct_pipeline.py` still defaults to motor when run directly. Guarded ICP is the capture-time default for its diagnostics rather than its corrections: motor mode writes no edges at all, so nothing records per-edge fitness, residual, or whether the orbit closes. The guards keep it safe, since any correction that fails them falls back to the motor prior.
+
+Do not expect it to improve the surface. On `outputs/scan_x100_r143259`, measured against the same captures, guarded ICP gave a 2.155 mm local surface RMS from 108542 points against motor mode's 2.084 mm from 140110, because its corrections have a 0.85 mm median and the surface noise is about 2 mm: it is adjusting poses by less than the uncertainty of the points it aligns. Smooth hands, repeated geometry, background points, and partial overlap can also give ICP a plausible but physically incorrect match, which is what the guards exist to catch.
+
+The reason to keep it on is the loop edge. On that scan it matched the two 180 degree views with 0.941 fitness and reported them 6.83 mm and 2.61 deg apart, exceeding the guards and falling back to the prior. That number is the largest geometric error left in the pipeline, larger than the radius uncertainty or the surface noise, and motor mode never measures it.
 
 Guarded ICP processes adjacent angles within each station, a loop edge for each complete orbit, and same-angle links between adjacent X stations:
 
