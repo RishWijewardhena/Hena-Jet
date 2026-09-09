@@ -20,6 +20,13 @@ from calculating_radius import test_radius
 
 
 class DepthFusionTests(unittest.TestCase):
+    def test_capture_profile_defaults_match_controller(self):
+        from camera_controller import CameraController
+        args = main_scan.parse_args([])
+        camera = CameraController()
+        self.assertEqual((args.width, args.height, args.disparity), (1280, 800, "128"))
+        self.assertEqual((camera.width, camera.height, camera.disparity), (1280, 800, "128"))
+
     def test_uses_median_valid_depth_and_masks_the_working_range(self):
         frames = [
             np.array([[0.0, 0.11], [0.20, 0.10]], dtype=np.float32),

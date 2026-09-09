@@ -3,8 +3,44 @@
 from __future__ import annotations
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
+
+# Explicit best-tested preset from filter_test_1280/noise_tuning. The test
+# used disparity 256; this is not an established optimum at disparity 128.
+# Width/height are SDK parameter reference dimensions, preserved from the
+# tested configuration, not requested stream dimensions.
+CAPTURE_FILTER_PARAMETERS = {
+    "SpatialAdvancedFilter": {"alpha": 0.5, "magnitude": 1, "disp_diff": 160, "radius": 1},
+    "TemporalFilter": {"weight": 0.4, "diff_scale": 0.1},
+    "NoiseRemovalFilter": {"max_size": 80, "min_diff": 256, "width": 848, "height": 480},
+    "EdgeNoiseRemovalFilter": {
+        "margin_x_th": 6, "margin_y_th": 6, "limit_x_th": 70, "limit_y_th": 30,
+        "enable_vertical_direction": 0, "width": 1280, "height": 800,
+    },
+}
+
+
+def configure_capture_filters(filters, requested_names):
+    """Set and read back the tested preset; do not silently accept SDK defaults."""
+    available = {f.get_name(): f for f in filters if f.is_enabled()}
+    verified = {}
+    for name in requested_names:
+        if name not in available:
+            raise RuntimeError(f"Requested capture filter is unavailable: {name}")
+        if name not in CAPTURE_FILTER_PARAMETERS:
+            continue
+        depth_filter = available[name]
+        verified[name] = {}
+        for key, value in CAPTURE_FILTER_PARAMETERS[name].items():
+            depth_filter.set_config_value(key, value)
+            active = float(depth_filter.get_config_value(key))
+            if not math.isclose(active, value, rel_tol=1e-6, abs_tol=1e-6):
+                raise RuntimeError(f"Filter setting mismatch: {name}.{key}: {active} != {value}")
+            verified[name][key] = active
+        logger.info("Verified capture filter %s: %s", name, verified[name])
+    return verified
 
 # The spatial and temporal filters operate in the disparity domain, so
 # DisparityTransform converts back to depth *after* them, which is where the

@@ -12,6 +12,8 @@ from depth_filters import (  # noqa: E402
     apply_depth_filters,
     gate_by_confidence,
     select_depth_filters,
+    configure_capture_filters,
+    CAPTURE_FILTER_PARAMETERS,
 )
 
 
@@ -37,6 +39,33 @@ class FakeFilter:
 
 
 class SelectDepthFiltersTests(unittest.TestCase):
+    def test_preset_overrides_different_sdk_defaults_and_verifies(self):
+        from unittest.mock import Mock
+        filters = []
+        for name, parameters in CAPTURE_FILTER_PARAMETERS.items():
+            values = {key: -1 for key in parameters}
+            f = Mock()
+            f.get_name.return_value = name
+            f.is_enabled.return_value = True
+            f.set_config_value.side_effect = values.__setitem__
+            f.get_config_value.side_effect = values.__getitem__
+            filters.append(f)
+        actual = configure_capture_filters(filters, CAPTURE_FILTER_PARAMETERS)
+        self.assertEqual(actual, CAPTURE_FILTER_PARAMETERS)
+
+    def test_preset_rejects_missing_filter(self):
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            configure_capture_filters([], ["TemporalFilter"])
+
+    def test_preset_rejects_ignored_setting(self):
+        from unittest.mock import Mock
+        f = Mock()
+        f.get_name.return_value = "TemporalFilter"
+        f.is_enabled.return_value = True
+        f.get_config_value.return_value = 0.9
+        with self.assertRaisesRegex(RuntimeError, "mismatch"):
+            configure_capture_filters([f], ["TemporalFilter"])
+
     def test_enables_only_the_requested_filters(self):
         recommended = [FakeFilter("TemporalFilter"), FakeFilter("DecimationFilter")]
 

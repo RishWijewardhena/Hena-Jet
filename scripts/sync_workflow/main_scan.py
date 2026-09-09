@@ -30,9 +30,9 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=str, default="/dev/ttyACM0", help="Motor controller serial port")
     parser.add_argument("--baud", type=int, default=250000, help="Baud rate")
     parser.add_argument("--step-deg", type=float, default=10.0, help="Degrees to step per capture")
-    parser.add_argument("--disparity", type=str, default="256", choices=["128", "256"], help="Disparity search range")
-    parser.add_argument("--width", type=int, default=848, help="Camera width resolution")
-    parser.add_argument("--height", type=int, default=530, help="Camera height resolution")
+    parser.add_argument("--disparity", type=str, default="128", choices=["128", "256"], help="Disparity search range")
+    parser.add_argument("--width", type=int, default=1280, help="Camera width resolution")
+    parser.add_argument("--height", type=int, default=800, help="Camera height resolution")
     parser.add_argument("--fps", type=int, default=30, help="Camera framerate")
     parser.add_argument("--radius-m", type=float, default=None,
                         help="Radius from camera optical center to orbit center in metres "

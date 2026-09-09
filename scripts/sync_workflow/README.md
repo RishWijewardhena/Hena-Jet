@@ -7,6 +7,29 @@ This workflow captures RGB-D point clouds while the camera moves around a statio
 
 ## End-to-end flow
 
+Capture requests **1280×800 at 30 fps, disparity 128** by default. The supplied
+Gemini 305g datasheet lists a 95 mm minimum for this resolution/disparity pair;
+the software depth gate does not extend the hardware operating range.
+
+The capture filter preset is explicitly set and read back at startup:
+
+| Filter | Explicit settings |
+| --- | --- |
+| SpatialAdvanced | alpha 0.5, magnitude 1, disp_diff 160, radius 1 |
+| Temporal | weight 0.4, diff_scale 0.1 |
+| NoiseRemoval | max_size 80, min_diff 256; reference dimensions 848×480 |
+| EdgeNoiseRemoval | margins 6/6, limits 70/30, vertical disabled; reference dimensions 1280×800 |
+
+These values match the best-tested chain from the 1280×800, disparity-256
+noise-tuning recording. More aggressive trials did not demonstrate an advantage.
+They are pinned even where numerically equal to SDK defaults; they are not an
+established optimum at disparity 128. NoiseRemoval's `min_diff=256` is a separate
+filter threshold, not the camera disparity search range. Reference dimensions
+are preserved from the tested filter configuration, not inferred from image size.
+The device-recommended processing order and disparity conversion are retained.
+Missing requested filters, rejected parameters or read-back mismatches abort
+startup; verified settings are written to the capture log.
+
 [WORKFLOW.md](WORKFLOW.md) charts the same pipeline in more detail: the calibration gates, the depth filter chain, the four reconstruction stages, and which measurements are internally consistent versus traceable.
 
 ```text
@@ -298,7 +321,7 @@ With `--reconstruct`, the program closes the hardware after capture and launches
 |---|---|
 | `--port`, `--baud` | Motor-controller serial connection. |
 | `--step-deg` | Angular spacing between captures. |
-| `--disparity` | Gemini 305 disparity range: 128 or 256. |
+| `--disparity` | Gemini 305 disparity range: 128 (default) or 256. |
 | `--width`, `--height`, `--fps` | Requested RGB-D stream configuration. |
 | `--orbit-geometry` | Measured calibration file; default repository `outputs/test_radius_x100/radius_calibration.json`. |
 | `--radius-m` | Optical-center to orbit-center distance in metres; defaults to the calibration recommended radius. |

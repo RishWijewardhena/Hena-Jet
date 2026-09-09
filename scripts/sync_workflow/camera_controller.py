@@ -1,7 +1,7 @@
 import logging
 from typing import Tuple, Optional
 
-from depth_filters import DEFAULT_ENABLED_FILTERS, apply_depth_filters, select_depth_filters
+from depth_filters import DEFAULT_ENABLED_FILTERS, apply_depth_filters, select_depth_filters, configure_capture_filters
 
 logger = logging.getLogger(__name__)
 
@@ -135,8 +135,8 @@ def configure_disparity_search_range(device, requested_disparity: str | int) -> 
 class CameraController:
     """Wrapper for Orbbec Gemini 305 camera operations."""
 
-    def __init__(self, width: int = 848, height: int = 530, fps: int = 30,
-                 disparity: str = "256", depth_filters=DEFAULT_ENABLED_FILTERS):
+    def __init__(self, width: int = 1280, height: int = 800, fps: int = 30,
+                 disparity: str = "128", depth_filters=DEFAULT_ENABLED_FILTERS):
         self.width = width
         self.height = height
         self.fps = fps
@@ -146,6 +146,7 @@ class CameraController:
         self.align_filter = None
         self.depth_filter_names = tuple(depth_filters or ())
         self.depth_filters = []
+        self.active_filter_parameters = {}
         self.camera_param = None
         self.intrinsics = None
         self.dist_coeffs = None
@@ -234,6 +235,14 @@ class CameraController:
         except Exception as e:
             logger.warning("Depth post-processing unavailable: %s", e)
             self.depth_filters = []
+
+        try:
+            self.active_filter_parameters = configure_capture_filters(
+                self.depth_filters, self.depth_filter_names
+            )
+        except Exception:
+            self.stop()
+            raise
 
         # Wait a few frames for auto-exposure to settle
         for _ in range(10):

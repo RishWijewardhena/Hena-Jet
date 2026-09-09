@@ -102,7 +102,7 @@ actually spread by 0.324 mm — optimistic by 1.9x.
 ```mermaid
 flowchart TD
     START([main_scan.py]) --> VAL[validate args]
-    VAL --> CAM[start camera<br/>848x530 @ 30 fps]
+    VAL --> CAM[start camera<br/>1280x800 @ 30 fps<br/>disparity 128]
     CAM --> FILT["enable 5 depth filters"]
     FILT --> HOME[home all axes]
     HOME --> PLAN["generate_angle_sequence<br/>0 to +180, back down to -180"]
