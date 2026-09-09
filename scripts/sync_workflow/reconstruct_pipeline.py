@@ -27,6 +27,7 @@ from typing import Optional
 import numpy as np
 
 from orbit_geometry import select_orbit_geometry, load_orbit_geometry, validate_camera_frame
+import tsdf_fusion
 from pointcloud_processing import (
     CylinderCrop,
     merge_and_finalize_clouds,
@@ -960,6 +961,29 @@ def parse_args(argv=None):
     )
     parser.add_argument("--skip-per-scan-sor", action="store_true",
                         help="Skip per-scan SOR (much faster; final SOR still runs)")
+    parser.add_argument(
+        "--fusion", choices=("points", "tsdf", "both"), default="points",
+        help="How to combine the registered captures. 'points' concatenates the "
+             "per-view clouds, which stacks every view's noise into one surface. "
+             "'tsdf' averages them into a signed-distance field, cancelling "
+             "independent per-view error and producing a mesh. 'both' writes each.",
+    )
+    parser.add_argument(
+        "--tsdf-voxel-m", type=float, default=tsdf_fusion.DEFAULT_VOXEL_M,
+        help="TSDF voxel edge length. The default matches the camera's 1 mm depth "
+             "quantisation: finer adds no information, coarser trades real detail "
+             "for smoothness",
+    )
+    parser.add_argument(
+        "--tsdf-trunc-m", type=float, default=tsdf_fusion.DEFAULT_SDF_TRUNC_M,
+        help="TSDF truncation distance; keep it a few voxels wide so the field "
+             "can interpolate across a surface",
+    )
+    parser.add_argument(
+        "--tsdf-depth", choices=("sensor", "output"), default="sensor",
+        help="Which saved depth to fuse when a scan recorded rgbd/: the raw "
+             "sensor depth, or the processed per-capture output",
+    )
     return parser.parse_args(argv)
 
 
@@ -967,6 +991,14 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     args = parse_args(argv)
+
+    if args.tsdf_voxel_m <= 0 or args.tsdf_trunc_m <= 0:
+        raise ValueError("--tsdf-voxel-m and --tsdf-trunc-m must be positive")
+    if args.fusion != "points" and args.tsdf_trunc_m < args.tsdf_voxel_m:
+        raise ValueError(
+            "--tsdf-trunc-m must be at least --tsdf-voxel-m so the signed-distance "
+            "field can interpolate across a surface"
+        )
 
     guarded_icp_mode = args.registration_mode == "guarded-icp"
     if args.exclude_high_drift_frames and not guarded_icp_mode:
@@ -984,8 +1016,25 @@ def main(argv=None):
     args.orbit_geometry = select_orbit_geometry(args.orbit_geometry, scan_metadata)
     calibration = load_orbit_geometry(args.orbit_geometry)
     intrinsics_path = input_dir / "intrinsics.json"
+    camera_intrinsics = None
     if intrinsics_path.is_file():
-        validate_camera_frame(calibration, json.loads(intrinsics_path.read_text()))
+        camera_intrinsics = json.loads(intrinsics_path.read_text())
+        validate_camera_frame(calibration, camera_intrinsics)
+    if args.fusion != "points" and camera_intrinsics is None:
+        raise ValueError(
+            f"TSDF fusion needs camera intrinsics, but {intrinsics_path} is missing. "
+            "Depth is recovered by reprojecting each capture through its pinhole "
+            "model, which cannot be done without them."
+        )
+
+    # TSDF integrates depth maps, so it needs the range the captures were
+    # exported with rather than the merge path's geometric crop alone.
+    capture_settings = scan_metadata.get("capture", {}) or {}
+    capture_range = capture_settings.get("depth_range_m") or []
+    if len(capture_range) == 2 and all(np.isfinite(capture_range)):
+        fusion_depth_min_m, fusion_depth_max_m = (float(v) for v in capture_range)
+    else:
+        fusion_depth_min_m, fusion_depth_max_m = 0.0, 1.0
     measured_geometry = calibration["orbit_geometry"]
     orbit_axis = np.asarray(measured_geometry["axis"], dtype=float)
     calibration_x_mm = (
@@ -1261,6 +1310,36 @@ def main(argv=None):
     }
     save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
 
+    tsdf_stats = None
+    if args.fusion in ("tsdf", "both"):
+        logger.info("Stage 3a: TSDF volumetric fusion...")
+        tsdf_stats = tsdf_fusion.fuse_captures(
+            [frames[frame_id].path for frame_id in merge_frame_ids],
+            [optimized_poses[frame_id] for frame_id in merge_frame_ids],
+            camera_intrinsics,
+            input_dir=input_dir,
+            output_dir=output_dir,
+            voxel_length_m=args.tsdf_voxel_m,
+            sdf_trunc_m=args.tsdf_trunc_m,
+            depth_min_m=fusion_depth_min_m,
+            depth_max_m=fusion_depth_max_m,
+            depth_source=args.tsdf_depth,
+            crop_bounds=final_crop_bounds[merge_frame_ids[0]],
+        )
+        settings["tsdf_fusion"] = tsdf_stats
+        save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
+
+    if args.fusion == "tsdf":
+        logger.info("Finished!")
+        logger.info("TSDF mesh: %s", tsdf_stats["mesh_path"])
+        logger.info("TSDF cloud: %s", tsdf_stats["cloud_path"])
+        logger.info("Diagnostics: %s", output_dir / "registration_diagnostics.json")
+        logger.info("Processing log: %s", processing_log_path)
+        file_handler.flush()
+        logging.getLogger().removeHandler(file_handler)
+        file_handler.close()
+        return
+
     logger.info("Stage 3/4: Open3D full-resolution transform and cleanup...")
     transformed_paths, transform_stats = transform_and_clean_clouds(
         [frames[frame_id].path for frame_id in merge_frame_ids],
@@ -1304,8 +1383,14 @@ def main(argv=None):
     }
     save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
 
+    settings["processing"]["tsdf_fusion"] = tsdf_stats
+    save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
+
     logger.info("Finished!")
     logger.info("Merged cloud: %s", merged_cloud_path)
+    if tsdf_stats is not None:
+        logger.info("TSDF mesh: %s", tsdf_stats["mesh_path"])
+        logger.info("TSDF cloud: %s", tsdf_stats["cloud_path"])
     logger.info("Diagnostics: %s", output_dir / "registration_diagnostics.json")
     logger.info("Processing log: %s", processing_log_path)
     file_handler.flush()
