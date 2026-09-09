@@ -79,6 +79,22 @@ baseline, not completeness against every frame originally recorded.
 
 ## Parameter experiments
 
+`noise_trials.json` provides five comparison chains: current defaults,
+NoiseRemoval `max_size` 160 and 320 (recorded default 80), vertical edge filtering
+enabled (recorded default disabled), and size 160 combined with vertical edges.
+These are experimental settings validated against the recorded SDK ranges, not
+accuracy-validated presets. Other thresholds and parameter reference dimensions
+remain at SDK defaults to isolate the effects. Larger noise-size limits may also
+remove small real features; inspect boundaries and retained coverage.
+
+```bash
+python scripts/filter_testing/filter_bench.py compare \
+  --bag outputs/filter_test_1280/raw.bag \
+  --output outputs/filter_test_1280/noise_tuning \
+  --trials scripts/filter_testing/noise_trials.json \
+  --seconds 5 --min-depth 0.05 --max-depth 0.25 --plot
+```
+
 Read a successful trial's `inventory.json`, then create a JSON list such as:
 
 ```json

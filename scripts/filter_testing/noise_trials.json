@@ -1,0 +1,47 @@
+[
+  {
+    "name": "current_defaults",
+    "filters": {
+      "SpatialAdvancedFilter": {},
+      "TemporalFilter": {},
+      "NoiseRemovalFilter": {},
+      "EdgeNoiseRemovalFilter": {}
+    }
+  },
+  {
+    "name": "noise_max_size_160",
+    "filters": {
+      "SpatialAdvancedFilter": {},
+      "TemporalFilter": {},
+      "NoiseRemovalFilter": {"max_size": 160},
+      "EdgeNoiseRemovalFilter": {}
+    }
+  },
+  {
+    "name": "noise_max_size_320",
+    "filters": {
+      "SpatialAdvancedFilter": {},
+      "TemporalFilter": {},
+      "NoiseRemovalFilter": {"max_size": 320},
+      "EdgeNoiseRemovalFilter": {}
+    }
+  },
+  {
+    "name": "edge_vertical_enabled",
+    "filters": {
+      "SpatialAdvancedFilter": {},
+      "TemporalFilter": {},
+      "NoiseRemovalFilter": {},
+      "EdgeNoiseRemovalFilter": {"enable_vertical_direction": 1}
+    }
+  },
+  {
+    "name": "noise_160_and_vertical_edges",
+    "filters": {
+      "SpatialAdvancedFilter": {},
+      "TemporalFilter": {},
+      "NoiseRemovalFilter": {"max_size": 160},
+      "EdgeNoiseRemovalFilter": {"enable_vertical_direction": 1}
+    }
+  }
+]
