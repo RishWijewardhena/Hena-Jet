@@ -73,7 +73,7 @@ def parse_args(argv=None):
                         help="Discard depth closer than this distance")
     parser.add_argument("--depth-max-m", type=float, default=0.25,
                         help="Discard depth farther than this distance")
-    parser.add_argument("--crop-radius-m", type=float, default=0.08,
+    parser.add_argument("--crop-radius-m", type=float, default=0.085,
                         help="Final reconstruction crop limit around the orbit center")
     parser.add_argument(
         "--registration-crop-radius-m",

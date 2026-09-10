@@ -33,7 +33,7 @@ class ReconstructionCliTests(unittest.TestCase):
             reconstruct_pipeline.resolve_crop_radii(
                 args.crop_radius_m, args.registration_crop_radius_m, {},
             ),
-            (0.08, 0.08),
+            (0.085, 0.085),
         )
         self.assertEqual(
             reconstruct_pipeline.resolve_crop_axial_half_length(

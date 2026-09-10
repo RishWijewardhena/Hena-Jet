@@ -98,10 +98,11 @@ class ScanMetadataTests(unittest.TestCase):
 
         self.assertEqual(args.x_positions_mm, [150.0])
 
-    def test_registration_crop_defaults_to_10cm(self):
+    def test_crop_defaults_match_the_hand_scan(self):
         args = main_scan.parse_args([])
 
-        self.assertEqual(args.registration_crop_radius_m, 0.10)
+        self.assertEqual(args.crop_radius_m, 0.085)
+        self.assertEqual(args.registration_crop_radius_m, 0.085)
 
     def test_automatic_registration_crop_does_not_exceed_the_final_crop(self):
         args = main_scan.parse_args(["--crop-radius-m", "0.075"])
@@ -189,10 +190,10 @@ class ScanMetadataTests(unittest.TestCase):
         self.assertEqual(metadata["orbit_axis"], [1.0, 0.0, 0.0])
         self.assertEqual(metadata["capture"]["frames_per_angle"], 5)
         self.assertEqual(metadata["capture"]["depth_range_m"], [0.05, 0.3])
-        self.assertEqual(metadata["reconstruction"]["crop_radius_m"], 0.15)
+        self.assertEqual(metadata["reconstruction"]["crop_radius_m"], 0.085)
         self.assertEqual(
             metadata["reconstruction"]["registration_crop_radius_m"],
-            0.10,
+            0.085,
         )
         self.assertEqual(metadata["captured_angles_deg"], [0.0, 10.0])
         self.assertEqual(metadata["x_stage"]["positions_mm"], [200.0])

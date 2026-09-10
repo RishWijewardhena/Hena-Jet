@@ -868,7 +868,7 @@ def parse_args(argv=None):
                         help="Sign convention for angle direction (1.0 or -1.0)")
     parser.add_argument("--crop-radius-m", type=float, default=None,
                         help="Final output crop limit around the pivot "
-                             "(defaults to scan metadata or 0.08m; set <= 0 to disable)")
+                             "(defaults to scan metadata or 0.085m; set <= 0 to disable)")
     parser.add_argument(
         "--registration-crop-radius-m",
         type=float,

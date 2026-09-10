@@ -332,8 +332,8 @@ With `--reconstruct`, the program closes the hardware after capture and launches
 | `--min-valid-samples` | Valid temporal depth samples required per fused pixel; default 3. |
 | `--min-confidence` | Reserved confidence threshold recorded in metadata; keep at 0 because confidence frames are not yet wired into capture. |
 | `--depth-min-m`, `--depth-max-m` | Accepted depth interval; defaults 0.02 and 0.25 m. |
-| `--crop-radius-m` | Final output crop radial limit; default 0.08 m. |
-| `--registration-crop-radius-m` | Tighter crop used only for guarded ICP; default 0.10 m. |
+| `--crop-radius-m` | Final output crop radial limit; default 0.085 m. |
+| `--registration-crop-radius-m` | Tighter crop used only for guarded ICP; default `min(final crop, 0.10 m)`, therefore 0.085 m with the standard crop. |
 | `--crop-shape` | `cylinder` (default) or `cube`; the cylinder separates radial and axial limits. |
 | `--crop-axial-half-length-m` | Cylinder half-length along the orbit axis; default 0.30 m. |
 | `--output-dir` | Directory for the scan PLYs, intrinsics, and metadata; default `outputs/scan`. |
@@ -400,7 +400,7 @@ Explicit crop values override recorded crop metadata and defaults. Legacy metada
 | `--pivot X Y Z` | Explicit orbit center in zero-frame camera coordinates; default measured calibration pivot. |
 | `--reference-angle-deg` | Motor angle treated as the reference pose; default 0 degrees. |
 | `--angle-sign` | Converts the recorded motor-angle direction to the reconstruction convention; use `1` or `-1`. |
-| `--crop-radius-m` | Final output crop radial limit around the pivot; metadata or 0.08 m by default, and `<= 0` disables it. |
+| `--crop-radius-m` | Final output crop radial limit around the pivot; metadata or 0.085 m by default, and `<= 0` disables it. |
 | `--registration-crop-radius-m` | Crop limit used only to construct ICP clouds; metadata or `min(final crop, 0.10 m)` by default, and `<= 0` disables it. |
 | `--crop-shape` | `cylinder` (default) or `cube`; the cylinder reads both crop radii as radial limits around the orbit axis. |
 | `--crop-axial-half-length-m` | Half-length along the orbit axis when `--crop-shape cylinder`; metadata or 0.30 m by default. |
