@@ -34,6 +34,10 @@ class ReconstructionCliTests(unittest.TestCase):
 
         self.assertEqual(radius, 0.1175)
 
+    def test_auto_radius_option_is_removed(self):
+        with self.assertRaises(SystemExit):
+            reconstruct_pipeline.parse_args(["--input-dir", "scan", "--auto-radius"])
+
 
 
     def test_registration_crop_defaults_to_10cm_without_shrinking_final_crop(self):

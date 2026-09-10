@@ -365,8 +365,8 @@ Known point-cloud camera frames must match the calibration camera frame.
 The measured axis is authoritative. `--pivot` overrides the measured pivot and
 disables the calibration-station crop shift. Radius comes from
 `recommended_radius_m`, unless `--radius-m` (capture) or `--orbit-radius-m`
-(reconstruction) overrides it. `--auto-radius` remains a diagnostic surface-depth
-estimate; changing the scalar radius does not alter the measured pivot or axis.
+(reconstruction) overrides it. Changing the scalar radius does not alter the
+measured pivot or axis.
 `--registration-mode motor` disables ICP while retaining measured geometry.
 
 A calibration is accepted on the uncertainty of the fitted radius, not on the scatter of the observations behind it. Single-marker ArUco poses are noisy but unbiased, so hundreds of them average to a stable radius: in `outputs/radius_x100_rerun2` a 3.207 mm observation RMSE over 179 inliers gave a 0.194 mm bootstrap standard deviation, and two independent runs fifteen minutes apart agreed to 0.058 mm while individual angles moved by up to 8.5 mm. `--max-radius-std-mm` (0.25) is therefore the gate, and per-angle median residuals are reported in `angle_median_residual_m` as diagnostics.
@@ -382,7 +382,7 @@ Two limitations remain. A bootstrap standard deviation measures precision, not a
 One `--orbit-geometry` calibration serves every X station. The radius and axis are properties of the mechanism and do not depend on X; the pivot only slides along the axis, which leaves the pose priors untouched because rotation about a line is invariant to where along it the pivot sits. Reconstruction reads the calibration's own `motor.x_position_mm` and shifts the pivot by `scan_X - calibration_X` before using it as a crop centre, so a calibration captured at X=100 reconstructs an X=50 scan correctly. A calibration must record its station; an explicit `--pivot` overrides the shift.
 
 
-`--auto-radius` is diagnostic, not physical calibration. It cannot reliably distinguish the object's visible surface from the mechanical rotation center. Explicit crop values override recorded crop metadata and defaults. Legacy metadata without `registration_crop_radius_m` automatically uses the smaller of 0.10 m and the positive final crop, so existing datasets gain the safer ICP region without changing their final output extent.
+Explicit crop values override recorded crop metadata and defaults. Legacy metadata without `registration_crop_radius_m` automatically uses the smaller of 0.10 m and the positive final crop, so existing datasets gain the safer ICP region without changing their final output extent.
 
 
 ### `reconstruct_pipeline.py` options
@@ -394,7 +394,6 @@ One `--orbit-geometry` calibration serves every X station. The radius and axis a
 | `--registration-mode` | `motor` or `guarded-icp`; default `guarded-icp`. |
 | `--orbit-radius-m` | Explicit orbit radius; otherwise the calibration recommended radius. |
 | `--orbit-geometry` | `radius_calibration.json` whose measured `orbit_geometry` supplies the orbit axis and pivot; selection is CLI, recorded scan path, then the fixed rig file. |
-| `--auto-radius` | Use a rough first-frame surface-depth estimate instead of calibrated radius. |
 | `--orbit-axis X Y Z` | Legacy option; measured calibration axis takes precedence. |
 | `--pivot X Y Z` | Explicit orbit center in zero-frame camera coordinates; default measured calibration pivot. |
 | `--reference-angle-deg` | Motor angle treated as the reference pose; default 0 degrees. |

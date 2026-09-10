@@ -385,45 +385,6 @@ def resolve_crop_axial_half_length(
     return value
 
 
-def calculate_auto_radius(o3d, ply_files: list[Path]) -> float:
-    """Read frame_0.0.ply (or first frame), find the hand, and return its Z depth."""
-    target = next(
-        (p for p in ply_files if abs(read_angle_from_filename(p.name)) < 1e-9),
-        ply_files[0],
-    )
-    cloud = o3d.io.read_point_cloud(str(target))
-    if cloud.is_empty():
-        raise RuntimeError(f"Could not read points for auto-radius from {target}")
-    
-    pts = np.asarray(cloud.points, dtype=float)
-    finite = pts[np.all(np.isfinite(pts), axis=1) & (pts[:, 2] > 0.01)]
-    if len(finite) < 100:
-        raise RuntimeError("Not enough points to calculate auto-radius.")
-
-    # Find center 10%
-    cx = (finite[:, 0].max() + finite[:, 0].min()) / 2
-    cy = (finite[:, 1].max() + finite[:, 1].min()) / 2
-    x_range = finite[:, 0].max() - finite[:, 0].min()
-    y_range = finite[:, 1].max() - finite[:, 1].min()
-    
-    mask = (
-        (np.abs(finite[:, 0] - cx) < x_range * 0.10) &
-        (np.abs(finite[:, 1] - cy) < y_range * 0.10)
-    )
-    center_pts = finite[mask]
-    if len(center_pts) == 0:
-        center_pts = finite # fallback if crop is empty
-        
-    radius = float(np.median(center_pts[:, 2]))
-    logger.warning(
-        "Estimated visible-surface depth from %s: %.3fm. This is not a "
-        "calibrated optical-center orbit radius.",
-        target.name,
-        radius,
-    )
-    return radius
-
-
 # ===================================================================
 
 # Orbit pose builder
@@ -885,12 +846,8 @@ def parse_args(argv=None):
             "Pose source: motor orbit or guarded motor+ICP (default: guarded-icp)"
         ),
     )
-    parser.add_argument("--auto-radius", action="store_true",
-                        help="Estimate center-surface depth from the first frame (rough fallback; "
-                             "not a physical orbit-radius calibration)")
     parser.add_argument("--orbit-radius-m", type=float, default=None,
-                        help="Camera orbit radius in metres; defaults to measured calibration "
-                             "(ignored if --auto-radius is used)")
+                        help="Camera orbit radius in metres; defaults to measured calibration")
     parser.add_argument("--orbit-axis", type=float, nargs=3, default=None,
                         help="Legacy axis option; measured calibration supplies the orbit axis")
     parser.add_argument("--pivot", type=float, nargs=3, default=None,
@@ -1040,14 +997,10 @@ def main(argv=None):
     calibration_x_mm = (
         None if args.pivot else calibration_station_x_mm(calibration, args.orbit_geometry)
     )
-    if args.auto_radius:
-        import open3d as o3d
-        orbit_radius_m = calculate_auto_radius(o3d, ply_files)
-    else:
-        orbit_radius_m = resolve_orbit_radius(
-            args.orbit_radius_m,
-            {"orbit_radius_m": calibration["recommended_radius_m"]},
-        )
+    orbit_radius_m = resolve_orbit_radius(
+        args.orbit_radius_m,
+        {"orbit_radius_m": calibration["recommended_radius_m"]},
+    )
     pivot = np.asarray(args.pivot if args.pivot else measured_geometry["pivot_m"], dtype=float)
     if pivot.shape != (3,) or not np.isfinite(pivot).all():
         raise ValueError("--pivot must contain three finite coordinates")
@@ -1230,11 +1183,7 @@ def main(argv=None):
         "registration_mode": args.registration_mode,
         "orbit_radius_m": orbit_radius_m,
         "orbit_radius_source": (
-            "auto"
-            if args.auto_radius
-            else "cli"
-            if args.orbit_radius_m is not None
-            else "orbit_geometry"
+            "cli" if args.orbit_radius_m is not None else "orbit_geometry"
         ),
         "orbit_geometry_source": (
             str(args.orbit_geometry) if args.orbit_geometry else None
