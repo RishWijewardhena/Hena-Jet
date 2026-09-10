@@ -17,6 +17,7 @@ flowchart TD
     AJ -.->|numbers only| C
     BJ --> C["reconstruct_pipeline.py"]
     C --> MC["merged_cloud.ply"]
+    C --> TM["tsdf_mesh.ply<br/>tsdf_mesh_cleaned.ply"]
     MC --> D["scan_quality_report.py<br/>sphere_bar_report.py"]
 
     style ONCE fill:#e8f0fe,stroke:#4285f4
@@ -25,11 +26,12 @@ flowchart TD
     style D fill:#fce8e6,stroke:#ea4335
 ```
 
-**The marker bar and the hand are never in the rig at the same time.**
-`test_radius.py` looks at the ArUco bar to measure where the camera travels, and
-writes that geometry to a file. `main_scan.py` contains no marker code at all --
-it only moves the motor and saves point clouds. Reconstruction reads the
-calibration *file*, so a scan never needs a marker in view.
+**The marker bar may be visible in the same video as the hand, but that is not
+guaranteed and reconstruction must not depend on it.** `test_radius.py` uses an
+ArUco bar when it is available to measure where the camera travels and writes
+that geometry to a file. `main_scan.py` contains no marker code at all -- it
+only moves the motor and saves point clouds. Reconstruction reads the calibration
+*file*, so a hand scan does not require a marker in view.
 
 Re-run the calibration only when the mechanics change. **A different X station
 does not need its own calibration** -- the radius and axis do not depend on X,
@@ -118,7 +120,7 @@ flowchart TD
     YLOOP -->|angles done| XLOOP
     XLOOP -->|stations done| META[scan_metadata.json]
     META --> RECON{"--reconstruct?"}
-    RECON -->|yes| SUB["launch reconstruct_pipeline.py<br/>measured calibration + guarded ICP + crop"]
+    RECON -->|yes| SUB["launch reconstruct_pipeline.py<br/>measured calibration + guarded ICP<br/>85 mm cylindrical crop + TSDF and point fusion"]
     RECON -->|no| DONE([captures on disk])
 
     style FILT fill:#e8f0fe
@@ -191,7 +193,7 @@ flowchart TD
         M5 --> M6[estimate + orient normals]
     end
 
-    MERGE --> OUT(["merged_cloud.ply<br/>optimized_poses.npy<br/>registration_diagnostics.json"])
+    MERGE --> OUT(["merged_cloud.ply<br/>tsdf_cloud.ply<br/>tsdf_mesh.ply (raw)<br/>tsdf_mesh_cleaned.ply<br/>optimized_poses.npy<br/>registration_diagnostics.json"])
 
     style OUT fill:#e6f4ea
 ```
@@ -210,7 +212,7 @@ flowchart LR
     end
     subgraph CYL ["cylinder — separates cleanly"]
         direction TB
-        CY["radial limit 80 mm<br/>axial limit +/-150 mm"]
+        CY["standard radial limit 85 mm<br/>axial limit +/-300 mm"]
         CY --> CY2["keeps 100% of the object<br/>and 0% of the ring"]
     end
 
@@ -222,6 +224,17 @@ Two independent crops: `--registration-crop-radius-m` shapes only the reduced
 clouds ICP sees, and `--crop-radius-m` shapes the full-resolution output.
 Tightening the registration crop keeps rig geometry out of ICP without
 shrinking the result.
+
+### TSDF surface artifact
+
+`--fusion both` is the default. In addition to `merged_cloud.ply`, it integrates
+the registered depth frames into a 1 mm TSDF with a 3 mm truncation distance.
+`tsdf_mesh.ply` is the unmodified extracted mesh, retained for inspection.
+`tsdf_mesh_cleaned.ply` is the intended path-planning surface: it removes
+degenerate, duplicate, unreferenced, and non-manifold geometry; discards tiny
+detached components; repairs only boundary holes up to 3 mm; then applies light
+non-shrinking Taubin smoothing and recomputes normals. Larger holes, finger
+gaps, and wrist openings are deliberately left open.
 
 ---
 

@@ -78,33 +78,24 @@ Validate the concept with ZED-M:
 
 See [docs/zed_m_feasibility.md](docs/zed_m_feasibility.md) for the checklist.
 
-## Reliable Close-Range KISS-ICP Scan
+## Active Gemini 305 Scan Workflow
 
-The real-time scanner is tuned for a ZED Mini moving slowly around a stationary
-hand at a working distance of approximately 10–20 cm:
+The active capture and reconstruction path is the synchronized circular-scan
+workflow in [`scripts/sync_workflow/`](scripts/sync_workflow/README.md). It uses
+the calibrated motor pose as the alignment prior, with guarded ICP available for
+small, validated corrections.
 
 ```bash
-python scripts/kiss_icp_realtime.py \
-  --out outputs/kiss_icp_hand_map.ply
+conda activate hena_jet
+python scripts/sync_workflow/main_scan.py --reconstruct
 ```
 
-The default configuration uses `NEURAL_PLUS`, ZED confidence filtering, an
-11–22 cm reliable software depth window, deterministic 3 mm ICP sampling, and a
-frame-weighted 2 mm global map. Frames with sparse, low-coverage, degenerate, or
-excessively large pose changes are not fused.
+Reconstruction defaults to a cylindrical 85 mm radial crop with a 300 mm axial
+half-length, guarded ICP, and `--fusion both`. It writes a cleaned point cloud,
+the raw TSDF mesh (`tsdf_mesh.ply`) for inspection, and the cleaned planning
+surface (`tsdf_mesh_cleaned.ply`). The cleaned mesh removes small detached
+fragments, repairs only tiny holes, and applies non-shrinking Taubin smoothing;
+it does not intentionally bridge finger gaps or large openings.
 
-Stopping the scan saves three files:
-
-- `kiss_icp_hand_map.ply`: globally fused voxels observed in at least two frames.
-- `kiss_icp_hand_map_trajectory.npy`: accepted KISS-ICP poses only.
-- `kiss_icp_hand_map_quality.json`: settings, versions, frame rejection reasons,
-  depth coverage, pose steps, map statistics, and trajectory closure error.
-
-The active development Python environment currently has ZED SDK 5.3.1 but does
-not have the `kiss-icp` or `open3d` Python packages. Run the live scanner in the
-camera environment where those packages are installed. ZED depth confidence
-values near 100 are least trustworthy; the default threshold rejects values
-above 60 while leaving texture confidence at 100 to preserve low-texture skin.
-See the Stereolabs documentation for
-[confidence filtering](https://www.stereolabs.com/docs/depth-sensing/confidence-filtering)
-and [depth modes](https://docs.stereolabs.com/docs/development/zed-sdk/modules/depth-sensing/depth-modes).
+See [`scripts/sync_workflow/WORKFLOW.md`](scripts/sync_workflow/WORKFLOW.md) for
+the calibration, capture, registration, and TSDF-fusion flow charts.
