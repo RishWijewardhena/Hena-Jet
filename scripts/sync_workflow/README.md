@@ -332,8 +332,10 @@ With `--reconstruct`, the program closes the hardware after capture and launches
 | `--min-valid-samples` | Valid temporal depth samples required per fused pixel; default 3. |
 | `--min-confidence` | Reserved confidence threshold recorded in metadata; keep at 0 because confidence frames are not yet wired into capture. |
 | `--depth-min-m`, `--depth-max-m` | Accepted depth interval; defaults 0.02 and 0.25 m. |
-| `--crop-radius-m` | Final output crop half-extent; default 0.15 m. |
+| `--crop-radius-m` | Final output crop radial limit; default 0.08 m. |
 | `--registration-crop-radius-m` | Tighter crop used only for guarded ICP; default 0.10 m. |
+| `--crop-shape` | `cylinder` (default) or `cube`; the cylinder separates radial and axial limits. |
+| `--crop-axial-half-length-m` | Cylinder half-length along the orbit axis; default 0.30 m. |
 | `--output-dir` | Directory for the scan PLYs, intrinsics, and metadata; default `outputs/scan`. |
 | `--dry-run` | Print the plan without opening hardware. |
 | `--no-home` | Skip homing; only safe when the motor origin is already valid. |
@@ -398,10 +400,11 @@ Explicit crop values override recorded crop metadata and defaults. Legacy metada
 | `--pivot X Y Z` | Explicit orbit center in zero-frame camera coordinates; default measured calibration pivot. |
 | `--reference-angle-deg` | Motor angle treated as the reference pose; default 0 degrees. |
 | `--angle-sign` | Converts the recorded motor-angle direction to the reconstruction convention; use `1` or `-1`. |
-| `--crop-radius-m` | Final output crop-cube half-extent around the pivot; metadata or 0.15 m by default, and `<= 0` disables it. |
-| `--registration-crop-radius-m` | Crop-cube half-extent used only to construct ICP clouds; metadata or `min(final crop, 0.10 m)` by default, and `<= 0` disables it. |
-| `--crop-shape` | `cube` (default) or `cylinder`; the cylinder reads both crop radii as radial limits around the orbit axis. |
-| `--crop-axial-half-length-m` | Half-length along the orbit axis when `--crop-shape cylinder`; metadata or 0.15 m by default. |
+| `--crop-radius-m` | Final output crop radial limit around the pivot; metadata or 0.08 m by default, and `<= 0` disables it. |
+| `--registration-crop-radius-m` | Crop limit used only to construct ICP clouds; metadata or `min(final crop, 0.10 m)` by default, and `<= 0` disables it. |
+| `--crop-shape` | `cylinder` (default) or `cube`; the cylinder reads both crop radii as radial limits around the orbit axis. |
+| `--crop-axial-half-length-m` | Half-length along the orbit axis when `--crop-shape cylinder`; metadata or 0.30 m by default. |
+| `--fusion` | `both` (default) writes the cleaned point merge and TSDF artifacts; `points` or `tsdf` select one path. |
 | `--skip-per-scan-sor` | Skip the per-frame outlier filter; final merged-cloud SOR still runs. |
 
 ### Stage 1: build pose priors
@@ -456,7 +459,7 @@ The pose graph produces `optimized_poses.npy` and per-frame `*_optimized.txt` ma
 
 Registration uses reduced copies, but Open3D applies final matrices to the original PLYs. Four bounded workers transform, crop, optionally filter, and write the scans to `01_transformed/` in stable frame order.
 
-`--crop-shape` selects the crop geometry. With the default `cube`, both crop arguments are half-extents of axis-aligned cubes, not spherical radii. With `cylinder`, they become radial limits around the orbit axis and `--crop-axial-half-length-m` bounds the axis separately.
+`--crop-shape` selects the crop geometry. With the default `cylinder`, the crop radii are radial limits around the orbit axis and `--crop-axial-half-length-m` bounds the axis separately. `cube` uses both crop arguments as axis-aligned half-extents.
 
 Prefer the cylinder on this rig. The enclosure ring sits 90-115 mm from the orbit axis, the object stays inside 55 mm, and the object also runs +/-120 mm along the axis. Measured on `outputs/new_scan`, an 80 mm cylinder keeps 100% of the object and 0% of the ring, whereas every cube small enough to drop the ring (90 mm half-extent or less) clips 21-39% of the object, because shrinking a cube shortens it along the axis at the same time.
 
@@ -491,7 +494,10 @@ reconstruction/
 |-- optimized_poses.npy
 |-- registration_diagnostics.json
 |-- processing.log
-`-- merged_cloud.ply
+|-- merged_cloud.ply
+|-- tsdf_cloud.ply
+|-- tsdf_mesh.ply
+`-- tsdf_mesh_cleaned.ply
 ```
 
 - `*_prior.txt`: pose from motor angle, measured axis/pivot, and station offset.
@@ -501,6 +507,9 @@ reconstruction/
 - `registration_diagnostics.json`: effective settings, radius source, metrics, decisions, rejection reasons, and corrections.
 - `processing.log`: per-stage Python processing progress, point counts, timing, and failures.
 - `merged_cloud.ply`: final cleaned, normal-estimated point cloud.
+- `tsdf_cloud.ply`: point cloud extracted from the TSDF volume.
+- `tsdf_mesh.ply`: raw TSDF mesh retained for inspection.
+- `tsdf_mesh_cleaned.ply`: TSDF mesh with small-hole repair, fragment removal, and Taubin smoothing.
 
 ## Reading diagnostics
 

@@ -60,9 +60,9 @@ POSE_GRAPH_EDGE_PRUNE_THRESHOLD = 0.25
 PRE_ICP_SOR_NEIGHBORS = 20
 PRE_ICP_SOR_SIGMA = 1.5
 
-DEFAULT_FINAL_CROP_RADIUS_M = 0.15
+DEFAULT_FINAL_CROP_RADIUS_M = 0.08
 DEFAULT_REGISTRATION_CROP_RADIUS_M = 0.10
-DEFAULT_CROP_AXIAL_HALF_LENGTH_M = 0.15
+DEFAULT_CROP_AXIAL_HALF_LENGTH_M = 0.30
 
 # Full-resolution per-scan cleanup after pose estimation
 PER_SCAN_SOR_NEIGHBORS = 10
@@ -867,8 +867,8 @@ def parse_args(argv=None):
     parser.add_argument("--angle-sign", type=float, default=1.0,
                         help="Sign convention for angle direction (1.0 or -1.0)")
     parser.add_argument("--crop-radius-m", type=float, default=None,
-                        help="Half-extent of the final output crop cube around the pivot "
-                             "(defaults to scan metadata or 0.15m; set <= 0 to disable)")
+                        help="Final output crop limit around the pivot "
+                             "(defaults to scan metadata or 0.08m; set <= 0 to disable)")
     parser.add_argument(
         "--registration-crop-radius-m",
         type=float,
@@ -881,7 +881,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--crop-shape",
         choices=("cube", "cylinder"),
-        default="cube",
+        default="cylinder",
         help=(
             "Crop geometry around the pivot. 'cylinder' treats the crop radii "
             "as radial limits around the orbit axis and bounds the axis "
@@ -919,7 +919,7 @@ def parse_args(argv=None):
     parser.add_argument("--skip-per-scan-sor", action="store_true",
                         help="Skip per-scan SOR (much faster; final SOR still runs)")
     parser.add_argument(
-        "--fusion", choices=("points", "tsdf", "both"), default="points",
+        "--fusion", choices=("points", "tsdf", "both"), default="both",
         help="How to combine the registered captures. 'points' concatenates the "
              "per-view clouds, which stacks every view's noise into one surface. "
              "'tsdf' averages them into a signed-distance field, cancelling "

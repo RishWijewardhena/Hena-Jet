@@ -262,7 +262,7 @@ class MeshCleanupTests(unittest.TestCase):
 
             self.assertTrue((output_dir / "tsdf_mesh.ply").is_file())
             self.assertTrue((output_dir / "tsdf_mesh_cleaned.ply").is_file())
-            self.assertEqual(stats["mesh_cleanup"]["taubin_iterations"], 3)
+            self.assertEqual(stats["mesh_cleanup"]["taubin_iterations"], 10)
             self.assertEqual(stats["cleaned_mesh_path"], str(output_dir / "tsdf_mesh_cleaned.ply"))
 
 
