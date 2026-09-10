@@ -27,6 +27,7 @@ from typing import Optional
 import numpy as np
 
 from orbit_geometry import select_orbit_geometry, load_orbit_geometry, validate_camera_frame
+import tsdf_fusion
 from pointcloud_processing import (
     CylinderCrop,
     merge_and_finalize_clouds,
@@ -59,9 +60,9 @@ POSE_GRAPH_EDGE_PRUNE_THRESHOLD = 0.25
 PRE_ICP_SOR_NEIGHBORS = 20
 PRE_ICP_SOR_SIGMA = 1.5
 
-DEFAULT_FINAL_CROP_RADIUS_M = 0.15
+DEFAULT_FINAL_CROP_RADIUS_M = 0.085
 DEFAULT_REGISTRATION_CROP_RADIUS_M = 0.10
-DEFAULT_CROP_AXIAL_HALF_LENGTH_M = 0.15
+DEFAULT_CROP_AXIAL_HALF_LENGTH_M = 0.30
 
 # Full-resolution per-scan cleanup after pose estimation
 PER_SCAN_SOR_NEIGHBORS = 10
@@ -382,45 +383,6 @@ def resolve_crop_axial_half_length(
             "Crop axial half-length must be a finite positive number of metres."
         )
     return value
-
-
-def calculate_auto_radius(o3d, ply_files: list[Path]) -> float:
-    """Read frame_0.0.ply (or first frame), find the hand, and return its Z depth."""
-    target = next(
-        (p for p in ply_files if abs(read_angle_from_filename(p.name)) < 1e-9),
-        ply_files[0],
-    )
-    cloud = o3d.io.read_point_cloud(str(target))
-    if cloud.is_empty():
-        raise RuntimeError(f"Could not read points for auto-radius from {target}")
-    
-    pts = np.asarray(cloud.points, dtype=float)
-    finite = pts[np.all(np.isfinite(pts), axis=1) & (pts[:, 2] > 0.01)]
-    if len(finite) < 100:
-        raise RuntimeError("Not enough points to calculate auto-radius.")
-
-    # Find center 10%
-    cx = (finite[:, 0].max() + finite[:, 0].min()) / 2
-    cy = (finite[:, 1].max() + finite[:, 1].min()) / 2
-    x_range = finite[:, 0].max() - finite[:, 0].min()
-    y_range = finite[:, 1].max() - finite[:, 1].min()
-    
-    mask = (
-        (np.abs(finite[:, 0] - cx) < x_range * 0.10) &
-        (np.abs(finite[:, 1] - cy) < y_range * 0.10)
-    )
-    center_pts = finite[mask]
-    if len(center_pts) == 0:
-        center_pts = finite # fallback if crop is empty
-        
-    radius = float(np.median(center_pts[:, 2]))
-    logger.warning(
-        "Estimated visible-surface depth from %s: %.3fm. This is not a "
-        "calibrated optical-center orbit radius.",
-        target.name,
-        radius,
-    )
-    return radius
 
 
 # ===================================================================
@@ -884,12 +846,8 @@ def parse_args(argv=None):
             "Pose source: motor orbit or guarded motor+ICP (default: guarded-icp)"
         ),
     )
-    parser.add_argument("--auto-radius", action="store_true",
-                        help="Estimate center-surface depth from the first frame (rough fallback; "
-                             "not a physical orbit-radius calibration)")
     parser.add_argument("--orbit-radius-m", type=float, default=None,
-                        help="Camera orbit radius in metres; defaults to measured calibration "
-                             "(ignored if --auto-radius is used)")
+                        help="Camera orbit radius in metres; defaults to measured calibration")
     parser.add_argument("--orbit-axis", type=float, nargs=3, default=None,
                         help="Legacy axis option; measured calibration supplies the orbit axis")
     parser.add_argument("--pivot", type=float, nargs=3, default=None,
@@ -909,8 +867,8 @@ def parse_args(argv=None):
     parser.add_argument("--angle-sign", type=float, default=1.0,
                         help="Sign convention for angle direction (1.0 or -1.0)")
     parser.add_argument("--crop-radius-m", type=float, default=None,
-                        help="Half-extent of the final output crop cube around the pivot "
-                             "(defaults to scan metadata or 0.15m; set <= 0 to disable)")
+                        help="Final output crop limit around the pivot "
+                             "(defaults to scan metadata or 0.08m; set <= 0 to disable)")
     parser.add_argument(
         "--registration-crop-radius-m",
         type=float,
@@ -923,7 +881,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--crop-shape",
         choices=("cube", "cylinder"),
-        default="cube",
+        default="cylinder",
         help=(
             "Crop geometry around the pivot. 'cylinder' treats the crop radii "
             "as radial limits around the orbit axis and bounds the axis "
@@ -960,6 +918,29 @@ def parse_args(argv=None):
     )
     parser.add_argument("--skip-per-scan-sor", action="store_true",
                         help="Skip per-scan SOR (much faster; final SOR still runs)")
+    parser.add_argument(
+        "--fusion", choices=("points", "tsdf", "both"), default="both",
+        help="How to combine the registered captures. 'points' concatenates the "
+             "per-view clouds, which stacks every view's noise into one surface. "
+             "'tsdf' averages them into a signed-distance field, cancelling "
+             "independent per-view error and producing a mesh. 'both' writes each.",
+    )
+    parser.add_argument(
+        "--tsdf-voxel-m", type=float, default=tsdf_fusion.DEFAULT_VOXEL_M,
+        help="TSDF voxel edge length. The default matches the camera's 1 mm depth "
+             "quantisation: finer adds no information, coarser trades real detail "
+             "for smoothness",
+    )
+    parser.add_argument(
+        "--tsdf-trunc-m", type=float, default=tsdf_fusion.DEFAULT_SDF_TRUNC_M,
+        help="TSDF truncation distance; keep it a few voxels wide so the field "
+             "can interpolate across a surface",
+    )
+    parser.add_argument(
+        "--tsdf-depth", choices=("sensor", "output"), default="sensor",
+        help="Which saved depth to fuse when a scan recorded rgbd/: the raw "
+             "sensor depth, or the processed per-capture output",
+    )
     return parser.parse_args(argv)
 
 
@@ -967,6 +948,14 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     args = parse_args(argv)
+
+    if args.tsdf_voxel_m <= 0 or args.tsdf_trunc_m <= 0:
+        raise ValueError("--tsdf-voxel-m and --tsdf-trunc-m must be positive")
+    if args.fusion != "points" and args.tsdf_trunc_m < args.tsdf_voxel_m:
+        raise ValueError(
+            "--tsdf-trunc-m must be at least --tsdf-voxel-m so the signed-distance "
+            "field can interpolate across a surface"
+        )
 
     guarded_icp_mode = args.registration_mode == "guarded-icp"
     if args.exclude_high_drift_frames and not guarded_icp_mode:
@@ -984,21 +973,34 @@ def main(argv=None):
     args.orbit_geometry = select_orbit_geometry(args.orbit_geometry, scan_metadata)
     calibration = load_orbit_geometry(args.orbit_geometry)
     intrinsics_path = input_dir / "intrinsics.json"
+    camera_intrinsics = None
     if intrinsics_path.is_file():
-        validate_camera_frame(calibration, json.loads(intrinsics_path.read_text()))
+        camera_intrinsics = json.loads(intrinsics_path.read_text())
+        validate_camera_frame(calibration, camera_intrinsics)
+    if args.fusion != "points" and camera_intrinsics is None:
+        raise ValueError(
+            f"TSDF fusion needs camera intrinsics, but {intrinsics_path} is missing. "
+            "Depth is recovered by reprojecting each capture through its pinhole "
+            "model, which cannot be done without them."
+        )
+
+    # TSDF integrates depth maps, so it needs the range the captures were
+    # exported with rather than the merge path's geometric crop alone.
+    capture_settings = scan_metadata.get("capture", {}) or {}
+    capture_range = capture_settings.get("depth_range_m") or []
+    if len(capture_range) == 2 and all(np.isfinite(capture_range)):
+        fusion_depth_min_m, fusion_depth_max_m = (float(v) for v in capture_range)
+    else:
+        fusion_depth_min_m, fusion_depth_max_m = 0.0, 1.0
     measured_geometry = calibration["orbit_geometry"]
     orbit_axis = np.asarray(measured_geometry["axis"], dtype=float)
     calibration_x_mm = (
         None if args.pivot else calibration_station_x_mm(calibration, args.orbit_geometry)
     )
-    if args.auto_radius:
-        import open3d as o3d
-        orbit_radius_m = calculate_auto_radius(o3d, ply_files)
-    else:
-        orbit_radius_m = resolve_orbit_radius(
-            args.orbit_radius_m,
-            {"orbit_radius_m": calibration["recommended_radius_m"]},
-        )
+    orbit_radius_m = resolve_orbit_radius(
+        args.orbit_radius_m,
+        {"orbit_radius_m": calibration["recommended_radius_m"]},
+    )
     pivot = np.asarray(args.pivot if args.pivot else measured_geometry["pivot_m"], dtype=float)
     if pivot.shape != (3,) or not np.isfinite(pivot).all():
         raise ValueError("--pivot must contain three finite coordinates")
@@ -1181,11 +1183,7 @@ def main(argv=None):
         "registration_mode": args.registration_mode,
         "orbit_radius_m": orbit_radius_m,
         "orbit_radius_source": (
-            "auto"
-            if args.auto_radius
-            else "cli"
-            if args.orbit_radius_m is not None
-            else "orbit_geometry"
+            "cli" if args.orbit_radius_m is not None else "orbit_geometry"
         ),
         "orbit_geometry_source": (
             str(args.orbit_geometry) if args.orbit_geometry else None
@@ -1261,6 +1259,36 @@ def main(argv=None):
     }
     save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
 
+    tsdf_stats = None
+    if args.fusion in ("tsdf", "both"):
+        logger.info("Stage 3a: TSDF volumetric fusion...")
+        tsdf_stats = tsdf_fusion.fuse_captures(
+            [frames[frame_id].path for frame_id in merge_frame_ids],
+            [optimized_poses[frame_id] for frame_id in merge_frame_ids],
+            camera_intrinsics,
+            input_dir=input_dir,
+            output_dir=output_dir,
+            voxel_length_m=args.tsdf_voxel_m,
+            sdf_trunc_m=args.tsdf_trunc_m,
+            depth_min_m=fusion_depth_min_m,
+            depth_max_m=fusion_depth_max_m,
+            depth_source=args.tsdf_depth,
+            crop_bounds=final_crop_bounds[merge_frame_ids[0]],
+        )
+        settings["tsdf_fusion"] = tsdf_stats
+        save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
+
+    if args.fusion == "tsdf":
+        logger.info("Finished!")
+        logger.info("TSDF mesh: %s", tsdf_stats["mesh_path"])
+        logger.info("TSDF cloud: %s", tsdf_stats["cloud_path"])
+        logger.info("Diagnostics: %s", output_dir / "registration_diagnostics.json")
+        logger.info("Processing log: %s", processing_log_path)
+        file_handler.flush()
+        logging.getLogger().removeHandler(file_handler)
+        file_handler.close()
+        return
+
     logger.info("Stage 3/4: Open3D full-resolution transform and cleanup...")
     transformed_paths, transform_stats = transform_and_clean_clouds(
         [frames[frame_id].path for frame_id in merge_frame_ids],
@@ -1304,8 +1332,14 @@ def main(argv=None):
     }
     save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
 
+    settings["processing"]["tsdf_fusion"] = tsdf_stats
+    save_diagnostics(output_dir, frames, optimized_poses, edges, settings)
+
     logger.info("Finished!")
     logger.info("Merged cloud: %s", merged_cloud_path)
+    if tsdf_stats is not None:
+        logger.info("TSDF mesh: %s", tsdf_stats["mesh_path"])
+        logger.info("TSDF cloud: %s", tsdf_stats["cloud_path"])
     logger.info("Diagnostics: %s", output_dir / "registration_diagnostics.json")
     logger.info("Processing log: %s", processing_log_path)
     file_handler.flush()

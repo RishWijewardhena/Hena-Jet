@@ -24,6 +24,24 @@ class ReconstructionCliTests(unittest.TestCase):
 
         self.assertEqual(args.registration_mode, "guarded-icp")
 
+    def test_tsdf_cylindrical_reconstruction_defaults_match_the_hand_scan(self):
+        args = reconstruct_pipeline.parse_args(["--input-dir", "scan"])
+
+        self.assertEqual(args.fusion, "both")
+        self.assertEqual(args.crop_shape, "cylinder")
+        self.assertEqual(
+            reconstruct_pipeline.resolve_crop_radii(
+                args.crop_radius_m, args.registration_crop_radius_m, {},
+            ),
+            (0.08, 0.08),
+        )
+        self.assertEqual(
+            reconstruct_pipeline.resolve_crop_axial_half_length(
+                args.crop_axial_half_length_m, {},
+            ),
+            0.30,
+        )
+
     def test_uses_the_radius_recorded_during_capture(self):
         args = reconstruct_pipeline.parse_args(["--input-dir", "scan"])
 
@@ -33,6 +51,10 @@ class ReconstructionCliTests(unittest.TestCase):
         )
 
         self.assertEqual(radius, 0.1175)
+
+    def test_auto_radius_option_is_removed(self):
+        with self.assertRaises(SystemExit):
+            reconstruct_pipeline.parse_args(["--input-dir", "scan", "--auto-radius"])
 
 
 
@@ -466,6 +488,7 @@ class ReconstructionEndToEndTests(unittest.TestCase):
                 "--output-dir", str(output_dir),
                 "--orbit-geometry", str(calibration_path),
                 "--registration-mode", "motor",
+                "--fusion", "points",
                 "--skip-per-scan-sor",
             ])
 
@@ -526,6 +549,7 @@ class ReconstructionEndToEndTests(unittest.TestCase):
                 "--orbit-radius-m", "0.1",
                 "--crop-radius-m", "0.05",
                 "--registration-mode", "motor",
+                "--fusion", "points",
                 "--skip-per-scan-sor",
             ])
 
@@ -616,14 +640,14 @@ class CylinderCropRegionTests(unittest.TestCase):
             0.18,
         )
         self.assertEqual(
-            reconstruct_pipeline.resolve_crop_axial_half_length(None, {}), 0.15,
+            reconstruct_pipeline.resolve_crop_axial_half_length(None, {}), 0.30,
         )
         with self.assertRaises(ValueError):
             reconstruct_pipeline.resolve_crop_axial_half_length(-0.1, {})
 
-    def test_crop_shape_defaults_to_cube_and_accepts_cylinder(self):
+    def test_crop_shape_defaults_to_cylinder_and_accepts_cylinder(self):
         args = reconstruct_pipeline.parse_args(["--input-dir", "scan"])
-        self.assertEqual(args.crop_shape, "cube")
+        self.assertEqual(args.crop_shape, "cylinder")
         args = reconstruct_pipeline.parse_args(
             ["--input-dir", "scan", "--crop-shape", "cylinder",
              "--crop-axial-half-length-m", "0.16"],

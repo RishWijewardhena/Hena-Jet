@@ -332,8 +332,10 @@ With `--reconstruct`, the program closes the hardware after capture and launches
 | `--min-valid-samples` | Valid temporal depth samples required per fused pixel; default 3. |
 | `--min-confidence` | Reserved confidence threshold recorded in metadata; keep at 0 because confidence frames are not yet wired into capture. |
 | `--depth-min-m`, `--depth-max-m` | Accepted depth interval; defaults 0.02 and 0.25 m. |
-| `--crop-radius-m` | Final output crop half-extent; default 0.15 m. |
+| `--crop-radius-m` | Final output crop radial limit; default 0.08 m. |
 | `--registration-crop-radius-m` | Tighter crop used only for guarded ICP; default 0.10 m. |
+| `--crop-shape` | `cylinder` (default) or `cube`; the cylinder separates radial and axial limits. |
+| `--crop-axial-half-length-m` | Cylinder half-length along the orbit axis; default 0.30 m. |
 | `--output-dir` | Directory for the scan PLYs, intrinsics, and metadata; default `outputs/scan`. |
 | `--dry-run` | Print the plan without opening hardware. |
 | `--no-home` | Skip homing; only safe when the motor origin is already valid. |
@@ -365,8 +367,8 @@ Known point-cloud camera frames must match the calibration camera frame.
 The measured axis is authoritative. `--pivot` overrides the measured pivot and
 disables the calibration-station crop shift. Radius comes from
 `recommended_radius_m`, unless `--radius-m` (capture) or `--orbit-radius-m`
-(reconstruction) overrides it. `--auto-radius` remains a diagnostic surface-depth
-estimate; changing the scalar radius does not alter the measured pivot or axis.
+(reconstruction) overrides it. Changing the scalar radius does not alter the
+measured pivot or axis.
 `--registration-mode motor` disables ICP while retaining measured geometry.
 
 A calibration is accepted on the uncertainty of the fitted radius, not on the scatter of the observations behind it. Single-marker ArUco poses are noisy but unbiased, so hundreds of them average to a stable radius: in `outputs/radius_x100_rerun2` a 3.207 mm observation RMSE over 179 inliers gave a 0.194 mm bootstrap standard deviation, and two independent runs fifteen minutes apart agreed to 0.058 mm while individual angles moved by up to 8.5 mm. `--max-radius-std-mm` (0.25) is therefore the gate, and per-angle median residuals are reported in `angle_median_residual_m` as diagnostics.
@@ -382,7 +384,7 @@ Two limitations remain. A bootstrap standard deviation measures precision, not a
 One `--orbit-geometry` calibration serves every X station. The radius and axis are properties of the mechanism and do not depend on X; the pivot only slides along the axis, which leaves the pose priors untouched because rotation about a line is invariant to where along it the pivot sits. Reconstruction reads the calibration's own `motor.x_position_mm` and shifts the pivot by `scan_X - calibration_X` before using it as a crop centre, so a calibration captured at X=100 reconstructs an X=50 scan correctly. A calibration must record its station; an explicit `--pivot` overrides the shift.
 
 
-`--auto-radius` is diagnostic, not physical calibration. It cannot reliably distinguish the object's visible surface from the mechanical rotation center. Explicit crop values override recorded crop metadata and defaults. Legacy metadata without `registration_crop_radius_m` automatically uses the smaller of 0.10 m and the positive final crop, so existing datasets gain the safer ICP region without changing their final output extent.
+Explicit crop values override recorded crop metadata and defaults. Legacy metadata without `registration_crop_radius_m` automatically uses the smaller of 0.10 m and the positive final crop, so existing datasets gain the safer ICP region without changing their final output extent.
 
 
 ### `reconstruct_pipeline.py` options
@@ -394,15 +396,15 @@ One `--orbit-geometry` calibration serves every X station. The radius and axis a
 | `--registration-mode` | `motor` or `guarded-icp`; default `guarded-icp`. |
 | `--orbit-radius-m` | Explicit orbit radius; otherwise the calibration recommended radius. |
 | `--orbit-geometry` | `radius_calibration.json` whose measured `orbit_geometry` supplies the orbit axis and pivot; selection is CLI, recorded scan path, then the fixed rig file. |
-| `--auto-radius` | Use a rough first-frame surface-depth estimate instead of calibrated radius. |
 | `--orbit-axis X Y Z` | Legacy option; measured calibration axis takes precedence. |
 | `--pivot X Y Z` | Explicit orbit center in zero-frame camera coordinates; default measured calibration pivot. |
 | `--reference-angle-deg` | Motor angle treated as the reference pose; default 0 degrees. |
 | `--angle-sign` | Converts the recorded motor-angle direction to the reconstruction convention; use `1` or `-1`. |
-| `--crop-radius-m` | Final output crop-cube half-extent around the pivot; metadata or 0.15 m by default, and `<= 0` disables it. |
-| `--registration-crop-radius-m` | Crop-cube half-extent used only to construct ICP clouds; metadata or `min(final crop, 0.10 m)` by default, and `<= 0` disables it. |
-| `--crop-shape` | `cube` (default) or `cylinder`; the cylinder reads both crop radii as radial limits around the orbit axis. |
-| `--crop-axial-half-length-m` | Half-length along the orbit axis when `--crop-shape cylinder`; metadata or 0.15 m by default. |
+| `--crop-radius-m` | Final output crop radial limit around the pivot; metadata or 0.08 m by default, and `<= 0` disables it. |
+| `--registration-crop-radius-m` | Crop limit used only to construct ICP clouds; metadata or `min(final crop, 0.10 m)` by default, and `<= 0` disables it. |
+| `--crop-shape` | `cylinder` (default) or `cube`; the cylinder reads both crop radii as radial limits around the orbit axis. |
+| `--crop-axial-half-length-m` | Half-length along the orbit axis when `--crop-shape cylinder`; metadata or 0.30 m by default. |
+| `--fusion` | `both` (default) writes the cleaned point merge and TSDF artifacts; `points` or `tsdf` select one path. |
 | `--skip-per-scan-sor` | Skip the per-frame outlier filter; final merged-cloud SOR still runs. |
 
 ### Stage 1: build pose priors
@@ -457,7 +459,7 @@ The pose graph produces `optimized_poses.npy` and per-frame `*_optimized.txt` ma
 
 Registration uses reduced copies, but Open3D applies final matrices to the original PLYs. Four bounded workers transform, crop, optionally filter, and write the scans to `01_transformed/` in stable frame order.
 
-`--crop-shape` selects the crop geometry. With the default `cube`, both crop arguments are half-extents of axis-aligned cubes, not spherical radii. With `cylinder`, they become radial limits around the orbit axis and `--crop-axial-half-length-m` bounds the axis separately.
+`--crop-shape` selects the crop geometry. With the default `cylinder`, the crop radii are radial limits around the orbit axis and `--crop-axial-half-length-m` bounds the axis separately. `cube` uses both crop arguments as axis-aligned half-extents.
 
 Prefer the cylinder on this rig. The enclosure ring sits 90-115 mm from the orbit axis, the object stays inside 55 mm, and the object also runs +/-120 mm along the axis. Measured on `outputs/new_scan`, an 80 mm cylinder keeps 100% of the object and 0% of the ring, whereas every cube small enough to drop the ring (90 mm half-extent or less) clips 21-39% of the object, because shrinking a cube shortens it along the axis at the same time.
 
@@ -492,7 +494,10 @@ reconstruction/
 |-- optimized_poses.npy
 |-- registration_diagnostics.json
 |-- processing.log
-`-- merged_cloud.ply
+|-- merged_cloud.ply
+|-- tsdf_cloud.ply
+|-- tsdf_mesh.ply
+`-- tsdf_mesh_cleaned.ply
 ```
 
 - `*_prior.txt`: pose from motor angle, measured axis/pivot, and station offset.
@@ -502,6 +507,9 @@ reconstruction/
 - `registration_diagnostics.json`: effective settings, radius source, metrics, decisions, rejection reasons, and corrections.
 - `processing.log`: per-stage Python processing progress, point counts, timing, and failures.
 - `merged_cloud.ply`: final cleaned, normal-estimated point cloud.
+- `tsdf_cloud.ply`: point cloud extracted from the TSDF volume.
+- `tsdf_mesh.ply`: raw TSDF mesh retained for inspection.
+- `tsdf_mesh_cleaned.ply`: TSDF mesh with small-hole repair, fragment removal, and Taubin smoothing.
 
 ## Reading diagnostics
 

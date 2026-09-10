@@ -73,8 +73,8 @@ def parse_args(argv=None):
                         help="Discard depth closer than this distance")
     parser.add_argument("--depth-max-m", type=float, default=0.25,
                         help="Discard depth farther than this distance")
-    parser.add_argument("--crop-radius-m", type=float, default=0.15,
-                        help="Final reconstruction crop-cube half-extent around the orbit center")
+    parser.add_argument("--crop-radius-m", type=float, default=0.08,
+                        help="Final reconstruction crop limit around the orbit center")
     parser.add_argument(
         "--registration-crop-radius-m",
         type=float,
@@ -87,7 +87,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--crop-shape",
         choices=("cube", "cylinder"),
-        default="cube",
+        default="cylinder",
         help=(
             "Reconstruction crop geometry: 'cylinder' reads the crop radii as "
             "radial limits around the orbit axis, which drops the enclosure "
@@ -97,7 +97,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--crop-axial-half-length-m",
         type=float,
-        default=0.15,
+        default=0.30,
         help="Half-length along the orbit axis for --crop-shape cylinder",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/scan"), help="Output directory for PLY files")
