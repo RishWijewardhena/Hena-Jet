@@ -10,6 +10,9 @@ captures/
 outputs/
 results/
 datasets/
+.agents/
+examples/
+
 *.ply
 *.pcd
 *.bag
