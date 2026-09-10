@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 # for the field to interpolate, and small relative to real surface separation.
 DEFAULT_VOXEL_M = 0.001
 DEFAULT_SDF_TRUNC_M = 0.003
+MAX_REPAIR_HOLE_M = 0.003
+TAUBIN_SMOOTHING_ITERATIONS = 3
+MIN_COMPONENT_TRIANGLES = 32
+MIN_COMPONENT_FRACTION = 0.0005
 
 
 @dataclass
@@ -273,6 +277,106 @@ def extract(volume, *, crop_bounds=None) -> tuple:
     return mesh, cloud
 
 
+def _remove_small_components(mesh) -> int:
+    """Remove detached triangle islands too small to be meaningful anatomy."""
+    if len(mesh.triangles) == 0:
+        return 0
+    labels, counts, _ = mesh.cluster_connected_triangles()
+    labels = np.asarray(labels)
+    counts = np.asarray(counts)
+    if len(counts) <= 1:
+        return 0
+    minimum = max(
+        MIN_COMPONENT_TRIANGLES,
+        int(np.ceil(float(counts.max()) * MIN_COMPONENT_FRACTION)),
+    )
+    remove = counts[labels] < minimum
+    removed_components = int(np.count_nonzero(counts < minimum))
+    if np.any(remove):
+        mesh.remove_triangles_by_mask(remove.tolist())
+        mesh.remove_unreferenced_vertices()
+    return removed_components
+
+
+def _small_boundary_loop_count(mesh, maximum_extent_m: float) -> int:
+    """Count boundary loops whose axis-aligned extent permits hole repair."""
+    triangles = np.asarray(mesh.triangles, dtype=np.int64)
+    if len(triangles) == 0:
+        return 0
+    edges = np.concatenate((
+        triangles[:, (0, 1)], triangles[:, (1, 2)], triangles[:, (2, 0)],
+    ))
+    edges.sort(axis=1)
+    unique_edges, counts = np.unique(edges, axis=0, return_counts=True)
+    boundary = unique_edges[counts == 1]
+    if len(boundary) == 0:
+        return 0
+
+    adjacency: dict[int, set[int]] = {}
+    for left, right in boundary:
+        adjacency.setdefault(int(left), set()).add(int(right))
+        adjacency.setdefault(int(right), set()).add(int(left))
+
+    vertices = np.asarray(mesh.vertices)
+    unvisited = set(adjacency)
+    small_loops = 0
+    while unvisited:
+        start = unvisited.pop()
+        component = {start}
+        pending = [start]
+        while pending:
+            vertex = pending.pop()
+            for neighbor in adjacency[vertex]:
+                if neighbor not in component:
+                    component.add(neighbor)
+                    unvisited.discard(neighbor)
+                    pending.append(neighbor)
+        extent = np.ptp(vertices[list(component)], axis=0)
+        if float(np.max(extent)) <= maximum_extent_m:
+            small_loops += 1
+    return small_loops
+
+
+def clean_mesh(mesh):
+    """Repair tiny TSDF defects and lightly smooth a mesh without shrinkage."""
+    import open3d as o3d
+
+    raw_vertices = len(mesh.vertices)
+    raw_triangles = len(mesh.triangles)
+    mesh = o3d.geometry.TriangleMesh(mesh)
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+    mesh.remove_unreferenced_vertices()
+    removed_components = _remove_small_components(mesh)
+
+    small_holes_before = _small_boundary_loop_count(mesh, MAX_REPAIR_HOLE_M)
+    tensor_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    mesh = tensor_mesh.fill_holes(MAX_REPAIR_HOLE_M).to_legacy()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_non_manifold_edges()
+    mesh.remove_unreferenced_vertices()
+    small_holes_after = _small_boundary_loop_count(mesh, MAX_REPAIR_HOLE_M)
+
+    mesh = mesh.filter_smooth_taubin(
+        number_of_iterations=TAUBIN_SMOOTHING_ITERATIONS,
+    )
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
+    return mesh, {
+        "raw_vertices": raw_vertices,
+        "raw_triangles": raw_triangles,
+        "cleaned_vertices": len(mesh.vertices),
+        "cleaned_triangles": len(mesh.triangles),
+        "removed_components": removed_components,
+        "repaired_holes": max(0, small_holes_before - small_holes_after),
+        "max_repair_hole_m": MAX_REPAIR_HOLE_M,
+        "taubin_iterations": TAUBIN_SMOOTHING_ITERATIONS,
+    }
+
+
 def fuse_captures(
     ply_paths: Sequence[Path],
     poses: Sequence[np.ndarray],
@@ -310,12 +414,16 @@ def fuse_captures(
         crop_bounds=crop_bounds,
     )
     mesh, cloud = extract(volume, crop_bounds=crop_bounds)
+    cleaned_mesh, cleanup_stats = clean_mesh(mesh)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     mesh_path = output_dir / "tsdf_mesh.ply"
+    cleaned_mesh_path = output_dir / "tsdf_mesh_cleaned.ply"
     cloud_path = output_dir / "tsdf_cloud.ply"
     if not o3d.io.write_triangle_mesh(str(mesh_path), mesh):
         raise RuntimeError(f"Could not write {mesh_path}")
+    if not o3d.io.write_triangle_mesh(str(cleaned_mesh_path), cleaned_mesh):
+        raise RuntimeError(f"Could not write {cleaned_mesh_path}")
     if not o3d.io.write_point_cloud(str(cloud_path), cloud):
         raise RuntimeError(f"Could not write {cloud_path}")
 
@@ -331,7 +439,9 @@ def fuse_captures(
         "mesh_triangles": len(mesh.triangles),
         "cloud_points": len(cloud.points),
         "mesh_path": str(mesh_path),
+        "cleaned_mesh_path": str(cleaned_mesh_path),
         "cloud_path": str(cloud_path),
+        "mesh_cleanup": cleanup_stats,
     }
     logger.info(
         "TSDF fused %d frames -> %d mesh vertices, %d cloud points",

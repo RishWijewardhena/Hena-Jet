@@ -186,5 +186,85 @@ class IntegrationTests(unittest.TestCase):
         self.assertLess(spread_many, spread_one)
 
 
+class MeshCleanupTests(unittest.TestCase):
+    def _mesh_with_missing_face(self, side_m: float):
+        import open3d as o3d
+
+        mesh = o3d.geometry.TriangleMesh.create_box(
+            width=side_m, height=side_m, depth=side_m,
+        )
+        triangles = np.asarray(mesh.triangles)
+        vertices = np.asarray(mesh.vertices)
+        top = np.flatnonzero(np.all(vertices[triangles, 2] == side_m, axis=1))
+        mesh.remove_triangles_by_index(top.tolist())
+        mesh.remove_unreferenced_vertices()
+        return mesh
+
+    def test_cleanup_fills_only_a_small_hole(self):
+        mesh = self._mesh_with_missing_face(0.002)
+
+        cleaned, stats = tsdf_fusion.clean_mesh(mesh)
+
+        self.assertGreater(len(cleaned.triangles), len(mesh.triangles))
+        self.assertGreaterEqual(stats["repaired_holes"], 1)
+
+    def test_cleanup_preserves_a_hole_larger_than_three_mm(self):
+        mesh = self._mesh_with_missing_face(0.006)
+
+        cleaned, stats = tsdf_fusion.clean_mesh(mesh)
+
+        self.assertEqual(len(cleaned.triangles), len(mesh.triangles))
+        self.assertEqual(stats["repaired_holes"], 0)
+
+    def test_cleanup_removes_a_small_detached_fragment_and_smooths_ripples(self):
+        import open3d as o3d
+
+        mesh = o3d.geometry.TriangleMesh.create_sphere(radius=0.02, resolution=10)
+        vertices = np.asarray(mesh.vertices)
+        vertices[:, 2] += 0.0008 * np.sin(vertices[:, 0] * 1200.0)
+        mesh.vertices = o3d.utility.Vector3dVector(vertices)
+        raw_radial_spread = float(np.std(np.linalg.norm(vertices, axis=1)))
+        fragment = o3d.geometry.TriangleMesh.create_tetrahedron(radius=0.0005)
+        fragment.translate((0.10, 0.0, 0.0))
+        mesh += fragment
+
+        cleaned, stats = tsdf_fusion.clean_mesh(mesh)
+
+        cleaned_extent = cleaned.get_axis_aligned_bounding_box().get_extent()
+        cleaned_radial_spread = float(
+            np.std(np.linalg.norm(np.asarray(cleaned.vertices), axis=1))
+        )
+        self.assertLess(len(cleaned.triangles), len(mesh.triangles))
+        self.assertGreaterEqual(stats["removed_components"], 1)
+        self.assertLess(float(cleaned_extent[0]), 0.05)
+        self.assertLess(cleaned_radial_spread, raw_radial_spread)
+        self.assertTrue(cleaned.is_edge_manifold(allow_boundary_edges=True))
+
+    def test_fusion_keeps_raw_mesh_and_writes_cleaned_mesh(self):
+        depth = plane_depth(0.18)
+        color = np.full((48, 64, 3), 180, dtype=np.uint8)
+        with TemporaryDirectory() as tmp:
+            input_dir = Path(tmp) / "scan"
+            input_dir.mkdir()
+            ply_path = input_dir / "frame_0.0.ply"
+            write_camera_frame_ply(ply_path, depth, color)
+            output_dir = Path(tmp) / "reconstruction"
+
+            stats = tsdf_fusion.fuse_captures(
+                [ply_path], [np.eye(4)], INTRINSICS,
+                input_dir=input_dir,
+                output_dir=output_dir,
+                voxel_length_m=0.002,
+                sdf_trunc_m=0.006,
+                depth_min_m=0.05,
+                depth_max_m=0.30,
+            )
+
+            self.assertTrue((output_dir / "tsdf_mesh.ply").is_file())
+            self.assertTrue((output_dir / "tsdf_mesh_cleaned.ply").is_file())
+            self.assertEqual(stats["mesh_cleanup"]["taubin_iterations"], 3)
+            self.assertEqual(stats["cleaned_mesh_path"], str(output_dir / "tsdf_mesh_cleaned.ply"))
+
+
 if __name__ == "__main__":
     unittest.main()
