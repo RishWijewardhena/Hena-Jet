@@ -106,7 +106,7 @@ Only the first three come from the device. `get_recommended_filters()` on this d
 
 The remaining seven device filters stay off deliberately. `HoleFillingFilter` invents depth where the sensor measured none, `DecimationFilter` reduces resolution, and `SpatialFastFilter` and `SpatialModerateFilter` would stack redundant smoothing on top of `SpatialAdvancedFilter`. None belong in a chain feeding metric reconstruction.
 
-Each motor angle now captures 6 fresh RGB-D frames by default. A fused pixel must have at least three valid temporal samples (`--min-valid-samples 3`). The `--min-confidence` option is parsed, validated, and recorded in metadata, but the current capture path does not yet obtain a confidence frame or apply this gate. Keep it at its default `0` until confidence-frame wiring is completed.
+Each motor angle now captures 6 fresh RGB-D frames by default. A fused pixel must have at least three valid temporal samples (`--min-valid-samples 3`). There is no per-pixel confidence gate: the Gemini 305's datasheet lists only Depth, Color, and IR output streams, and the Orbbec SDK's per-device default profiles ship no confidence stream for this device family, so a confidence-based gate is not achievable on this hardware.
 
 Capture logs print the valid-depth fill rate for every fused angle. After reconstructing each capture, run the quality report and compare its JSON with the preceding run:
 
@@ -130,8 +130,6 @@ python scripts/sync_workflow/sphere_bar_report.py \
 Sphere centres are recoverable far more accurately than the point noise, because thousands of points are fitted to one known radius, so the 1.5 mm single-frame noise still resolves a sub-millimetre length error. A proportional error in the measured length is a proportional error in the calibrated radius, reported as `implied_radius_correction_ratio`.
 
 `scan_quality_report.py` measures single-frame and merged-cloud surface plane-RMS and cross-view residual grouped by angular separation; it does not currently copy the capture-time fill rates into its JSON. Together, the logged fill rate and report measurements separate capture noise from multi-view pose error: plane-RMS describes local surface thickness, while cross-view residual shows how well different viewing angles coincide.
-
-The saved pre-change baseline is 1.513 mm single-frame plane-RMS, 4.915 mm merged plane-RMS, and 0.860 / 1.227 / 2.699 / 3.593 mm cross-view residual at 10 / 30 / 90 / 180 degrees. A post-change rig capture has not yet been recorded, so the accuracy changes must not be treated as physically validated until the same report is run on a fresh dataset and compared with that baseline.
 
 LingBot-Depth is deliberately excluded from the geometry path. Measurements in the 0.20-0.35 m working band showed a +74 mm bias and 14.7 mm median error; even an ideal affine alignment left 45.7 mm median error, compared with a 0.9 mm sensor floor. It is therefore not used to generate, correct, or replace the metric depth that enters reconstruction.
 
@@ -284,7 +282,6 @@ Metadata is updated during scanning, so completed angles remain recorded if a la
     "disparity": 256,
     "frames_per_angle": 6,
     "min_valid_samples": 3,
-    "min_confidence": 0,
     "depth_range_m": [0.02, 0.25]
   },
   "reconstruction": {
@@ -330,12 +327,12 @@ With `--reconstruct`, the program closes the hardware after capture and launches
 | `--registration-mode` | `motor` or `guarded-icp`; default `guarded-icp`. Full-pose reconstruction is launched separately. |
 | `--frames-per-angle` | Fresh frames fused per angle; default 6. |
 | `--min-valid-samples` | Valid temporal depth samples required per fused pixel; default 3. |
-| `--min-confidence` | Reserved confidence threshold recorded in metadata; keep at 0 because confidence frames are not yet wired into capture. |
 | `--depth-min-m`, `--depth-max-m` | Accepted depth interval; defaults 0.02 and 0.25 m. |
 | `--crop-radius-m` | Final output crop radial limit; default 0.085 m. |
 | `--registration-crop-radius-m` | Tighter crop used only for guarded ICP; default `min(final crop, 0.10 m)`, therefore 0.085 m with the standard crop. |
 | `--crop-shape` | `cylinder` (default) or `cube`; the cylinder separates radial and axial limits. |
 | `--crop-axial-half-length-m` | Cylinder half-length along the orbit axis; default 0.30 m. |
+| `--exclude-high-drift-frames` | When `--reconstruct` runs guarded ICP, omit sequential frames whose ICP correction exceeds the pose guards. |
 | `--output-dir` | Directory for the scan PLYs, intrinsics, and metadata; default `outputs/scan`. |
 | `--dry-run` | Print the plan without opening hardware. |
 | `--no-home` | Skip homing; only safe when the motor origin is already valid. |
@@ -371,15 +368,15 @@ disables the calibration-station crop shift. Radius comes from
 measured pivot or axis.
 `--registration-mode motor` disables ICP while retaining measured geometry.
 
-A calibration is accepted on the uncertainty of the fitted radius, not on the scatter of the observations behind it. Single-marker ArUco poses are noisy but unbiased, so hundreds of them average to a stable radius: in `outputs/radius_x100_rerun2` a 3.207 mm observation RMSE over 179 inliers gave a 0.194 mm bootstrap standard deviation, and two independent runs fifteen minutes apart agreed to 0.058 mm while individual angles moved by up to 8.5 mm. `--max-radius-std-mm` (0.25) is therefore the gate, and per-angle median residuals are reported in `angle_median_residual_m` as diagnostics.
+A calibration is accepted on the uncertainty of the fitted radius, not on the scatter of the observations behind it. Single-marker ArUco poses are noisy but unbiased, so hundreds of them average to a stable radius; `--max-radius-std-mm` (0.25) is the gate on that bootstrap standard deviation, and per-angle median residuals are reported in `angle_median_residual_m` as diagnostics.
 
-Excluding high-residual angles was implemented, measured, and removed. It made the two runs disagree by 0.22-0.32 mm at every threshold tried, against 0.058 mm when nothing was excluded, because the offending angles differ from run to run and each fit then loses different angular support. The worst angle barely biases the result anyway: dropping +120 degrees alone moved one run by 0.003 mm. Treat a large per-angle median as a view to inspect -- a small, steeply oblique or overexposed marker -- not as a sample to delete.
+Excluding high-residual angles was tried and removed: which angles look worst differs run to run, and dropping them made independent runs agree *less*, not more. Treat a large per-angle median as a view to inspect -- a small, steeply oblique, or overexposed marker -- not as a sample to delete.
 
-The bootstrap resamples whole angles, not individual frames. The ten frames captured at one angle share that angle's pose error, so treating them as independent draws inflates the apparent sample size by the burst length. Across three runs of the same rig, per-frame resampling claimed a 0.165 mm mean standard deviation while the radii actually spread with a 0.324 mm standard deviation, understating it by 1.9x; resampling by angle reports 0.39-0.54 mm, erring toward caution.
+The bootstrap resamples whole angles, not individual frames, because the frames captured at one angle share that angle's pose error; resampling by frame understates the true spread of repeated runs.
 
-Measured on this rig, one run therefore determines the radius to roughly +/- 0.5 mm and does not pass the 0.25 mm gate. Three runs gave 143.483, 143.425 and 142.895 mm, a 0.560 mm spread, combining to **143.268 +/- 0.187 mm** as a standard error of the mean. Averaging independent runs is the honest route to a tighter number; a single run reporting +/- 0.15 mm was an artefact of the resampling, not a measurement.
+A single run typically determines the radius to only about +/- 0.5 mm, which will not clear the 0.25 mm gate on its own. Average several independent runs for a tighter number -- a lone run reporting well under 0.25 mm is more likely a resampling artefact than a genuinely precise measurement.
 
-Two limitations remain. A bootstrap standard deviation measures precision, not accuracy, so it cannot detect a biased calibration from one run: the original `outputs/test_radius_x100` result sits 0.7 mm from the later runs, its bias coming from sparse angular coverage of 13 angles at a 30 degree step with two contributing no poses. And the gate cannot distinguish a rig that needs better markers from one that needs more runs. Comparing repeat runs is what exposes both.
+Two limitations remain. A bootstrap standard deviation measures precision, not accuracy, so it cannot detect a biased calibration from a single run -- sparse or gappy angular coverage (few angles, large step, some contributing no poses) is a known source of that bias, and the fixed default calibration at `outputs/test_radius_x100/radius_calibration.json` has exactly that limitation. The gate also cannot distinguish a rig that needs better markers from one that just needs more runs. Comparing repeat runs is what exposes both, so treat a single calibration run as provisional until it agrees with a second one.
 
 One `--orbit-geometry` calibration serves every X station. The radius and axis are properties of the mechanism and do not depend on X; the pivot only slides along the axis, which leaves the pose priors untouched because rotation about a line is invariant to where along it the pivot sits. Reconstruction reads the calibration's own `motor.x_position_mm` and shifts the pivot by `scan_X - calibration_X` before using it as a crop centre, so a calibration captured at X=100 reconstructs an X=50 scan correctly. A calibration must record its station; an explicit `--pivot` overrides the shift.
 
@@ -404,7 +401,12 @@ Explicit crop values override recorded crop metadata and defaults. Legacy metada
 | `--registration-crop-radius-m` | Crop limit used only to construct ICP clouds; metadata or `min(final crop, 0.10 m)` by default, and `<= 0` disables it. |
 | `--crop-shape` | `cylinder` (default) or `cube`; the cylinder reads both crop radii as radial limits around the orbit axis. |
 | `--crop-axial-half-length-m` | Half-length along the orbit axis when `--crop-shape cylinder`; metadata or 0.30 m by default. |
+| `--exclude-high-drift-frames` | Omit a sequential frame from the final merge when its guarded-ICP correction exceeds the pose guards (guarded ICP modes only). |
+| `--keep-all-components` | Keep detached point clusters in the merged cloud; by default a component smaller than 1% of the largest is discarded, since SOR cannot see a compact blob of noise that floats clear of the object. |
 | `--fusion` | `both` (default) writes the cleaned point merge and TSDF artifacts; `points` or `tsdf` select one path. |
+| `--tsdf-voxel-m` | TSDF voxel edge length; default 0.001 m (matches the camera's 1 mm depth quantization -- finer adds no information, coarser trades detail for smoothness). |
+| `--tsdf-trunc-m` | TSDF truncation distance; default 0.003 m, kept a few voxels wide so the field can interpolate across a surface. |
+| `--tsdf-depth` | `sensor` (default) or `output`; which saved depth to fuse when a scan recorded `rgbd/`. |
 | `--skip-per-scan-sor` | Skip the per-frame outlier filter; final merged-cloud SOR still runs. |
 
 ### Stage 1: build pose priors
@@ -420,9 +422,9 @@ The pipeline constructs the circular motor transform and adds the station offset
 
 Both `main_scan.py` and `reconstruct_pipeline.py` default to guarded ICP. Guarded ICP is the capture-time default for its diagnostics rather than its corrections: motor mode writes no edges at all, so nothing records per-edge fitness, residual, or whether the orbit closes. The guards keep it safe, since any correction that fails them falls back to the motor prior.
 
-Do not expect it to improve the surface. On `outputs/scan_x100_r143259`, measured against the same captures, guarded ICP gave a 2.155 mm local surface RMS from 108542 points against motor mode's 2.084 mm from 140110, because its corrections have a 0.85 mm median and the surface noise is about 2 mm: it is adjusting poses by less than the uncertainty of the points it aligns. Smooth hands, repeated geometry, background points, and partial overlap can also give ICP a plausible but physically incorrect match, which is what the guards exist to catch.
+Do not expect it to improve the surface. Its corrections are typically under 1 mm, similar to or smaller than the surface noise, so it is adjusting poses by less than the uncertainty of the points it aligns. Smooth hands, repeated geometry, background points, and partial overlap can also give ICP a plausible but physically incorrect match, which is what the guards exist to catch.
 
-The reason to keep it on is the loop edge. On that scan it matched the two 180 degree views with 0.941 fitness and reported them 6.83 mm and 2.61 deg apart, exceeding the guards and falling back to the prior. That number is the largest geometric error left in the pipeline, larger than the radius uncertainty or the surface noise, and motor mode never measures it.
+The reason to keep it on is the loop edge: matching the two ends of a complete orbit against each other is the one measurement in the pipeline that can catch a geometric error larger than the radius uncertainty or the surface noise, and motor mode never computes it. A rejected loop edge (reported in `registration_diagnostics.json`) is worth inspecting even though the fallback keeps the reconstruction safe.
 
 Guarded ICP processes adjacent angles within each station, a loop edge for each complete orbit, and same-angle links between adjacent X stations:
 

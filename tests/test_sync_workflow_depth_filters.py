@@ -10,7 +10,6 @@ sys.path.insert(0, str(SYNC_WORKFLOW_DIR))
 from depth_filters import (  # noqa: E402
     DEFAULT_ENABLED_FILTERS,
     apply_depth_filters,
-    gate_by_confidence,
     select_depth_filters,
     configure_capture_filters,
     CAPTURE_FILTER_PARAMETERS,
@@ -118,35 +117,6 @@ class ApplyDepthFiltersTests(unittest.TestCase):
 
     def test_returns_the_input_when_no_filters_are_enabled(self):
         self.assertEqual(apply_depth_filters("raw", []), "raw")
-
-
-class GateByConfidenceTests(unittest.TestCase):
-    def test_zeroes_low_confidence_pixels(self):
-        import numpy as np
-
-        depth = np.array([[0.25, 0.26], [0.27, 0.28]], dtype=np.float32)
-        confidence = np.array([[10, 200], [255, 30]], dtype=np.uint8)
-
-        gated = gate_by_confidence(depth, confidence, min_confidence=100)
-
-        np.testing.assert_allclose(gated, [[0.0, 0.26], [0.27, 0.0]])
-
-    def test_passes_through_when_confidence_is_missing(self):
-        import numpy as np
-
-        depth = np.array([[0.25]], dtype=np.float32)
-
-        np.testing.assert_allclose(
-            gate_by_confidence(depth, None, min_confidence=100), depth
-        )
-
-    def test_rejects_mismatched_shapes(self):
-        import numpy as np
-
-        with self.assertRaises(ValueError):
-            gate_by_confidence(
-                np.zeros((2, 2)), np.zeros((3, 3), dtype=np.uint8), min_confidence=1
-            )
 
 
 if __name__ == "__main__":

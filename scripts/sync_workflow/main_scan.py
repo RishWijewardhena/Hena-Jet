@@ -67,8 +67,6 @@ def parse_args(argv=None):
                         help="Fresh RGB-D frames to median-combine at each angle")
     parser.add_argument("--min-valid-samples", type=int, default=3,
                         help="Valid temporal samples a pixel needs to survive fusion")
-    parser.add_argument("--min-confidence", type=int, default=0,
-                        help="Drop depth pixels below this sensor confidence (0 disables)")
     parser.add_argument("--depth-min-m", type=float, default=0.02,
                         help="Discard depth closer than this distance")
     parser.add_argument("--depth-max-m", type=float, default=0.25,
@@ -267,7 +265,6 @@ def build_scan_metadata(args, *, active_disparity, captured_angles, captures=Non
             "disparity": int(active_disparity),
             "frames_per_angle": int(args.frames_per_angle),
             "min_valid_samples": int(args.min_valid_samples),
-            "min_confidence": int(args.min_confidence),
             "depth_range_m": [float(args.depth_min_m), float(args.depth_max_m)],
         },
         "reconstruction": {
@@ -350,8 +347,6 @@ def main():
         raise ValueError("--frames-per-angle must be at least 1.")
     if args.min_valid_samples < 1 or args.min_valid_samples > args.frames_per_angle:
         raise ValueError("--min-valid-samples must be within [1, --frames-per-angle].")
-    if not 0 <= args.min_confidence <= 255:
-        raise ValueError("--min-confidence must be within [0, 255].")
     if args.depth_min_m < 0.0 or args.depth_max_m <= args.depth_min_m:
         raise ValueError("Depth range must satisfy 0 <= min < max.")
     if args.radius_m is not None and args.radius_m <= 0.0:
