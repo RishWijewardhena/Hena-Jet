@@ -1,1 +1,1 @@
-"""Orbit-radius and measured-pose calibration helpers."""
+"""Orbit-radius calibration helpers."""

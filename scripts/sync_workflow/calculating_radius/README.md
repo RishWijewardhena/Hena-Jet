@@ -52,8 +52,6 @@ fixed marker map + RGB image
 | `generate_radius_markers.py` | Generates the printable wrap, placement guide, and fixed 3D marker map. |
 | `test_radius.py` | Homes the mechanism, captures each angle, estimates poses, evaluates the trajectory, and writes the report. |
 | `radius_calibration.py` | Contains marker-map geometry, ArUco detector parameters, PnP pose solving, pose acceptance, RGB/depth transform conversion, robust plane fitting, algebraic + geometric circle fitting, and the radius bootstrap. |
-| `capture_orbit_pose_map.py` | Captures a complete per-angle pose map for measured-pose reconstruction; this is different from calculating only one radius. |
-| `orbit_pose_map.py` | Helpers for consuming the complete per-angle pose map. |
 
 ## Marker coordinate system
 
